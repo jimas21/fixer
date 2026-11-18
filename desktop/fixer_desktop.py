@@ -4747,12 +4747,21 @@ def job_lora_remove(p: dict, emit, cancel):
     targets = [k for k, v in lib.items() if v.get("pair") == pair] if pair else [fn]
     if fn not in targets:
         targets.append(fn)
-    freed = 0
+    freed, stopped = 0, False
     for t in targets:
         f = COMFY_LORAS / t
-        if f.is_file():
-            freed += f.stat().st_size
+        if not f.is_file():
+            lib.pop(t, None)
+            continue
+        size = f.stat().st_size
+        try:
+            f.unlink()
+        except PermissionError:
+            if not stopped:                              # ComfyUI may hold the file open on Windows; release it
+                COMFY.stop()
+                stopped = True
             f.unlink(missing_ok=True)
+        freed += size
         lib.pop(t, None)
     _lora_lib_write(lib)
     COMFY.warmed.clear()

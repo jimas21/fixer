@@ -4659,7 +4659,7 @@ async def queue_runner(app):
                             elif _job.op == "upscale":
                                 _timing(model=UPSCALER[0])
                             payload_ = _apply_enhance(_job, payload_, emit_)
-                             return _base(payload_, emit_, cancel_)
+                            return _base(payload_, emit_, cancel_)
                         finally:
                             _TL.rec = None
                     try:

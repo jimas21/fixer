@@ -119,14 +119,15 @@ final class Rules: ObservableObject {
         return stored
     }
     static let pcImagePresets: [PCImageChoice] = [
-        PCImageChoice(id: "Tongyi-MAI/Z-Image-Turbo", label: "Z-Image Turbo",
-                      note: "Very photographic. Edits by repainting with Edit strength.", steps: 9, guidance: 0.0),
+        PCImageChoice(id: "Kandoo/Juggernaut-XL-Ragnarok", label: "Juggernaut XL Ragnarok",
+                      note: "Photo-real people, portraits and scenes, explicit-capable. Edits by repainting with Edit strength.", steps: 30, guidance: 5.0),
     ]
     /// Picture models the computer no longer keeps (11-17: FLUX.2 klein and bigASP were removed): a saved one moves
     /// to the first preset.
     static func isRemovedPCImage(_ id: String) -> Bool {
         let l = id.lowercased()
         return l.contains("flux.2-klein") || l.contains("flux2-klein") || l.contains("bigasp")
+            || l.contains("z-image") || l.contains("z_image")
     }
     /// The saved picture model, moved off a removed one. The saved steps and guidance move with it (they belong to
     /// the model); this runs before those two are read, as stored properties start in the order they are written.

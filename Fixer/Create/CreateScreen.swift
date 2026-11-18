@@ -358,7 +358,7 @@ final class CreateStore: ObservableObject {
     /// How a change is made by default: the explicit-capable picture models redraw (so the change stays in their own
     /// look); the others let the photo editor keep everything but what was asked.
     static func defaultChangeMode(for recipeID: String) -> String {
-        ["zimage-nsfw", "chroma"].contains(recipeID) ? "redraw" : "edit"
+        ["juggernaut", "chroma"].contains(recipeID) ? "redraw" : "edit"
     }
 }
 
@@ -409,6 +409,7 @@ struct CreateScreen: View {
     @State var videoPhoto: UIImage?            // the photo a video starts from ("Animate this photo")
     @State var videoPhotoID: UUID?             // its copy in the Library
     @State var videoPhotoPick: PhotosPickerItem?
+    @State var showVideoPhotos = false         // the Photos picker for a video's start photo (opened from the Photo tile's menu)
     @State var workingID: UUID?                // the picture the change bar works on (nil = the newest)
     @State var changeText = ""
     @State var changeMode = "edit"             // edit: keep the rest. redraw: the picture's own model again

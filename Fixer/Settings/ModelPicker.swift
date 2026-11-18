@@ -68,11 +68,9 @@ enum ModelSlot: String, CaseIterable, Identifiable {
             ModelEntry(id: ModelStore.defaultGenerator, name: "Stable Diffusion 1.5", size: 1.0e9, note: "Draws pictures on this iPhone when the computer isn't reachable. Small and simple; the computer's models are far better.")]
         case .desktopImage: [
             // Sizes of the ComfyUI files the computer actually keeps (11-17).
+            ModelEntry(id: "Kandoo/Juggernaut-XL-Ragnarok", name: "Juggernaut XL Ragnarok", size: 7.1e9, note: "Photo-real people, portraits and scenes, and fine with explicit pictures. Uses 'Leave out'. 30 steps."),
             ModelEntry(id: "Comfy-Org/Qwen-Image-2.1", name: "Qwen-Image 2.1 Turbo", size: 14.3e9, note: "New. Follows long, exact descriptions and lettering well; makes and edits with the same model. The explicit add-on is a switch."),
-            ModelEntry(id: "Tongyi-MAI/Z-Image-Turbo", name: "Z-Image Turbo", size: 26.3e9, note: "Fast all-rounder: scenery, objects and people, very photo-like. Keeps things clothed."),
-            ModelEntry(id: "lodestones/Chroma1-HD", name: "Chroma1 HD", size: 14.7e9, note: "Finest natural detail (skin, hair, fabric) and fine with explicit pictures. About three times slower."),
-            // Add-on: Z-Image Turbo's picture part retrained for explicit content (uses Z-Image Turbo's other parts).
-            ModelEntry(id: "tewea/z_image_turbo_bf16_nsfw", name: "Z-Image Turbo NSFW", size: 12.6e9, note: "Z-Image retrained for people and explicit pictures. Weaker at scenery.")]
+            ModelEntry(id: "lodestones/Chroma1-HD", name: "Chroma1 HD", size: 14.7e9, note: "Finest natural detail (skin, hair, fabric) and fine with explicit pictures. About three times slower.")]
         case .desktopVideo: [
             // Wan 2.2 image-to-video 14B in ComfyUI (11-17); the old 5B models were removed from the computer.
             ModelEntry(id: "Comfy-Org/Wan_2.2_ComfyUI_Repackaged", name: "Wan 2.2 14B", size: 38e9, note: "Turns words or a photo into a 5-second clip with natural motion. About 2-3 minutes per video.")]
@@ -132,12 +130,13 @@ struct ModelEntry: Identifiable, Hashable {
 final class Favorites: ObservableObject {
     static let shared = Favorites()
     /// Built-ins that came after the first builds; everything else counts as already offered.
-    private static let addedLater: Set<String> = ["lodestones/Chroma1-HD", "tewea/z_image_turbo_bf16_nsfw",
+    private static let addedLater: Set<String> = ["lodestones/Chroma1-HD", "Kandoo/Juggernaut-XL-Ragnarok",
                                                   "Comfy-Org/Qwen-Image-2.1",
                                                   "llmfan46/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-GGUF"]
     /// 11-17: models the computer no longer keeps. A saved list drops them, so nothing offers a removed model.
     private static let removedIDs: Set<String> = ["black-forest-labs/FLUX.2-klein-9B", "GraydientPlatformAPI/bigasp2lustify",
-                                                  "llmfan46/Qwen3.6-27B-uncensored-heretic-v2-GGUF"]
+                                                  "llmfan46/Qwen3.6-27B-uncensored-heretic-v2-GGUF",
+                                                  "Tongyi-MAI/Z-Image-Turbo", "tewea/z_image_turbo_bf16_nsfw"]
     @Published private(set) var lists: [String: [String]] = [:]
 
     private init() {

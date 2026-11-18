@@ -109,6 +109,19 @@ running or waiting and that time has passed, the engine, the chat model and Comf
 **Why was that picture slow?** `GET http://127.0.0.1:8765/local/timings` (this PC only) lists the recent jobs: seconds
 loading, drawing and improving the words, and whether a model had to load. No words or pictures are in it.
 
+**Web pages on this PC cannot reach any of it.** A hostile page in a browser on this PC can aim requests at
+`127.0.0.1`, and by re-pointing its own hostname there (DNS rebinding) make them look local. Three guards, each checked
+by the server itself and each failing closed:
+- The this-PC pages (`/local/state`, `/local/timings`, `/local/unload`, `/local/quit`) answer only when the request is
+  addressed to `127.0.0.1`, `localhost` or `[::1]` on the server's own port, carries no `Origin` header, and (quit)
+  carries `X-Fixer-Local: 1`. Anything else gets 404.
+- ComfyUI is started through `comfy_guard.py`, which refuses (403) every request, WebSocket included, that is not
+  addressed to its own loopback name and port. After each start the server sends a forged request; if it is answered,
+  ComfyUI is stopped. `/local/state` shows `comfy_guarded`. Off switch: `comfy_guard: 0` in `local.json`.
+- llama-server gets a fresh random key on every start (never on its command line); the server's own calls carry it.
+  After each start the server checks that a call without the key is refused; if not, the chat model is stopped.
+  `/local/state` shows `llama_keyed`. Off switch: `llama_key: 0` in `local.json`.
+
 **Video length.** `seconds` up to `video_max_seconds` (`local.json`, default 30). Wan 2.2 is trained on 5-second clips,
 so a longer one is made in 5-second parts, each starting from the previous part's last frame; a 30-second clip takes
 about six times as long as a 5-second one, and picture quality can drift from part to part.

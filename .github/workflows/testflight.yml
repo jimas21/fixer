@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: read
+  actions: read          # 11-18: to see whether a newer build is already waiting
 
 # One build at a time; never cancel a run that may be mid-upload.
 concurrency:
@@ -17,10 +18,31 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # 11-18: one release, not one per push. When a newer build is already waiting, this run does nothing and the newer
+  # one (which carries the same changes) is the release. Any error here counts as "not superseded".
+  newest:
+    name: Superseded by a newer build?
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      stale: ${{ steps.check.outputs.stale }}
+    steps:
+      - name: Look for a newer build
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          newer=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow testflight.yml --branch main --limit 20                     --json databaseId,status                     --jq "[.[] | select(.databaseId > $GITHUB_RUN_ID and .status != \"completed\")] | length"                   2>/dev/null || echo 0)
+          if [ "${newer:-0}" -gt 0 ] 2>/dev/null; then
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+            echo "### Skipped: a newer build is waiting and will be the release" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   build:
     name: Archive and upload
+    needs: newest
     # Skipped until the repo variables exist. preflight.sh then checks every variable and secret.
-    if: ${{ vars.TEAM_ID != '' && vars.BUNDLE_ID != '' }}
+    if: ${{ needs.newest.outputs.stale != 'true' && vars.TEAM_ID != '' && vars.BUNDLE_ID != '' }}
     # Mac image from the repo variable MAC_RUNNER (default macos-26). macos-15 also carries Xcode 26 and is
     # the fallback when GitHub's macos-26 queue is long; ci/toolchain.sh selects the newest Xcode 26 either way.
     runs-on: ${{ vars.MAC_RUNNER || 'macos-26' }}
@@ -93,14 +115,27 @@ jobs:
           path: build/DerivedData
           key: dd-v2-${{ github.run_id }}
 
+      # 11-18: a newer build arrived while this one was compiling: it is the release, this one is not uploaded.
+      - name: Still the newest build?
+        id: still
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          newer=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow testflight.yml --branch main --limit 20                     --json databaseId,status                     --jq "[.[] | select(.databaseId > $GITHUB_RUN_ID and .status != \"completed\")] | length"                   2>/dev/null || echo 0)
+          if [ "${newer:-0}" -gt 0 ] 2>/dev/null; then
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+            echo "### Not uploaded: a newer build is waiting and will be the release" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Export and upload to TestFlight
+        if: steps.still.outputs.stale != 'true'
         env:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
         run: bash ci/export_upload.sh
 
       - name: Summary
-        if: success()
+        if: success() && steps.still.outputs.stale != 'true'
         run: |
           {
             echo "### Uploaded to TestFlight"

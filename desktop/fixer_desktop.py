@@ -40,7 +40,8 @@ Protocol (version "fixer1"):
   video          "seconds": 1..video_max_seconds (default 30; the phone sends 5, 10, 20 or 30). Longer than 5 s is
                   made as 5-second parts, each continuing from the previous part's last frame; the "video" frame's
                   "seconds" is the real length.
-  this PC only    GET /local/state (also "pid", "comfy", "llama", "free_after_min"), POST /local/unload,
+  this PC only    GET /local/state (also "pid", "comfy", "llama", "free_after_min", "comfy_guarded", "llama_keyed"),
+                  POST /local/unload,
                   POST /local/quit (needs the header X-Fixer-Local: 1): replies {"quitting": true}, stops every job and child, wipes
                   comfy-private and ends the process (<= 20 s). GET /local/timings: the recent finished jobs' speed
                   numbers (no words). A request carrying an Origin header (a web page in a browser) is refused.
@@ -467,6 +468,13 @@ class LlamaBrain:
         self.starting = False
         self.card_gb = 0.0                   # measured card share (display only)
         self.epoch = 0                       # 11-18: bumped by a hard stop (leave / quit): an in-flight resume gives up
+        self.key: str | None = None          # 11-18: this start's API key (never logged, never in any report)
+        self.keyed: bool | None = None       # 11-18: this start proved the key is required
+
+    def key_state(self) -> bool | None:
+        """11-18: for /local/state: True = the running server refuses keyless requests (proven at start), False =
+        started without a key (llama_key 0), None = not running."""
+        return self.keyed if self.running() else None
 
     def running(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
@@ -492,33 +500,41 @@ class LlamaBrain:
             status("Loading model…")
             port = _free_port()
             moe = _is_moe(repo) and gpu
-            args = _llama_args(repo, path, weights, proj, gpu, port)
+            keyed = _tune("llama_key", 1) >= 1          # 11-18: 0 = the old start (no key, CORS default)
+            key = secrets.token_urlsafe(32) if keyed else None
+            args = _llama_args(repo, path, weights, proj, gpu, port, keyed=keyed)
             if gpu and not moe and "COMFY" in globals():
                 COMFY.free()          # dense only: the MoE fits beside ComfyUI (ComfyUI starts with --reserve-vram)
             try:
                 before = _gpu_info()[1] if gpu else 0.0
             except Exception:                            # noqa: BLE001
                 before = 0.0
+            self.key = key
             self.proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                         stderr=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                                         stderr=subprocess.DEVNULL, env=_llama_env(key),
+                                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             _JOB.add(self.proc)
-            import urllib.error
-            import urllib.request
             deadline = time.time() + 300
             while time.time() < deadline:
                 if self.proc.poll() is not None:
                     self.proc = None
+                    self.key = None
                     raise UserFacing("The model couldn't start. Try another model.")
-                try:
-                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as r:
-                        if r.status == 200:
-                            break
-                except (urllib.error.URLError, OSError):
-                    pass
+                if _llama_status(port, "GET", "/health", timeout=2) == 200:
+                    break
                 time.sleep(0.25)
             else:
                 self.stop()
                 raise UserFacing("The model took too long to start.")
+            if keyed:
+                # 11-18: prove the key is required before anything is sent: a keyless request to a protected endpoint
+                # must be refused and a keyed one answered. If not, stop it and refuse to use it (fail closed).
+                proof = _llama_key_proof(port, key)
+                if proof is not True:
+                    log.warning("chat model key check failed (%s); chat model stopped", proof)
+                    self.stop()
+                    raise UserFacing("The model couldn't start. Try another model.")
+            self.keyed = keyed
             self.port, self.repo, self.vision, self.on_gpu = port, repo, bool(proj), gpu
             self.moe = moe
             try:
@@ -541,6 +557,7 @@ class LlamaBrain:
                 self.proc.kill()
         self.proc = None
         self.port = self.repo = None
+        self.key = self.keyed = None
         self.vision = False
         self.moe = False
         self.card_gb = 0.0                   # (paused_for is NOT cleared here)
@@ -583,11 +600,77 @@ class LlamaBrain:
         return "paused" if self.paused_for else "loading" if self.starting else "ready" if self.running() else "off"
 
 
-def _llama_args(repo: str, path: Path, weights: str, proj: str | None, gpu: bool, port: int) -> list[str]:
-    """The llama-server command line (split out so it can be checked without starting anything)."""
+def _llama_env(key: str | None) -> dict | None:
+    """11-18: the environment for llama-server only. With a key: a copy of ours plus LLAMA_API_KEY (this build reads
+    the key from it, so it is never on the command line where any program on this PC could read it), and no
+    LLAMA_ARG_API_KEY_FILE that could replace it. Without one (llama_key 0): None, i.e. inherited, as before."""
+    if not key:
+        return None
+    env = {k: v for k, v in os.environ.items() if k.upper() not in ("LLAMA_API_KEY", "LLAMA_ARG_API_KEY_FILE")}
+    env["LLAMA_API_KEY"] = key
+    return env
+
+
+_BRAIN_KEY = object()                                  # "the running brain's key" (the default for _llama_request)
+
+
+def _llama_request(port: int, method: str, path: str, body: bytes | None = None, headers: dict | None = None,
+                   timeout: float = 600, key=_BRAIN_KEY):
+    """11-18: the ONE way Fixer talks to llama-server: every request carries "Authorization: Bearer <key>" (the
+    running brain's key unless one is given; key=None sends none, only for the start-up proof). Returns
+    (connection, response); the caller reads the response and closes the connection."""
+    import http.client
+    k = LLAMA.key if key is _BRAIN_KEY else key
+    h = dict(headers or {})
+    if k:
+        h["Authorization"] = f"Bearer {k}"
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    try:
+        conn.request(method, path, body=body, headers=h)
+        return conn, conn.getresponse()
+    except BaseException:
+        conn.close()
+        raise
+
+
+def _llama_status(port: int, method: str, path: str, timeout: float = 5, key=_BRAIN_KEY) -> int:
+    """The HTTP status of one small request through _llama_request; 0 when there was no answer."""
+    import http.client
+    try:
+        conn, r = _llama_request(port, method, path, timeout=timeout, key=key)
+    except (OSError, http.client.HTTPException):
+        return 0
+    try:
+        r.read()
+        return r.status
+    except (OSError, http.client.HTTPException):
+        return 0
+    finally:
+        conn.close()
+
+
+LLAMA_PROOF_PATH = "/props"            # protected by the key in llama-server (only /health and /models stay open)
+
+
+def _llama_key_proof(port: int, key: str):
+    """11-18: True when a keyless request is refused (401/403) and the keyed one answered (200); otherwise a short
+    reason for the log line (never the key)."""
+    keyless = _llama_status(port, "GET", LLAMA_PROOF_PATH, key=None)
+    keyed = _llama_status(port, "GET", LLAMA_PROOF_PATH, key=key)
+    if keyless in (401, 403) and keyed == 200:
+        return True
+    return f"keyless answered {keyless}, keyed {keyed}"
+
+
+def _llama_args(repo: str, path: Path, weights: str, proj: str | None, gpu: bool, port: int,
+                keyed: bool = False) -> list[str]:
+    """The llama-server command line (split out so it can be checked without starting anything). Never the key:
+    that goes in the child's environment (_llama_env)."""
     args = [str(LLAMA_SERVER), "-m", str(path / weights), "--host", "127.0.0.1", "--port", str(port),
             "-fa", "on", "-c", str(BRAIN_CTX), "-ctk", "q8_0", "-ctv", "q8_0", "-np", "1",
             "--no-webui", "--log-disable", "--jinja"]
+    if keyed:
+        args += ["--cors-origins", "localhost"]   # 11-18: this build's "same-origin only" (default is every site)
     moe = _is_moe(repo) and gpu
     if moe:
         # 11-17: experts in RAM, the rest on the card. --fit stays on (it fills only what is unset: if ComfyUI holds
@@ -656,12 +739,11 @@ def _chat_llama_once(p: dict, emit, cancel, port: int):
             "temperature": temp, "top_p": 0.95 if think else float(p.get("top_p", 0.8)), "top_k": int(p.get("top_k", 20)),
             "presence_penalty": float(p.get("presence_penalty", 1.5)),   # Qwen3.6 card, non-thinking chat
             "cache_prompt": True, "chat_template_kwargs": {"enable_thinking": think}}
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=600)
+    conn = None
     said = False
     try:
-        conn.request("POST", "/v1/chat/completions", body=json.dumps(body),
-                     headers={"Content-Type": "application/json"})
-        r = conn.getresponse()
+        conn, r = _llama_request(port, "POST", "/v1/chat/completions", body=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"}, timeout=600)
         if r.status != 200:
             try:
                 msg = json.loads(r.read()).get("error", {}).get("message", "")
@@ -717,7 +799,8 @@ def _chat_llama_once(p: dict, emit, cancel, port: int):
             raise UserFacing("The model stopped unexpectedly. Try again.")
         raise
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
     if think and not said and not cancel.is_set():
         # It thought and then said nothing (the phone was left showing "…"): answer again, without thinking.
         _chat_llama_once({**p, "think": False}, emit, cancel, port)
@@ -2426,6 +2509,36 @@ COMFY_DIR = ROOT / "comfyui"
 COMFY_PRIVATE = ROOT / "comfy-private"
 COMFY_PORT = int(os.environ.get("FIXER_COMFY_PORT", "8188"))
 COMFY_ON = os.environ.get("FIXER_COMFY", "1") == "1"       # 0 = old diffusers path for everything
+# 11-18: ComfyUI is started through this (beside this file): it refuses any request whose Host is not 127.0.0.1,
+# localhost or [::1] with ComfyUI's port, so a web page using DNS rebinding cannot read or drive it. Knob comfy_guard.
+COMFY_GUARD = Path(__file__).resolve().parent / "comfy_guard.py"
+COMFY_GUARD_PROBE_HOST = "fixer-guard-check.invalid"
+
+
+def _comfy_status(port: int, host: str | None, path: str = "/system_stats", timeout: float = 5) -> int:
+    """One raw GET to ComfyUI with the Host header exactly as given (None = http.client's own, 127.0.0.1:port).
+    Returns the HTTP status; 0 when there was no answer."""
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    try:
+        conn.request("GET", path, headers={"Host": host} if host is not None else {})
+        r = conn.getresponse()
+        r.read()
+        return r.status
+    except (OSError, http.client.HTTPException):
+        return 0
+    finally:
+        conn.close()
+
+
+def _comfy_guard_proof(port: int):
+    """11-18: True when a forged Host is refused (403) and a normal request answered (200); otherwise a short reason
+    (no request content) for the log line."""
+    forged = _comfy_status(port, f"{COMFY_GUARD_PROBE_HOST}:{port}")
+    normal = _comfy_status(port, None)
+    if forged == 403 and normal == 200:
+        return True
+    return f"forged Host answered {forged}, normal {normal}"
 COMFY_RECIPES = {                                               # phone model id -> Create recipe
     "Kandoo/Juggernaut-XL-Ragnarok": "juggernaut",
     "lodestones/Chroma1-HD": "chroma",
@@ -2802,6 +2915,7 @@ class Comfy:
         self.warmed: set[str] = set()
         self.paths = ""
         self.reserve = 0.0                   # --reserve-vram GB this start used (0 = none)
+        self.guarded: bool | None = None     # 11-18: this start went through the proven host guard
 
     def available(self) -> bool:
         return COMFY_ON and (COMFY_DIR / "main.py").is_file() and (COMFY_DIR / ".venv").is_dir()
@@ -2833,7 +2947,12 @@ class Comfy:
             self.paths = _comfy_paths_yaml()
             (COMFY_PRIVATE / "paths.yaml").write_text(self.paths, encoding="utf-8")
             status("Starting the picture engine…")
-            args = [str(COMFY_DIR / ".venv" / "Scripts" / "python.exe"), "-s", "main.py",
+            guarded = _tune("comfy_guard", 1) >= 1     # 11-18: 0 = the old start (python -s main.py), unguarded
+            if guarded and not COMFY_GUARD.is_file():
+                log.warning("ComfyUI host guard missing; not starting ComfyUI")
+                raise UserFacing("The picture engine on your computer couldn't start.")
+            script = str(COMFY_GUARD) if guarded else "main.py"
+            args = [str(COMFY_DIR / ".venv" / "Scripts" / "python.exe"), "-s", script,
                     "--listen", "127.0.0.1", "--port", str(COMFY_PORT), "--disable-auto-launch",
                     "--temp-directory", str(COMFY_PRIVATE / "temp"), "--input-directory", str(COMFY_PRIVATE / "input"),
                     "--output-directory", str(COMFY_PRIVATE / "output"), "--user-directory", str(COMFY_PRIVATE / "user"),
@@ -2870,10 +2989,20 @@ class Comfy:
                     raise UserFacing("The picture engine on your computer couldn't start.")
                 try:
                     self._get("/system_stats")
-                    _timing(engine_start_s=round(time.monotonic() - t_spawn, 1))
-                    return
                 except Exception:
                     time.sleep(0.5)
+                    continue
+                if guarded:
+                    # 11-18: prove the guard works before anything is sent: a forged Host must be refused (403) and a
+                    # normal request answered (200). If not, stop ComfyUI and refuse to use it (fail closed).
+                    proof = _comfy_guard_proof(COMFY_PORT)
+                    if proof is not True:
+                        log.warning("ComfyUI host guard check failed (%s); ComfyUI stopped", proof)
+                        self._kill_locked()
+                        raise UserFacing("The picture engine on your computer couldn't start.")
+                self.guarded = guarded
+                _timing(engine_start_s=round(time.monotonic() - t_spawn, 1))
+                return
             raise UserFacing("The picture engine on your computer is taking too long to start.")
 
     def ensure_current(self, status=lambda s: None):
@@ -2890,18 +3019,28 @@ class Comfy:
             except Exception:
                 pass
 
-    def stop(self):
+    def guard_state(self) -> bool | None:
+        """11-18: for /local/state: True = started through the proven host guard, False = started without it
+        (comfy_guard 0), None = not running."""
+        return self.guarded if self.running() else None
+
+    def _kill_locked(self):
+        """Kills ComfyUI and wipes its private folders; the caller holds self.lock."""
         import shutil
+        if self.running():
+            self.proc.kill()
+            try:
+                self.proc.wait(10)
+            except Exception:
+                pass
+        self.proc = None
+        self.guarded = None
+        self.warmed.clear()
+        shutil.rmtree(COMFY_PRIVATE, ignore_errors=True)
+
+    def stop(self):
         with self.lock:
-            if self.running():
-                self.proc.kill()
-                try:
-                    self.proc.wait(10)
-                except Exception:
-                    pass
-            self.proc = None
-            self.warmed.clear()
-            shutil.rmtree(COMFY_PRIVATE, ignore_errors=True)
+            self._kill_locked()
 
 
 COMFY = Comfy()
@@ -5775,6 +5914,7 @@ def _leave_free():
 
 
 FREE_AFTER_MIN: float | None = None   # 11-18: the owner's "free my computer after" choice from the phone; None = unset
+FREE_AFTER_SAVED: float | None = None  # 11-18: what free_after.json really holds (None = nothing saved / not read)
 
 
 def _parse_free_after(v) -> float | None:
@@ -5785,6 +5925,40 @@ def _parse_free_after(v) -> float | None:
     if v != v or v < 0 or v > 1440:
         return None
     return v
+
+
+def _free_after_file() -> Path:
+    return ROOT / "free_after.json"
+
+
+def _load_free_after() -> float | None:
+    """11-18: the saved "free my computer after" choice (main() reads it at start, never the import, so the checks
+    are not touched by a leftover file). Missing, unreadable or invalid = None (unset)."""
+    try:
+        data = json.loads(_free_after_file().read_text(encoding="utf-8"))
+    except Exception:                                  # noqa: BLE001
+        return None
+    return _parse_free_after(data.get("free_after_min")) if isinstance(data, dict) else None
+
+
+def _save_free_after(choice: float) -> bool:
+    """11-18: keeps the choice across restarts: only that number, written to a temp file then swapped in. On success
+    FREE_AFTER_SAVED records what the file now holds; on failure it is left alone, so the next send tries again."""
+    global FREE_AFTER_SAVED
+    path = _free_after_file()
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps({"free_after_min": choice}), encoding="utf-8")
+        os.replace(tmp, path)
+        FREE_AFTER_SAVED = choice
+        return True
+    except Exception:                                  # noqa: BLE001
+        log.warning("could not save the free-after choice")
+        try:
+            tmp.unlink()
+        except Exception:                              # noqa: BLE001
+            pass
+        return False
 
 
 def _leave_grace_s(choice: float | None, default_min: float) -> float:
@@ -5898,7 +6072,7 @@ def _deny() -> web.Response:
 
 
 async def handle(request: web.Request) -> web.StreamResponse:
-    global LAST_CHAT, CHATS_ACTIVE, LAST_SEEN, LEFT_AT, FREE_AFTER_MIN
+    global LAST_CHAT, CHATS_ACTIVE, LAST_SEEN, LEFT_AT, FREE_AFTER_MIN, FREE_AFTER_SAVED
     op = request.match_info["op"]
     if op not in JOBS:
         return web.Response(status=404)
@@ -5920,6 +6094,10 @@ async def handle(request: web.Request) -> web.StreamResponse:
         choice = _parse_free_after(payload.get("free_after_min"))
         if choice is not None:
             FREE_AFTER_MIN = choice
+            # 11-18: survives a restart. Compared with what is really in the file, not with memory, so a save that
+            # failed is tried again the next time the phone sends the value.
+            if choice != FREE_AFTER_SAVED:
+                _save_free_after(choice)
 
     resp = web.StreamResponse(headers={"Content-Type": "application/octet-stream", "Cache-Control": "no-store"})
     await resp.prepare(request)
@@ -6044,12 +6222,65 @@ def _plain(e: Exception) -> str:
     return "Something went wrong on your computer. Try again."
 
 
+LOCAL_HOSTNAMES = ("127.0.0.1", "localhost", "[::1]")
+
+
+def _local_host_ok(host: str | None, port: int) -> bool:
+    """11-18: True only for a Host header naming this PC by loopback: 127.0.0.1, localhost or [::1], with no port or
+    exactly `port` (case-insensitive, one trailing dot allowed on the name). This is what defeats DNS rebinding: a
+    hostile page that re-points its own name at 127.0.0.1 still sends that name here. Missing/empty/odd = False."""
+    if not host or not isinstance(host, str) or host != host.strip() or any(c.isspace() for c in host):
+        return False
+    host = host.lower()
+    if host.startswith("["):
+        end = host.find("]")
+        if end < 0:
+            return False
+        name, rest = host[:end + 1], host[end + 1:]
+    elif host.count(":") <= 1:
+        name = host.partition(":")[0]
+        rest = host[len(name):]
+    else:
+        return False
+    if rest and rest != f":{int(port)}":
+        return False
+    if name.endswith("."):
+        name = name[:-1]
+    return name in LOCAL_HOSTNAMES
+
+
 def _from_this_pc(request: web.Request) -> bool:
     # A tunnel (cloudflared) on this PC also connects from 127.0.0.1, but adds forwarding headers.
     # 11-18: a web page open in a browser on this PC can also reach 127.0.0.1; browsers add Origin to those requests.
+    # 11-18: and a page using DNS rebinding sends no Origin on a GET but its own hostname as Host: Host must be loopback.
     forwarded = any(h in request.headers for h in ("Cf-Connecting-Ip", "X-Forwarded-For", "Forwarded", "Cf-Ray",
                                                    "Origin"))
+    hosts = request.headers.getall("Host", [])
+    if len(hosts) != 1 or not _local_host_ok(hosts[0], _own_port(request)):
+        return False
+    if not _url_host_local(request):                   # 11-18: an absolute request line naming another host
+        return False
     return request.remote in ("127.0.0.1", "::1") and not forwarded
+
+
+def _url_host_local(request: web.Request) -> bool:
+    """11-18: request.url's host (taken from an absolute-form request line when there is one, else from Host) must be
+    a loopback name too: 127.0.0.1, localhost or ::1 (yarl drops the brackets), one trailing dot allowed."""
+    try:
+        h = (request.url.host or "").lower()
+    except Exception:                                  # noqa: BLE001  (an unparseable target is refused)
+        return False
+    if h.endswith("."):
+        h = h[:-1]
+    return h in ("127.0.0.1", "localhost", "::1")
+
+
+def _own_port(request: web.Request) -> int:
+    """The port this connection came in on (PORT for the real server; the checks' test server uses a spare one)."""
+    try:
+        return int(request.transport.get_extra_info("sockname")[1])
+    except Exception:                                  # noqa: BLE001
+        return PORT
 
 
 async def local_state(request: web.Request) -> web.Response:
@@ -6059,7 +6290,9 @@ async def local_state(request: web.Request) -> web.Response:
     return web.json_response({"loaded": ENGINE.repo, "busy": QUEUE.busy(), "waiting": len(QUEUE.waiting()),
                               "idle_s": int(time.monotonic() - LAST_USE),
                               "pid": os.getpid(), "comfy": COMFY.running(), "llama": LLAMA.running(),   # 11-18
-                              "free_after_min": FREE_AFTER_MIN})
+                              "free_after_min": FREE_AFTER_MIN,
+                              # 11-18: true = proven at start, false = started without (knob 0), null = not running
+                              "comfy_guarded": COMFY.guard_state(), "llama_keyed": LLAMA.key_state()})
 
 
 # 11-18: the only fields /local/timings hands out. Names of models and recipes and numbers; never the prompt or photo.
@@ -6183,8 +6416,10 @@ def app() -> web.Application:
 
 
 def main():
+    global FREE_AFTER_MIN, FREE_AFTER_SAVED
     _JOB.own()                                         # 11-18: first, before any child: every child dies with us
     lower_priority()
+    FREE_AFTER_MIN = FREE_AFTER_SAVED = _load_free_after()   # 11-18: the owner's last "free my computer after" choice
     import shutil
     shutil.rmtree(COMFY_PRIVATE, ignore_errors=True)   # a crash or kill could have left a job's photo behind
     if not KEYS.exists():

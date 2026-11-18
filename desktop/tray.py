@@ -9,7 +9,8 @@ Green = on, amber = working, grey = off. Hover for the state. Right-click:
   Pair a phone…               opens a window with the QR code
   Open folder
   Quit                        stops the server the same way, then removes the icon (11-18: if not everything stopped
-                              it tries once more first; Turn off then shows "Couldn't stop everything", not "Off")
+                              it tries once more first; Turn off then shows "Couldn't stop everything", not "Off";
+                              a Quit still short after that shows a notification and keeps the icon ~5 s first)
 
 Only one tray can run (a second one exits at once). The tray owns the server: it puts it in a job object, so if the
 tray is ended in any way (Task Manager, a closing session) the server and its children end too. To control the install
@@ -42,6 +43,10 @@ LOG = ROOT / "tray.log"
 STARTUP = Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / "Fixer Desktop.lnk"
 NO_WINDOW = 0x08000000
 STOP_FAILED = "Couldn't stop everything (see tray.log)"   # 11-18: shown instead of "Off" when a stop fell short
+QUIT_NOTICE = ("Fixer Desktop couldn't stop everything before quitting. Some of it may still be running: "
+               "see tray.log in its folder.")
+QUIT_NOTICE_S = 5.0                                     # 11-18: a short Quit keeps the icon this long so it is seen
+_sleep = time.sleep                                     # the checks swap this out
 
 
 def load_conf() -> dict:
@@ -112,8 +117,10 @@ class Tray:
         self.job = fx.Job()                             # the server lives in this: it ends when this tray ends
         self.stopping = False
         self.stop_failed = False                        # 11-18: the last stop fell short (shown instead of "Off")
-        self.want_quit = False
-        self.stop_lock = threading.Lock()
+        self.want_quit = False                          # 11-18: set and read only under quit_lock
+        self.stop_running = False                       # a stop worker owns the stop (under quit_lock)
+        self.quitting = False                           # the icon is about to go (after a Quit's stop)
+        self.quit_lock = threading.Lock()
         self.stop_thread: threading.Thread | None = None
         self.icon = pystray.Icon("fixer", icon_image("off"), "Fixer Desktop — Off", menu=self.menu())
 
@@ -123,7 +130,10 @@ class Tray:
         return self.proc is not None and self.proc.poll() is None
 
     def turn_on(self, *_):
-        if self.stopping or self.running():
+        with self.quit_lock:                            # 11-18: read together with the stop worker's last step
+            if self.stopping or self.quitting:
+                return
+        if self.running():
             return
         if self.reachable():                            # already serving (started by hand or by an older tray): adopt it
             return
@@ -135,32 +145,75 @@ class Tray:
 
     def stop_all(self, quit_after: bool = False):
         """Stops the server, ComfyUI and the chat model, off the menu thread; then (Quit) removes the icon."""
-        if quit_after:
-            self.want_quit = True
-        if self.stop_lock.locked():
-            return                                      # already stopping; a Quit asked meanwhile ends it after
-        self.stop_thread = threading.Thread(target=self._stop_worker, daemon=False, name="tray-stop")
-        self.stop_thread.start()
+        # 11-18: want_quit and stop_running change together under quit_lock, and the worker reads want_quit under it
+        # in the same step that ends its run: a Quit clicked while a stop is finishing is either seen by that worker
+        # or finds no worker and starts its own. It can no longer fall between the two.
+        with self.quit_lock:
+            if self.quitting:
+                return                                  # 11-18: the icon is already going (e.g. the 5 s notice)
+            if quit_after:
+                self.want_quit = True
+            if self.stop_running:
+                return                                  # already stopping; it sees the Quit before it finishes
+            self.stop_running = True
+            self.stopping = True
+        try:
+            self.stop_thread = threading.Thread(target=self._stop_worker, daemon=False, name="tray-stop")
+            self.stop_thread.start()
+        except BaseException:
+            with self.quit_lock:
+                self.stop_running = self.stopping = False
+            raise
 
     def _stop_worker(self):
-        if not self.stop_lock.acquire(blocking=False):
-            return
-        ok = False
+        ok, retried, quit_now, ended = False, False, False, False
         try:
-            self.stopping = True
             self.set("stopping", "Stopping…")
             ok = self._stop_once()
-            if not ok and self.want_quit:               # 11-18: Quit tries once more before the icon goes
-                log("not everything stopped; trying once more before quitting")
+            while True:
+                with self.quit_lock:
+                    quit_now = self.want_quit
+                    if ok or not quit_now or retried:
+                        self.stop_failed = not ok
+                        self.proc = None
+                        # 11-18: set in the same step that clears "stopping", so Turn on can never start a
+                        # server in between
+                        self.quitting = self.quitting or quit_now
+                        self.stopping = False
+                        self.stop_running = False
+                        ended = True
+                        break
+                log("not everything stopped; trying once more before quitting")   # Quit tries once more first
+                retried = True
                 ok = self._stop_once()
-            self.stop_failed = not ok
-            self.proc = None
         finally:
-            self.stopping = False
-            self.stop_lock.release()
+            if not ended:                               # an unexpected error: never leave the tray stuck 'Stopping'
+                with self.quit_lock:
+                    self.stop_failed = not ok
+                    quit_now = self.want_quit
+                    self.quitting = self.quitting or quit_now
+                    self.stopping = False
+                    self.stop_running = False
         self.set("off", "Off" if ok else STOP_FAILED)
-        if self.want_quit:
+        if quit_now:                                    # quitting is already set: Turn on and Quit are ignored now
+            if not ok:
+                self._show_quit_failure()
             self.icon.stop()
+
+    def _show_quit_failure(self):
+        """11-18: a Quit that fell short: a Windows notification (when this pystray has one), and the icon stays with
+        its "Couldn't stop everything" title for QUIT_NOTICE_S seconds. Nothing here can stop the quit."""
+        log("quit fell short; showing it before the icon goes")
+        try:
+            notify = getattr(self.icon, "notify", None)
+            if callable(notify) and getattr(self.icon, "HAS_NOTIFICATION", True):
+                notify(QUIT_NOTICE, "Fixer Desktop")
+        except Exception as ex:                         # noqa: BLE001
+            log(f"notification failed: {type(ex).__name__}")
+        try:
+            _sleep(QUIT_NOTICE_S)
+        except Exception:                               # noqa: BLE001
+            pass
 
     def _stop_once(self) -> bool:
         """One run of the shared stop routine. True only when it reports everything stopped."""

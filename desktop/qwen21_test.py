@@ -722,23 +722,67 @@ def case_cache_flags():
     class P:
         pid = 1
 
+        def __init__(self):
+            self.dead = False
+
         def poll(self):
-            return None
+            return 0 if self.dead else None
+
+        def kill(self):
+            self.dead = True
+            seen["killed"] = seen.get("killed", 0) + 1
+
+        def wait(self, t=None):
+            return 0
 
     def popen(args, **kw):
         seen["args"] = args
+        seen["cwd"] = kw.get("cwd")
         return P()
     fd._timing_saved = None
-    saved = (fd.subprocess.Popen, fd._JOB, fd.COMFY._get, fd.COMFY_DIR, fd.COMFY_PRIVATE)
+    saved = (fd.subprocess.Popen, fd._JOB, fd.COMFY._get, fd.COMFY_DIR, fd.COMFY_PRIVATE, fd._comfy_guard_proof)
     fd.subprocess.Popen = popen
     fd._JOB = types.SimpleNamespace(add=lambda p: None)
     fd.COMFY._get = lambda path, timeout=3: {}
     fd.COMFY_PRIVATE = Path(TMP) / "comfy-private"
+    proofs: list = []
+    fd._comfy_guard_proof = lambda port: proofs.append(port) or True    # never a real request (8188 may be live)
     fd._TL.rec = fd._new_timing_record("picture")
     try:
         fd.COMFY.proc = None
         fd.COMFY.ensure()
         a = seen["args"]
+        # 11-18: started through the host guard: same interpreter and flags, the guard's absolute path for main.py
+        check(a[0] == str(fd.COMFY_DIR / ".venv" / "Scripts" / "python.exe") and a[1:3] == ["-s", str(fd.COMFY_GUARD)]
+              and Path(a[2]).is_absolute() and "main.py" not in a and seen["cwd"] == str(fd.COMFY_DIR),
+              f"ComfyUI starts as <venv python> -s <abs comfy_guard.py> ..., cwd the ComfyUI folder {a[:3]}")
+        check(a[a.index("--port") + 1] == str(fd.COMFY_PORT) and a[a.index("--listen") + 1] == "127.0.0.1"
+              and "--offline" in a, "the flags are unchanged (--listen 127.0.0.1, --port, --offline)")
+        check(proofs == [fd.COMFY_PORT] and fd.COMFY.guard_state() is True, "the guard is proven once; state true")
+        fd.COMFY.proc = None
+        check(fd.COMFY.guard_state() is None, "not running: comfy_guarded null")
+        # a guard that does not refuse a forged Host: ComfyUI is stopped and the start fails closed
+        fd._comfy_guard_proof = lambda port: "forged Host answered 200, normal 200"
+        seen.pop("killed", None)
+        try:
+            fd.COMFY.ensure()
+            failed = False
+        except fd.UserFacing as e:
+            failed = "couldn't start" in str(e)
+        check(failed and seen.get("killed") == 1 and fd.COMFY.proc is None and fd.COMFY.guard_state() is None,
+              "an unproven guard: ComfyUI killed, the usual couldn't-start error")
+        # knob comfy_guard 0: the old start, reported as unguarded, and no proof asked for
+        local0 = fd._local_config
+        fd._local_config = lambda: {"comfy_guard": 0}
+        fd._comfy_guard_proof = lambda port: proofs.append("unexpected") or True
+        fd.COMFY.ensure()
+        a0 = seen["args"]
+        check(a0[1:3] == ["-s", "main.py"] and "unexpected" not in proofs and fd.COMFY.guard_state() is False,
+              "comfy_guard 0: python -s main.py, comfy_guarded false")
+        fd._local_config = local0
+        fd._comfy_guard_proof = lambda port: True
+        fd.COMFY.proc = None
+        fd.COMFY.ensure()
         i = a.index("--cache-ram")
         check(a[i + 1:i + 3] == ["3", "6"], "ComfyUI starts with --cache-ram 3 6 (models stay cached in RAM)")
         check("--high-ram" not in a and "--cache-classic" not in a and "--fast" not in a and "--disable-smart-memory" not in a,
@@ -753,8 +797,9 @@ def case_cache_flags():
         check(a[a.index("--cache-ram") + 1:a.index("--cache-ram") + 3] == ["2", "10.5"], "the cache thresholds are live knobs")
         fd._local_config = local
     finally:
-        fd.subprocess.Popen, fd._JOB, fd.COMFY._get, fd.COMFY_DIR, fd.COMFY_PRIVATE = saved
+        fd.subprocess.Popen, fd._JOB, fd.COMFY._get, fd.COMFY_DIR, fd.COMFY_PRIVATE, fd._comfy_guard_proof = saved
         fd.COMFY.proc = None
+        fd.COMFY.guarded = None
         fd._TL.rec = None
 
 

@@ -35,7 +35,8 @@ ROOT = Path(os.environ.get("FIXER_HOME", r"C:\FixerDesktop"))
 PORT = int(os.environ.get("FIXER_PORT", "8765"))
 TRAY_MUTEX = os.environ.get("FIXER_TRAY_MUTEX", r"Global\FixerDesktopTray")
 NO_WINDOW = 0x08000000
-DEPLOY_FILES = ["fixer_desktop.py", "tray.py", "taehv.py", "pair.py", "fixerctl.py", "client_test.py", "trace_test.py"]
+DEPLOY_FILES = ["fixer_desktop.py", "comfy_guard.py", "tray.py", "taehv.py", "pair.py", "fixerctl.py", "client_test.py",
+                "trace_test.py"]
 SHELLS = {"powershell.exe", "pwsh.exe", "cmd.exe", "conhost.exe", "bash.exe", "sh.exe"}
 OWN_SCRIPTS = re.compile(r"""(^|[\\/"\s])(tray|pair|fixerctl)\.py\b""")
 

@@ -120,6 +120,41 @@ def case_free_after_rules():
         check(p(bad) is None, f"free_after_min {bad!r} is ignored")
 
 
+def case_local_host_rule():
+    """11-18: the Host test behind every /local page (DNS rebinding): loopback names only, no port or our own."""
+    ok, P = fd._local_host_ok, 8765
+    for good in ("127.0.0.1", "127.0.0.1:8765", "localhost", "localhost:8765", "LocalHost:8765", "localhost.",
+                 "localhost.:8765", "127.0.0.1.", "[::1]", "[::1]:8765"):
+        check(ok(good, P), f"Host {good!r} is this PC")
+    for bad in ("", None, "evil.example", "evil.example:8765", "localhost.evil.example", "127.0.0.1.evil.example",
+                "127.0.0.1.evil.example:8765", "localhost:8766", "127.0.0.1:80", "[::1]:1", "localhost:",
+                "localhost:08765", "local host", " localhost", "localhost ", "localhost\t", "a@127.0.0.1",
+                "a@localhost:8765", "172.16.0.9:8765", "[::1].:8765", "0.0.0.0", "0.0.0.0:8765", "[::]:8765", "::1", "[::1",
+                "localhost..", "127.0.0.2", "[::ffff:127.0.0.1]", "127.1", "2130706433", "localhost:8765:8765"):
+        check(not ok(bad, P), f"Host {bad!r} is refused")
+    check(ok("localhost:4321", 4321) and not ok("localhost:8765", 4321), "the port is the server's own")
+
+
+def case_free_after_file():
+    """11-18: the saved choice: missing, unreadable or invalid means unset; a good file is read back."""
+    f = fd._free_after_file()
+    try:
+        f.unlink()
+    except FileNotFoundError:
+        pass
+    check(fd._load_free_after() is None, "no file: unset")
+    for text in ("", "not json", "[5]", '{"free_after_min": "5"}', '{"free_after_min": -1}', '{"free_after_min": 9999}',
+                 '{"free_after_min": true}', '{"other": 5}', "null"):
+        f.write_text(text, encoding="utf-8")
+        check(fd._load_free_after() is None, f"invalid file {text!r}: unset")
+    f.write_bytes(b"\xff\xfe\x00garbage")
+    check(fd._load_free_after() is None, "unreadable bytes: unset")
+    check(fd._save_free_after(15.0) and fd._load_free_after() == 15.0, "set then reload: 15")
+    check(fd._save_free_after(0.0) and fd._load_free_after() == 0.0, "0 (never) is kept as 0, not unset")
+    check(fd.FREE_AFTER_MIN is None, "loading never happens at import (the checks' module state is untouched)")
+    f.unlink()
+
+
 async def case_leave_check_choice():
     """11-18: _leave_check uses the owner's choice, and waits while a chat model is starting."""
     fd.QUEUE = fd.JobQueue()
@@ -284,11 +319,12 @@ def write_keys():
     fd.KEYSTORE = fd.Keys(fd.KEYS)
 
 
-async def call(client, op: str, payload: dict) -> list[dict]:
+async def call(client, op: str, payload: dict, host: str | None = None) -> list[dict]:
     stamp = str(int(time.time()))
     aad = f"{fd.PROTOCOL}|{op}|{PHONE}|{stamp}"
     body = fd.seal(KEY, json.dumps(payload).encode(), aad.encode())
-    r = await client.post(f"/v1/{op}", data=body, headers={"X-Fixer-Phone": PHONE, "X-Fixer-Time": stamp})
+    headers = {"X-Fixer-Phone": PHONE, "X-Fixer-Time": stamp, **({"Host": host} if host else {})}
+    r = await client.post(f"/v1/{op}", data=body, headers=headers)
     if r.status != 200:
         return [{"t": "http", "status": r.status}]
     raw = await r.read()
@@ -345,6 +381,57 @@ async def case_http():
         await call(client, "status", {})
         r = await client.get("/local/state")
         check((await r.json()).get("free_after_min") == 0, "/local/state reports the choice")
+        # 11-18: the choice is saved when it changes and read back by a restart (0 = never is kept, not unset)
+        saved_file = fd._free_after_file()
+        check(json.loads(saved_file.read_text(encoding="utf-8")) == {"free_after_min": 0.0}
+              and fd._load_free_after() == 0.0, "the 0 (never) choice is saved and a restart reads 0, not unset")
+        check(not saved_file.with_name(saved_file.name + ".tmp").exists(), "no temp file is left behind")
+        await call(client, "leave", {"free_after_min": 60})
+        check(fd._load_free_after() == 60.0, "a new choice replaces the saved one")
+        await call(client, "warm", {"free_after_min": "bad"})
+        check(fd._load_free_after() == 60.0, "an ignored value never touches the saved one")
+        # 11-18: a save that failed is tried again the next time the phone sends the value (what was saved is tracked,
+        # not just what is in memory); once it is saved, the same value is not written again
+        real_save, tries = fd._save_free_after, []
+        fails = [True]
+
+        def flaky_save(choice):
+            tries.append(choice)
+            if fails and fails.pop():
+                return False                           # like a failed write: FREE_AFTER_SAVED stays as it was
+            return real_save(choice)
+        fd._save_free_after = flaky_save
+        try:
+            await call(client, "leave", {"free_after_min": 20})
+            check(fd.FREE_AFTER_MIN == 20 and fd._load_free_after() == 60.0, "a failed save: in memory, not on disk")
+            await call(client, "warm", {"free_after_min": 20})
+            check(fd._load_free_after() == 20.0 and tries == [20, 20], f"the same value again: saved now {tries}")
+            await call(client, "leave", {"free_after_min": 20})
+            check(tries == [20, 20], f"saved: not written again {tries}")
+        finally:
+            fd._save_free_after = real_save
+        await call(client, "leave", {"free_after_min": 0})
+        await call(client, "status", {})
+
+        # 11-18: DNS rebinding: a hostile name pointed at 127.0.0.1 arrives from loopback with no Origin, but with its
+        # own name as Host. Every /local page refuses any Host but loopback; "/" and /v1 do not care (the phone uses
+        # the LAN address or a public name).
+        for bad in ("evil.example", "evil.example:%d" % client.port, "localhost.evil.example",
+                    "127.0.0.1.evil.example", "127.0.0.1:1", "0.0.0.0:%d" % client.port):
+            for path in ("/local/state", "/local/timings"):
+                r = await client.get(path, headers={"Host": bad})
+                check(r.status == 404, f"{path} refused with Host {bad}")
+            r = await client.post("/local/unload", headers={"Host": bad})
+            check(r.status == 404, f"/local/unload refused with Host {bad}")
+        for good in ("localhost:%d" % client.port, "LOCALHOST", "127.0.0.1", "127.0.0.1.:%d" % client.port):
+            r = await client.get("/local/state", headers={"Host": good})
+            check(r.status == 200, f"/local/state answers with Host {good}")
+        r = await client.get("/", headers={"Host": "phone.example"})
+        check(r.status == 200, "the plain / page ignores Host")
+        frames = await call(client, "status", {}, host="phone.example")
+        check(frames and frames[-1].get("t") == "done", f"/v1 works with a non-loopback Host {frames}")
+        frames = await call(client, "status", {}, host="203.0.113.5:8765")
+        check(frames and frames[-1].get("t") == "done", f"/v1 works with an address as Host {frames}")
 
         # /local/state: the three new fields; refused through a tunnel and from a web page (Origin)
         r = await client.get("/local/state")
@@ -396,7 +483,8 @@ async def case_http():
         fd._EXIT = lambda code: order.append(f"exit{code}")
         LOCAL = {"X-Fixer-Local": "1"}
         for h in ({"Cf-Connecting-Ip": "1.2.3.4"}, {"X-Forwarded-For": "1.2.3.4"}, {"Forwarded": "for=1.2.3.4"},
-                  {"Cf-Ray": "x"}, {"Origin": "http://example.test"}, {"Origin": "null"}):
+                  {"Cf-Ray": "x"}, {"Origin": "http://example.test"}, {"Origin": "null"},
+                  {"Host": "evil.example"}, {"Host": f"localhost.evil.example:{client.port}"}):
             r = await client.post("/local/quit", headers={**h, **LOCAL})
             check(r.status == 404, f"/local/quit refused with {list(h)[0]}")
         for h in ({}, {"X-Fixer-Local": "0"}, {"X-Fixer-Local": "yes"}):
@@ -530,6 +618,7 @@ def case_real_boot_and_quit():
         port = free_port()
     home = Path(TMP) / "boot_home"
     home.mkdir(exist_ok=True)
+    (home / "free_after.json").write_text('{"free_after_min": 0}', encoding="utf-8")   # a choice saved before a restart
     env = {**os.environ, "FIXER_HOME": str(home), "FIXER_COMFY": "0", "FIXER_PORT": str(port),
            "FIXER_HOST": "127.0.0.1"}
     proc = subprocess.Popen([sys.executable, "-u", str(HERE / "fixer_desktop.py")], env=env, cwd=str(HERE),
@@ -553,6 +642,24 @@ def case_real_boot_and_quit():
     with urllib.request.urlopen(f"http://127.0.0.1:{port}/local/timings", timeout=5) as r:
         tm = json.loads(r.read())
     check(tm.get("jobs") == [] and "left_s" in tm and "idle_s" in tm, f"real /local/timings {tm}")
+    check(st.get("free_after_min") == 0, f"the saved 'never' choice is back after a restart ({st.get('free_after_min')!r})")
+
+    # 11-18: DNS rebinding: the same loopback connection with a forged Host is refused by every /local page
+    def status(path: str, host: str, post: bool = False) -> int:
+        h = {"Host": host, **({"X-Fixer-Local": "1"} if post else {})}
+        rq = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=b"" if post else None, headers=h,
+                                    method="POST" if post else "GET")
+        try:
+            with urllib.request.urlopen(rq, timeout=5) as resp:
+                return resp.status
+        except urllib.error.HTTPError as e:
+            return e.code
+    for forged in (f"evil.example:{port}", f"localhost.evil.example:{port}"):
+        check(status("/local/state", forged) == 404, f"real /local/state refused with Host {forged}")
+        check(status("/local/timings", forged) == 404, f"real /local/timings refused with Host {forged}")
+        check(status("/local/quit", forged, post=True) == 404, f"real /local/quit refused with Host {forged}")
+    check(status("/local/state", f"localhost:{port}") == 200, "real /local/state answers with Host localhost")
+    check(port_open(port) and proc.poll() is None, "a refused forged quit left the server running")
     req = urllib.request.Request(f"http://127.0.0.1:{port}/local/quit", data=b"", method="POST")
     try:
         urllib.request.urlopen(req, timeout=5).read()

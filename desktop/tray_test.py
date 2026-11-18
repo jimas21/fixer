@@ -54,6 +54,8 @@ import fixerctl as fx  # noqa: E402
 import tray  # noqa: E402
 
 tray.LOG = Path(TMP) / "tray.log"
+SLEPT: list[float] = []
+tray._sleep = lambda s: SLEPT.append(s)                 # the 5 s quit notice never really waits here
 
 FAILS: list[str] = []
 CHECKS = 0
@@ -84,6 +86,21 @@ check(lo(r"C:\FixerDesktop\comfyui\.venv\Scripts\python.exe", r"C:\FixerDesktop\
 check(lo(r"C:\Users\x\AppData\Local\Programs\Python\Python312\python.exe",
          r'"C:\Users\x\Python312\python.exe" -s main.py --temp-directory C:\FixerDesktop\comfy-private\temp'),
       "ComfyUI's base-python child (command line names comfy-private) is a leftover")
+# 11-18: ComfyUI started through the host guard (comfy_guard.py beside the server, every other flag unchanged)
+GUARD_FLAGS = (r" -s C:\FixerDesktop\comfy_guard.py --listen 127.0.0.1 --port 8188 --disable-auto-launch"
+               r" --temp-directory C:\FixerDesktop\comfy-private\temp --input-directory C:\FixerDesktop\comfy-private\input"
+               r" --extra-model-paths-config C:\FixerDesktop\comfy-private\paths.yaml --offline")
+check(lo(r"C:\FixerDesktop\comfyui\.venv\Scripts\python.exe",
+         r'"C:\FixerDesktop\comfyui\.venv\Scripts\python.exe"' + GUARD_FLAGS),
+      "the guarded ComfyUI launcher (ROOT\\comfyui\\.venv python running comfy_guard.py) is a leftover")
+check(lo(r"C:\Users\x\AppData\Local\Programs\Python\Python312\python.exe",
+         r'"C:\Users\x\AppData\Local\Programs\Python\Python312\python.exe"' + GUARD_FLAGS),
+      "the guarded ComfyUI's base-python child (names ROOT\\comfy_guard.py and ROOT\\comfy-private) is a leftover")
+check(not lo(r"C:\Users\x\AppData\Local\Programs\Python\Python312\python.exe",
+             r'"C:\Users\x\Python312\python.exe" -s C:\FixerDesktop2\comfy_guard.py --temp-directory C:\FixerDesktop2\comfy-private\temp'),
+      "another install's guarded ComfyUI is not ours")
+check(not lo(r"C:\Program Files\Notepad++\notepad++.exe", r"notepad++ C:\FixerDesktop\comfy_guard.py"),
+      "an editor with comfy_guard.py open is excluded")
 check(lo(r"C:\Users\x\AppData\Local\Programs\Python\Python312\python.exe",
          r'"C:\Users\x\Python312\python.exe" -u C:\FixerDesktop\fixer_desktop.py'),
       "the base-python child running ROOT\\fixer_desktop.py is a leftover")
@@ -326,7 +343,7 @@ check(t.state == "off" and not t.stopping, "after Quit the tray is grey and not 
 order.clear()
 with mock.patch.object(fx, "stop_everything", fake_stop):
     t.icon.stop = lambda: order.append("icon.stop")
-    t.want_quit = False
+    t.want_quit = t.quitting = False                    # the same tray object is reused after a Quit
     t.turn_off()
     t.stop_thread.join(10)
 check(order == ["stop_everything"] and t.state == "off", f"Turn off stops the server and leaves the tray ({order})")
@@ -342,7 +359,7 @@ def boom(*a, **k):
 
 with mock.patch.object(fx, "stop_everything", boom):
     t.icon.stop = lambda: order.append("icon.stop")
-    t.want_quit = False
+    t.want_quit = t.quitting = False                    # the same tray object is reused after a Quit
     t.quit()
     t.stop_thread.join(10)
 check(order == ["stop_everything", "stop_everything", "icon.stop"] and not t.stopping,
@@ -360,7 +377,7 @@ def stop_with(*a, **k):
 
 with mock.patch.object(fx, "stop_everything", stop_with):
     t.icon.stop = lambda: order.append("icon.stop")
-    t.want_quit = False
+    t.want_quit = t.quitting = False                    # the same tray object is reused after a Quit
     t.turn_off()
     t.stop_thread.join(10)
 check(order == ["stop_everything"] and t.detail == tray.STOP_FAILED and t.stop_failed,
@@ -375,13 +392,203 @@ check(order == ["stop_everything", "stop_everything", "icon.stop"] and t.detail 
 order.clear()
 results[:] = [False, False]
 with mock.patch.object(fx, "stop_everything", stop_with):
-    t.want_quit = False
+    t.want_quit = t.quitting = False                    # the same tray object is reused after a Quit
     t.quit()
     t.stop_thread.join(10)
 check(order == ["stop_everything", "stop_everything", "icon.stop"] and t.detail == tray.STOP_FAILED,
       f"Quit: two short stops, the icon goes and the failure is logged ({order})")
 check("not everything stopped; trying once more" in tray.LOG.read_text(encoding="utf-8"), "the retry is in tray.log")
 t.stop_failed = False
+
+# 11-18: a Quit that falls short is shown before the icon goes: a notification (when pystray has one) and the icon kept
+# with its "Couldn't stop everything" title for QUIT_NOTICE_S seconds; a missing or failing notify never stops the quit.
+seen_title: list[str] = []
+
+
+def notify_ok(message, title=None):
+    order.append("notify")
+    seen_title.append(t.icon.title)
+    check("couldn't stop everything" in message.lower() and title == "Fixer Desktop", f"the notice text ({message!r})")
+
+
+def notify_boom(message, title=None):
+    order.append("notify")
+    raise RuntimeError("no shell")
+
+
+for label, notify, want in (("with notify", notify_ok, ["notify"]), ("notify raises", notify_boom, ["notify"]),
+                            ("no notify at all", None, [])):
+    order.clear()
+    SLEPT.clear()
+    results[:] = [False, False]
+    if notify is None:
+        t.icon.__dict__.pop("notify", None)
+    else:
+        t.icon.notify = notify
+    tray._sleep = lambda s: (order.append(f"sleep{s:g}"), SLEPT.append(s))
+    with mock.patch.object(fx, "stop_everything", stop_with):
+        t.want_quit = t.quitting = False                    # the same tray object is reused after a Quit
+        t.quit()
+        t.stop_thread.join(10)
+    check(order == ["stop_everything", "stop_everything", *want, "sleep5", "icon.stop"],
+          f"short Quit ({label}): shown, kept ~5 s, then the icon goes ({order})")
+    check(tray.STOP_FAILED in t.icon.title and t.detail == tray.STOP_FAILED,
+          f"short Quit ({label}): the icon's title says so while it waits ({t.icon.title!r})")
+check(seen_title and tray.STOP_FAILED in seen_title[0], "the title was already set when the notice went up")
+
+# HAS_NOTIFICATION False (a backend without notifications): notify is not called, the wait and the quit still happen
+order.clear()
+results[:] = [False, False]
+t.icon.notify = notify_ok
+t.icon.HAS_NOTIFICATION = False
+with mock.patch.object(fx, "stop_everything", stop_with):
+    t.want_quit = t.quitting = False                    # the same tray object is reused after a Quit
+    t.quit()
+    t.stop_thread.join(10)
+check(order == ["stop_everything", "stop_everything", "sleep5", "icon.stop"], f"no notifications: wait, quit ({order})")
+del t.icon.HAS_NOTIFICATION
+t.icon.__dict__.pop("notify", None)
+
+# a Quit that worked shows nothing and does not wait
+order.clear()
+results[:] = [True]
+with mock.patch.object(fx, "stop_everything", stop_with):
+    t.want_quit = t.quitting = False                    # the same tray object is reused after a Quit
+    t.quit()
+    t.stop_thread.join(10)
+check(order == ["stop_everything", "icon.stop"], f"a clean Quit: no notice, no wait ({order})")
+t.stop_failed = False
+
+# 11-18: a second Quit (or Turn off) during the 5-second "couldn't stop" notice does nothing: no second stop, the icon
+# goes once; and Turn on clicked there starts nothing
+order.clear()
+results[:] = [False, False]
+late: list = []
+prev_sleep = tray._sleep
+
+
+def sleep_and_click(s):
+    order.append(f"sleep{s:g}")
+    first = t.stop_thread
+    t.quit()
+    t.turn_off()
+    late.append(t.stop_thread is first and not t.stop_running)
+
+
+with mock.patch.object(fx, "stop_everything", stop_with), mock.patch.object(t, "reachable", lambda: None), \
+        mock.patch.object(tray, "start_in_job") as sij:
+    tray._sleep = sleep_and_click
+    t.want_quit = t.quitting = False
+    t.quit()
+    t.stop_thread.join(10)
+    t.turn_on()
+check(order == ["stop_everything", "stop_everything", "sleep5", "icon.stop"] and late == [True],
+      f"a second Quit during the notice: no second stop, one icon.stop ({order}, {late})")
+check(not sij.called, "Turn on during / after the Quit's notice starts nothing")
+
+# 11-18: "quitting" is set in the same locked step that clears "stopping": by the time the worker shows "Off" (the
+# first moment Turn on could pass the stopping check) quitting is already true
+order.clear()
+results[:] = [True]
+seen_at_off: list = []
+real_set_t = t.set
+
+
+def set_watch(state, detail):
+    if state == "off":
+        with t.quit_lock:
+            seen_at_off.append((t.stopping, t.quitting))
+        with mock.patch.object(t, "reachable", lambda: None), mock.patch.object(tray, "start_in_job") as sij2:
+            t.turn_on()
+            seen_at_off.append(sij2.called)
+    real_set_t(state, detail)
+
+
+t.set = set_watch
+with mock.patch.object(fx, "stop_everything", stop_with):
+    t.want_quit = t.quitting = False
+    t.quit()
+    t.stop_thread.join(10)
+t.set = real_set_t
+check(seen_at_off == [(False, True), False], f"quitting is set together with stopping cleared ({seen_at_off})")
+tray._sleep = prev_sleep
+t.quitting = False
+
+# 11-18: the race: a Quit clicked while a Turn off's stop is running is never lost
+# (a) during the stop: the running worker sees it and removes the icon
+order.clear()
+t4 = tray.Tray()
+t4.icon.stop = lambda: order.append("icon.stop")
+gate, inside = threading.Event(), threading.Event()
+
+
+def slow_stop(*a, **k):
+    order.append("stop_everything")
+    inside.set()
+    gate.wait(10)
+    return dict(fake_rep)
+
+
+with mock.patch.object(fx, "stop_everything", slow_stop):
+    t4.turn_off()
+    first = t4.stop_thread
+    inside.wait(10)
+    t4.quit()                                           # the stop is running: this only records the Quit
+    check(t4.stop_thread is first, "a Quit during a stop starts no second stop")
+    gate.set()
+    first.join(10)
+check(order == ["stop_everything", "icon.stop"], f"Quit during a Turn off's stop: the icon goes ({order})")
+
+# (b) just after the worker decided (lock released, icon not yet updated): the Quit starts its own stop and quits
+order.clear()
+t5 = tray.Tray()
+t5.icon.stop = lambda: order.append("icon.stop")
+real_set = t5.set
+fired: list[int] = []
+
+
+def set_then_quit(state, detail):
+    if state == "off" and not fired:
+        fired.append(1)
+        t5.quit()                                       # lands after the worker's last look at want_quit
+    real_set(state, detail)
+
+
+t5.set = set_then_quit
+with mock.patch.object(fx, "stop_everything", fake_stop):
+    t5.turn_off()
+    first = t5.stop_thread
+    first.join(10)
+    if t5.stop_thread is not first:
+        t5.stop_thread.join(10)
+check(order == ["stop_everything", "stop_everything", "icon.stop"] and not t5.stopping and not t5.stop_running,
+      f"Quit as a stop finishes: a second stop runs and the icon goes ({order})")
+
+# (c) many Quit / Turn off clicks at once: one stop at a time, and the icon goes exactly once
+order.clear()
+t6 = tray.Tray()
+t6.icon.stop = lambda: order.append("icon.stop")
+with mock.patch.object(fx, "stop_everything", fake_stop):
+    clicks = [threading.Thread(target=(t6.quit if i % 2 else t6.turn_off)) for i in range(20)]
+    for c in clicks:
+        c.start()
+    for c in clicks:
+        c.join(10)
+    for _ in range(100):
+        th = t6.stop_thread
+        th.join(10)
+        if th is t6.stop_thread and not t6.stop_running:
+            break
+check("icon.stop" in order and not t6.stopping, f"a storm of clicks still ends with the icon gone ({order.count('icon.stop')})")
+
+# turn_on is ignored once a Quit is removing the icon
+t7 = tray.Tray()
+t7.quitting = True
+with mock.patch.object(t7, "reachable", lambda: None), mock.patch.object(tray, "start_in_job") as sij:
+    t7.turn_on()
+check(not sij.called, "Turn on does nothing while the icon is going")
+for x in (t4, t5, t6, t7):
+    x.job.close()
 
 # turn_on adopts a server that already answers instead of starting a second
 t2 = tray.Tray()

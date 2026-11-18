@@ -26,7 +26,9 @@ final class TidyFree: ObservableObject {
     @Published var working = false
     @Published var message: String?
 
-    func run(after: @escaping () -> Void = {}) {
+    /// `clearsItself`: the result is a line under the button (list rows), which goes away by itself after a few
+    /// seconds so it never looks like the result of a later tap. The menu shows an alert instead and leaves it.
+    func run(clearsItself: Bool = false, after: @escaping () -> Void = {}) {
         guard !working else { return }
         working = true
         message = nil
@@ -39,6 +41,10 @@ final class TidyFree: ObservableObject {
             }
             working = false
             after()
+            if clearsItself, let shown = message {
+                try? await Task.sleep(nanoseconds: 6_000_000_000)
+                if !working, message == shown { message = nil }
+            }
         }
     }
 }
@@ -52,7 +58,9 @@ private struct TidyFreeFlow: ViewModifier {
     func body(content: Content) -> some View {
         content
             .confirmationDialog(TidyText.freeConfirmTitle, isPresented: $model.asking, titleVisibility: .visible) {
-                Button(TidyText.freeConfirmButton, role: .destructive) { model.run(after: onDone) }
+                Button(TidyText.freeConfirmButton, role: .destructive) {
+                    model.run(clearsItself: !alertResult, after: onDone)
+                }
                 Button("Cancel", role: .cancel) {}
             } message: {
                 Text(TidyText.freeCaption)

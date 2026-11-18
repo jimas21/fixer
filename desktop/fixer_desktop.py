@@ -3740,9 +3740,6 @@ def job_comfy_recipes(p: dict, emit, cancel):
 
 # ---------------------------------------------------------------- Make's style recipes and the age floor (11-17)
 
-# THE age floor for people in generated pictures and video: single source (the owner, 11-17). Applied to every
-# picture/video request right before it runs (after the enhancer, see queue_runner), and sent to the phone so Make's
-
 
 # The recipes and quick picks live in a PRIVATE file beside the server (never in git; the owner edits it, and an
 # edit shows the next time Make opens). The public example below is the fallback when it is missing.
@@ -3809,7 +3806,7 @@ def _make_catalog() -> dict:
             return int(x)
         except (TypeError, ValueError):
             return fallback
-    
+
 
 def job_make_recipes(p: dict, emit, cancel):
     """Make's recipe row, quick picks and age range (op `make_recipes`). Read fresh on every call."""
@@ -5067,6 +5064,7 @@ async def local_unload(request: web.Request) -> web.Response:
 def app() -> web.Application:
     a = web.Application(client_max_size=MAX_BODY)
     a.cleanup_ctx.append(idle_unloader)
+    a.cleanup_ctx.append(queue_runner)
     if COMFY.available():
         threading.Thread(target=lambda: _quietly(COMFY.ensure), daemon=True, name="comfy-start").start()
     a.router.add_post("/v1/{op}", handle)

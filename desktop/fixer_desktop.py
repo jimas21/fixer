@@ -1206,22 +1206,94 @@ def job_status(p: dict, emit, cancel):
           "queue_waiting": len(QUEUE.waiting()), "queue_running": 1 if QUEUE.busy() else 0})
 
 
-def job_remove_model(p: dict, emit, cancel):
-    """Deletes one downloaded model from the capped folder (the phone's "Remove from PC"). Runs as a job in the line
-    (first), so nothing is using the card; if it's loaded it is unloaded first. Picking it again later downloads it again."""
+def _clean_model_name(repo: str) -> str:
+    """A readable fallback name from a repo id (the phone has its own names for the built-ins)."""
+    n = repo.split("/")[-1]
+    for junk in ("-GGUF", "-gguf", "_ComfyUI_Repackaged", "_ComfyUI_repackaged", "_repackaged", "-bf16", "-fp16"):
+        n = n.replace(junk, "")
+    return n.replace("-", " ").replace("_", " ").strip() or repo
+
+
+def _installed_models() -> list[dict]:
+    """One entry per model on this computer: {id (the phone id), name, kind (picture/video/chat/other), repos (the
+    hub repos it owns), size (bytes), in_use}. A recipe's parts are grouped under its phone id; a part shared with
+    another installed model is never listed as its own model."""
     from huggingface_hub import scan_cache_dir
-    repo = BRAIN_ALIASES.get(p.get("model") or "", p.get("model") or "")
-    cache = scan_cache_dir(MODELS / "hub")
-    hit = next((r for r in cache.repos if r.repo_id == repo), None)
-    if hit is None:
+    try:
+        sizes = {r.repo_id: r.size_on_disk for r in scan_cache_dir(MODELS / "hub").repos}
+    except Exception:                                    # noqa: BLE001
+        sizes = {}
+    present = set(sizes)
+    out: list[dict] = []
+    claimed: set[str] = set()
+    comfy_loaded = COMFY.running()
+    for phone_id, rid in COMFY_RECIPES.items():          # picture models: parts grouped under the phone id
+        r = CREATE_RECIPES.get(rid)
+        if not r or not _recipe_ready(r):
+            continue
+        repos = [n for n in r["needs"] if n in present]
+        size = sum(sizes.get(n, 0) for n in repos) + (_tree_size(COMFY_VAE) if rid == "chroma" else 0)
+        claimed.update(repos)
+        out.append({"id": phone_id, "name": r["name"], "kind": "picture", "repos": repos, "size": size,
+                    "in_use": comfy_loaded and rid in COMFY.warmed})
+    if WAN14_REPO in present:                             # video: the three Wan repos are one model
+        vrepos = [x for x in (WAN14_REPO, WAN_TE_REPO, WAN_EXPLICIT_REPO) if x in present]
+        claimed.update(vrepos)
+        out.append({"id": WAN14_REPO, "name": "Wan 2.2 14B video", "kind": "video", "repos": vrepos,
+                    "size": sum(sizes.get(x, 0) for x in vrepos), "in_use": VIDEO_BUSY.is_set()})
+    for repo in sorted(present - claimed):               # chat brains (GGUF weights)
+        if any(f.lower().endswith(".gguf") for f, _ in _cached_files(repo)):
+            out.append({"id": repo, "name": _clean_model_name(repo), "kind": "chat", "repos": [repo],
+                        "size": sizes[repo], "in_use": LLAMA.running() and LLAMA.repo == repo})
+            claimed.add(repo)
+    for repo in sorted(present - claimed):               # editors, tools and anything else left
+        out.append({"id": repo, "name": _clean_model_name(repo), "kind": "other", "repos": [repo],
+                    "size": sizes[repo], "in_use": repo in (ENGINE.repo or "")})
+    return out
+
+
+def job_installed(p: dict, emit, cancel):
+    """Every model on this computer the phone's Models screen can remove, one entry per model."""
+    emit({"t": "info", "installed": [{"id": m["id"], "name": m["name"], "kind": m["kind"],
+                                      "size_gb": round(m["size"] / 1024 ** 3, 1), "in_use": m["in_use"]}
+                                     for m in _installed_models()]})
+
+
+def job_remove_model(p: dict, emit, cancel):
+    """Removes one model from the capped folder (the phone's Models screen). Resolves a phone id to the repos the
+    model owns, deletes only repos no other installed model still needs, stops ComfyUI first (Windows won't delete
+    open files) and unloads the chat model / helper if they held it. Picking it again later downloads it again."""
+    from huggingface_hub import scan_cache_dir
+    want = p.get("model") or ""
+    want_resolved = BRAIN_ALIASES.get(want, want)
+    models = _installed_models()
+    entry = next((m for m in models if want in (m["id"],) or want_resolved in ([m["id"]] + m["repos"])), None)
+    if entry is None:
         raise UserFacing("That model isn't on your computer.")
-    if LLAMA.repo == repo:
-        LLAMA.stop()
-    if repo in (ENGINE.repo or ""):
-        ENGINE.unload()                                # also ends the helper process
-    cache.delete_revisions(*[rev.commit_hash for rev in hit.revisions]).execute()
-    left = scan_cache_dir(MODELS / "hub").size_on_disk
-    emit({"t": "info", "removed": repo, "freed_gb": round(hit.size_on_disk / 1024 ** 3, 1),
+    if entry["kind"] == "chat" and LLAMA.running() and LLAMA.repo in entry["repos"]:
+        raise UserFacing("That chat model is in use right now. Switch to another chat model first, then remove it.")
+    if entry["kind"] == "picture" and sum(1 for m in models if m["kind"] == "picture") <= 1:
+        raise UserFacing("That's the only picture model on your computer. Add another before removing this one.")
+    keep = {rp for m in models if m is not entry for rp in m["repos"]}   # repos another installed model still needs
+    to_delete = [rp for rp in entry["repos"] if rp not in keep]
+    COMFY.stop()                                         # release ComfyUI's file handles before deleting (Windows)
+    COMFY.warmed.clear()
+    for rp in to_delete:
+        if LLAMA.running() and LLAMA.repo == rp:
+            LLAMA.stop()
+        if rp in (ENGINE.repo or ""):
+            ENGINE.unload()                              # also ends the helper process
+    cache = scan_cache_dir(MODELS / "hub")
+    freed = 0
+    for rp in to_delete:
+        hit = next((r for r in cache.repos if r.repo_id == rp), None)
+        if hit is None:
+            continue
+        freed += hit.size_on_disk
+        cache.delete_revisions(*[rev.commit_hash for rev in hit.revisions]).execute()
+    left = (scan_cache_dir(MODELS / "hub").size_on_disk
+            + _tree_size(MODELS / "comfy-loras") + _tree_size(MODELS / "comfy-vae"))
+    emit({"t": "info", "removed": entry["id"], "name": entry["name"], "freed_gb": round(freed / 1024 ** 3, 1),
           "models_gb": round(left / 1024 ** 3, 1), "cap_gb": CAP_GB})
 
 
@@ -4164,13 +4236,13 @@ def _no_job(p: dict, emit, cancel):
 
 JOBS = {"status": job_status, "chat": job_chat, "image": job_image, "video": job_video, "search": job_search,
         "cutout": job_cutout, "upscale": job_upscale, "forget": job_forget,
-        "remove_model": job_remove_model, "warm": job_warm,
+        "remove_model": job_remove_model, "installed": job_installed, "warm": job_warm,
         "comfy_recipes": job_comfy_recipes, "comfy_run": job_comfy_run, "config": job_config,
         "make_recipes": job_make_recipes,
         "stop_all": _no_job, "queue": _no_job, "free_memory": _no_job}   # these three answer on the event loop
 # 11-17: never wait for the line, stream as before. (comfy_recipes never needed the card: it waited behind videos and
 # left Make on "Asking your computer..." for minutes.)
-IMMEDIATE = {"status", "search", "forget", "config", "comfy_recipes", "make_recipes", "chat"}
+IMMEDIATE = {"status", "search", "forget", "config", "comfy_recipes", "make_recipes", "chat", "installed"}
 ASYNC_OPS = {"queue", "stop_all", "free_memory"}
 
 

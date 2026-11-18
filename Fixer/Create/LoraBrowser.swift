@@ -14,8 +14,19 @@ struct LoraEntry: Identifiable, Hashable {
     var strength: Double        // the strength it is used at unless a run says otherwise
     var alwaysOn: Bool          // used with every picture or video of its model, the chat's included
     var source: String
-    var pair: Bool
+    var pair: Bool              // one file of a video pair
+    var role: String?           // "high" or "low" for a file of a pair
     var id: String { file }
+
+    /// The five model families a LoRA can be filed under.
+    static let families = ["sdxl", "chroma", "qwen21", "qwen-edit", "wan22"]
+
+    /// The library as the rows to show. The second-half file of a video pair is left out: the first-half file
+    /// stands for both, and the computer keeps the two in step.
+    static func rows(_ raw: Any?) -> [LoraEntry] {
+        let all = (raw as? [[String: Any]] ?? []).compactMap { LoraEntry($0) }
+        return all.filter { !($0.pair && $0.role == "low") }
+    }
 
     init?(_ d: [String: Any]) {
         guard let file = d["file"] as? String, !file.isEmpty else { return nil }
@@ -28,7 +39,12 @@ struct LoraEntry: Identifiable, Hashable {
         strength = (d["strength"] as? NSNumber)?.doubleValue ?? 1
         alwaysOn = d["always_on"] as? Bool ?? false
         source = d["source"] as? String ?? ""
-        pair = d["pair"] as? Bool ?? false
+        if let pairID = d["pair"] as? String {
+            pair = !pairID.isEmpty
+        } else {
+            pair = false
+        }
+        role = d["role"] as? String
     }
 
     /// A file an older computer listed by name only.
@@ -42,6 +58,7 @@ struct LoraEntry: Identifiable, Hashable {
         alwaysOn = false
         source = ""
         pair = false
+        role = nil
     }
 
     /// A file name as a readable name.
@@ -70,72 +87,59 @@ struct LoraEntry: Identifiable, Hashable {
     }
 }
 
-/// One LoRA found by a search. `ref` goes back to the computer to look it up; `thumb` fetches its preview.
+/// One LoRA found by a search. `ref` is the computer's id for it (it goes back to look it up); `thumb` is the
+/// address of its preview, which the computer fetches.
 struct LoraSearchResult: Identifiable, Hashable {
     let ref: String
     let name: String
-    let creator: String
     let size: Double
     let downloads: Int
     let thumb: String?
     var id: String { ref }
 
     init?(_ d: [String: Any]) {
-        guard let ref = d["ref"] as? String, !ref.isEmpty else { return nil }
+        guard let ref = d["source_id"] as? String, !ref.isEmpty else { return nil }
         self.ref = ref
-        name = d["name"] as? String ?? "Add-on"
-        creator = d["creator"] as? String ?? ""
-        size = (d["size"] as? NSNumber)?.doubleValue ?? 0
+        let given = d["name"] as? String ?? ""
+        name = given.isEmpty ? "Add-on" : given
+        size = ((d["size_mb"] as? NSNumber)?.doubleValue ?? 0) * 1_048_576
         downloads = (d["downloads"] as? NSNumber)?.intValue ?? 0
         thumb = d["thumb"] as? String
     }
 }
 
-/// Something to pick from a short list: a file among several, a model family, or one file of a video pair.
+/// One file among several found behind a link. `id` is the link that leads to just that file.
 struct LoraChoice: Identifiable, Hashable {
     let id: String
     let name: String
-    let size: Double
-
-    init?(_ d: [String: Any]) {
-        guard let id = d["id"] as? String, !id.isEmpty else { return nil }
-        self.id = id
-        name = d["name"] as? String ?? id
-        size = (d["size"] as? NSNumber)?.doubleValue ?? 0
-    }
 }
 
 /// What the computer found behind a link or a search result, shown before anything is downloaded.
 struct LoraCard {
-    let token: String           // handed back to start the download
     let name: String
-    let size: Double
-    let family: String
+    let size: Double            // bytes; 0 when the source doesn't say
+    let family: String          // "" when the computer couldn't tell, or when it fits no model here
     let fits: String            // the model it works with ("" = none here)
     let triggers: [String]
     let warnings: [String]
-    let installed: Bool
-    let pair: Bool
-    let askFamily: Bool         // the computer couldn't tell which model it is for
-    let families: [LoraChoice]
-    let askRole: Bool           // a video pair whose two files it couldn't tell apart
-    let pairFiles: [LoraChoice]
+    let files: [String]
+    let askFamily: Bool         // the computer couldn't tell which model it is for: the owner picks
+
+    /// It was made for a model this computer doesn't have: there is nothing to add.
+    var refused: Bool { family.isEmpty && !askFamily }
 
     init?(_ d: [String: Any]) {
-        guard let token = d["token"] as? String, !token.isEmpty else { return nil }
-        self.token = token
-        name = d["name"] as? String ?? "Add-on"
-        size = (d["size"] as? NSNumber)?.doubleValue ?? 0
-        family = d["family"] as? String ?? "unknown"
+        guard let name = d["name"] as? String else { return nil }
+        self.name = name.isEmpty ? "Add-on" : name
+        size = ((d["size_mb"] as? NSNumber)?.doubleValue ?? 0) * 1_048_576
+        family = d["family"] as? String ?? ""
         fits = d["fits"] as? String ?? ""
         triggers = d["triggers"] as? [String] ?? []
-        warnings = d["warnings"] as? [String] ?? []
-        installed = d["installed"] as? Bool ?? false
-        pair = d["pair"] as? Bool ?? false
-        askFamily = d["ask_family"] as? Bool ?? false
-        families = (d["families"] as? [[String: Any]] ?? []).compactMap { LoraChoice($0) }
-        askRole = d["ask_role"] as? Bool ?? false
-        pairFiles = (d["pair_files"] as? [[String: Any]] ?? []).compactMap { LoraChoice($0) }
+        var notes: [String] = []
+        if let one = d["warning"] as? String, !one.isEmpty { notes.append(one) }
+        warnings = notes
+        files = d["files"] as? [String] ?? []
+        askFamily = d["needs_pick"] as? Bool ?? false
     }
 }
 
@@ -144,7 +148,7 @@ struct LoraInspection {
     let choices: [LoraChoice]   // not empty: several files were found, and one has to be picked first
 }
 
-/// What the card screen was opened for: a pasted link, or a search result.
+/// What the card screen was opened for: a pasted link, or a search result (`ref`, the computer's id for it).
 struct LoraRequest: Hashable {
     var link: String?
     var ref: String?
@@ -206,7 +210,7 @@ struct LoraBrowser: View {
             Section {
                 Picker("From", selection: $source) {
                     Text("Civitai").tag("civitai")
-                    Text("Hugging Face").tag("huggingface")
+                    Text("Hugging Face").tag("hf")
                 }
                 .pickerStyle(.segmented)
                 HStack {
@@ -261,7 +265,6 @@ struct LoraBrowser: View {
 
     private func resultDetail(_ r: LoraSearchResult) -> String {
         var parts: [String] = []
-        if !r.creator.isEmpty { parts.append(r.creator) }
         if r.size > 0 { parts.append(LoraEntry.sizeText(r.size)) }
         if r.downloads > 0 { parts.append("\(r.downloads) downloads") }
         return parts.joined(separator: " · ")
@@ -361,7 +364,7 @@ struct LoraCardView: View {
     @State private var loading = true
     @State private var note: String?
     @State private var family = ""
-    @State private var high = ""
+    @State private var pickedLink: String?          // the one file chosen among several
     @State private var adding: Task<Void, Never>?
     @State private var progress: Double = 0
     @State private var status: String?
@@ -381,10 +384,9 @@ struct LoraCardView: View {
             if card == nil, !choices.isEmpty {
                 Section("Which file?") {
                     ForEach(choices) { c in
-                        Button {
-                            Task { await inspect(choice: c.id) }
-                        } label: {
-                            LabeledContent(c.name, value: LoraEntry.sizeText(c.size))
+                        Button(c.name) {
+                            pickedLink = c.id
+                            Task { await inspect() }
                         }
                     }
                 }
@@ -397,7 +399,7 @@ struct LoraCardView: View {
         }
         .navigationTitle(card?.name ?? request.title)
         .navigationBarTitleDisplayMode(.inline)
-        .task { await inspect(choice: nil) }
+        .task { await inspect() }
         .onDisappear { adding?.cancel() }
     }
 
@@ -406,6 +408,9 @@ struct LoraCardView: View {
         Section {
             LabeledContent("Size", value: LoraEntry.sizeText(c.size))
             LabeledContent("Works with", value: fitsText(c))
+            if c.files.count > 1 {
+                LabeledContent("Files", value: String(c.files.count))
+            }
             if !c.triggers.isEmpty {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Trigger words")
@@ -432,20 +437,10 @@ struct LoraCardView: View {
             Section {
                 Picker("Made for", selection: $family) {
                     Text("Choose…").tag("")
-                    ForEach(c.families) { f in Text(f.name).tag(f.id) }
+                    ForEach(LoraEntry.families, id: \.self) { f in Text(LoraEntry.familyName(f)).tag(f) }
                 }
             } footer: {
                 Text("Your computer couldn't tell which model this add-on was made for. It only works with that one.")
-            }
-        }
-        if c.askRole {
-            Section {
-                Picker("First-half file", selection: $high) {
-                    Text("Choose…").tag("")
-                    ForEach(c.pairFiles) { f in Text(f.name).tag(f.id) }
-                }
-            } footer: {
-                Text("A video add-on comes as two files, one for each half of the drawing. Pick the one for the first half; it is usually named high, H or HN.")
             }
         }
     }
@@ -461,8 +456,9 @@ struct LoraCardView: View {
                     Text(status ?? "Downloading…").font(.footnote).foregroundStyle(.secondary)
                 }
                 Button("Cancel", role: .cancel) { cancelAdd() }
-            } else if c.installed {
-                Text("Already on your computer.").foregroundStyle(.secondary)
+            } else if c.refused {
+                Text("It was made for a model that isn't on your computer, so it can't be added.")
+                    .foregroundStyle(.secondary)
             } else {
                 Button("Add to your computer") { add(c) }
                     .disabled(!ready(c))
@@ -472,21 +468,26 @@ struct LoraCardView: View {
 
     private func fitsText(_ c: LoraCard) -> String {
         if !c.fits.isEmpty { return c.fits }
-        return c.askFamily ? "Not known yet" : LoraEntry.familyName(c.family)
+        if c.askFamily { return "Not known yet" }
+        return c.family.isEmpty ? "No model on your computer" : LoraEntry.familyName(c.family)
     }
 
     private func ready(_ c: LoraCard) -> Bool {
+        if c.refused { return false }
         if c.askFamily, family.isEmpty { return false }
-        if c.askRole, high.isEmpty { return false }
         return true
     }
 
-    private func inspect(choice: String?) async {
+    /// What to ask the computer about: the one file picked among several, else what the screen was opened for.
+    private var askLink: String? { pickedLink ?? request.link }
+    private var askRef: String? { pickedLink == nil ? request.ref : nil }
+
+    private func inspect() async {
         if card != nil { return }
         loading = true
         note = nil
         do {
-            let found = try await Desktop.shared.loraInspect(url: request.link, ref: request.ref, choice: choice)
+            let found = try await Desktop.shared.loraInspect(link: askLink, ref: askRef)
             card = found.card
             choices = found.choices
             if found.card == nil, found.choices.isEmpty { note = "Nothing to add was found there." }
@@ -500,11 +501,12 @@ struct LoraCardView: View {
         note = nil
         progress = 0
         status = "Starting…"
-        let chosenFamily = c.askFamily ? family : nil
-        let chosenHigh = c.askRole ? high : nil
+        // The family always goes along: the computer keeps the two files of a video add-on as a pair only then.
+        let chosenFamily = c.askFamily ? family : c.family
+        let link = askLink, ref = askRef
         adding = Task {
             do {
-                let entry = try await Desktop.shared.loraAdd(token: c.token, family: chosenFamily, high: chosenHigh,
+                let entry = try await Desktop.shared.loraAdd(link: link, ref: ref, family: chosenFamily,
                                                              status: { s in status = s },
                                                              progress: { v in progress = v })
                 added = entry

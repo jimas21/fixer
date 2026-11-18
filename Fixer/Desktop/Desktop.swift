@@ -548,8 +548,8 @@ final class Desktop: ObservableObject {
             let recipes = (f["recipes"] as? [[String: Any]] ?? []).compactMap(CreateRecipe.init)
             recipeCache = recipes
             let names = f["loras"] as? [String] ?? []
-            var library = (f["lora_library"] as? [[String: Any]] ?? []).compactMap { LoraEntry($0) }
-            if library.isEmpty { library = names.map { LoraEntry(file: $0) } }
+            var library = LoraEntry.rows(f["lora_library"])
+            if library.isEmpty, f["lora_library"] == nil { library = names.map { LoraEntry(file: $0) } }
             return (recipes, names, library, f["video_lora_family"] as? String ?? "wan22")
         }
         throw PCError.bad
@@ -561,8 +561,7 @@ final class Desktop: ObservableObject {
     func loraList() async throws -> (loras: [LoraEntry], hasKey: Bool) {
         guard let link else { throw PCError.notPaired }
         for try await f in call("lora_list", [:], link: link) where f["t"] as? String == "info" {
-            let loras = (f["loras"] as? [[String: Any]] ?? []).compactMap { LoraEntry($0) }
-            return (loras, f["civitai_key"] as? Bool ?? false)
+            return (LoraEntry.rows(f["library"]), f["civitai_key"] as? Bool ?? false)
         }
         throw PCError.bad
     }
@@ -574,8 +573,10 @@ final class Desktop: ObservableObject {
         var payload: [String: Any] = ["source": source, "family": family, "query": query]
         if let cursor { payload["cursor"] = cursor }
         for try await f in call("lora_search", payload, link: link) where f["t"] as? String == "info" {
-            let results = (f["results"] as? [[String: Any]] ?? []).compactMap(LoraSearchResult.init)
-            return (results, f["cursor"] as? String)
+            let results = (f["loras"] as? [[String: Any]] ?? []).compactMap { LoraSearchResult($0) }
+            var next = f["cursor"] as? String
+            if next == nil, let n = f["cursor"] as? NSNumber { next = n.stringValue }
+            return (results, next)
         }
         throw PCError.bad
     }
@@ -583,43 +584,59 @@ final class Desktop: ObservableObject {
     /// A search result's small preview, fetched through the computer (nothing is kept on the phone).
     func loraThumb(_ thumb: String) async throws -> UIImage? {
         guard let link else { throw PCError.notPaired }
-        for try await f in call("lora_thumb", ["thumb": thumb], link: link) where f["t"] as? String == "info" {
-            guard let b64 = f["jpeg"] as? String, let data = Data(base64Encoded: b64) else { return nil }
+        for try await f in call("lora_thumb", ["url": thumb], link: link) where f["t"] as? String == "info" {
+            guard let b64 = f["thumb"] as? String, let data = Data(base64Encoded: b64) else { return nil }
             return UIImage(data: data)
         }
         return nil
     }
 
-    /// What a link or a search result holds: a card to confirm, or several files to choose from first.
-    func loraInspect(url: String?, ref: String?, choice: String?) async throws -> LoraInspection {
+    /// What a pasted link (`link`) or a search result (`ref`) holds: a card to confirm, or several files to choose
+    /// from first. Each choice carries the link that leads to just that file.
+    func loraInspect(link text: String?, ref: String?) async throws -> LoraInspection {
         guard let link else { throw PCError.notPaired }
         var payload: [String: Any] = [:]
-        if let url { payload["link"] = url }
-        if let ref { payload["ref"] = ref }
-        if let choice { payload["choice"] = choice }
+        if let text { payload["link"] = text }
+        if let ref { payload["source_id"] = ref }
         for try await f in call("lora_inspect", payload, link: link) where f["t"] as? String == "info" {
-            let card = (f["card"] as? [String: Any]).flatMap(LoraCard.init)
-            let choices = (f["choices"] as? [[String: Any]] ?? []).compactMap(LoraChoice.init)
+            let card = (f["card"] as? [String: Any]).flatMap { LoraCard($0) }
+            let names = f["choices"] as? [String] ?? []
+            let links = f["links"] as? [String] ?? []
+            let repo = f["repo"] as? String
+            var choices: [LoraChoice] = []
+            for (i, name) in names.enumerated() {
+                let short = name.split(separator: "/").last.map(String.init) ?? name
+                if i < links.count {
+                    choices.append(LoraChoice(id: links[i], name: short))
+                } else if let repo {
+                    choices.append(LoraChoice(id: "https://huggingface.co/\(repo)/blob/main/\(name)", name: short))
+                }
+            }
             return LoraInspection(card: card, choices: choices)
         }
         throw PCError.bad
     }
 
-    /// Downloads a LoRA to the computer and adds it to the library. Cancelling the task drops the connection, and
-    /// the computer then throws the half-downloaded file away.
-    func loraAdd(token: String, family: String?, high: String?,
+    /// Downloads a LoRA to the computer and adds it to the library, from the same `link` or `ref` its card was
+    /// read from. Cancelling the task drops the connection, and the computer then throws the half-downloaded file
+    /// away.
+    func loraAdd(link text: String?, ref: String?, family: String,
                  status: @escaping (String) -> Void,
                  progress: @escaping (Double) -> Void) async throws -> LoraEntry {
         guard let link else { throw PCError.notPaired }
-        var payload: [String: Any] = ["token": token]
-        if let family, !family.isEmpty { payload["family"] = family }
-        if let high, !high.isEmpty { payload["high"] = high }
+        var payload: [String: Any] = [:]
+        if let text { payload["link"] = text }
+        if let ref { payload["source_id"] = ref }
+        if !family.isEmpty { payload["family"] = family }
         for try await f in call("lora_add", payload, link: link) {
             switch f["t"] as? String {
             case "progress": progress((f["v"] as? NSNumber)?.doubleValue ?? 0)
             case "status": status(f["v"] as? String ?? "")
             case "info":
-                if let d = f["lora"] as? [String: Any], let entry = LoraEntry(d) { return entry }
+                let files = (f["added"] as? [[String: Any]] ?? []).compactMap { $0["file"] as? String }
+                guard let first = files.first else { break }
+                let rows = LoraEntry.rows(f["library"])
+                return rows.first { files.contains($0.file) } ?? LoraEntry(file: first)
             default: break
             }
         }
@@ -636,7 +653,8 @@ final class Desktop: ObservableObject {
         if let alwaysOn { payload["always_on"] = alwaysOn }
         if let family { payload["family"] = family }
         for try await f in call("lora_set", payload, link: link) where f["t"] as? String == "info" {
-            if let d = f["lora"] as? [String: Any], let entry = LoraEntry(d) { return entry }
+            let all = (f["library"] as? [[String: Any]] ?? []).compactMap { LoraEntry($0) }
+            if let entry = all.first(where: { $0.file == file }) { return entry }
         }
         throw PCError.bad
     }

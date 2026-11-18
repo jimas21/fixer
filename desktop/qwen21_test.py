@@ -51,6 +51,7 @@ def raises_user_facing(fn, *a, **kw) -> str | None:
 MODELS = Path(TMP) / "models"
 fd.MODELS = MODELS
 fd.COMFY_LORAS = MODELS / "comfy-loras"
+fd.COMFY_VAE = MODELS / "comfy-vae"
 
 
 def snap(repo: str, files: dict | None = None) -> Path:
@@ -186,11 +187,10 @@ def case_switch():
     install_21()
     L = ("chatrlabs-omni-lora-v0.1-bf16.safetensors", 1.0)
     ex = fd._qwen21_explicit
-    check(ex("Off", True, "zimage-nsfw") is None, "Off never loads it, whatever the brain or model says")
+    check(ex("Off", True, "chroma") is None, "Off never loads it, whatever the brain or model says")
     check(ex("On") == L, "On loads it")
     check(ex("auto", True) == L, "Auto + the brain says explicit: loads")
     check(ex("Auto", False) is None, "Auto + the brain says not explicit: off")
-    check(ex("Auto", None, "zimage-nsfw") == L, "Auto + no flag + a picture from an explicit model: loads")
     check(ex("Auto", None, None) is None and ex(None) is None and ex("Auto", None, "chroma") is None,
           "Auto + no flag + nothing explicit: off (never a word list)")
     check(ex(None, True) == L, "chat (no Make switch) follows the brain's flag")
@@ -245,7 +245,7 @@ def case_recipe_and_lineup():
               for k, o in fd.CREATE_RECIPES.items() if k != "qwen21"), "other recipes have no add-on switch")
     # removed lineup
     check("flux-klein" not in fd.CREATE_RECIPES and "bigasp" not in fd.CREATE_RECIPES, "FLUX klein and bigASP recipes are gone")
-    check(set(fd.CREATE_RECIPES) == {"zimage", "zimage-nsfw", "chroma", "qwen21"}, "the lineup is Z-Image (+NSFW), Chroma, 2.1")
+    check(set(fd.CREATE_RECIPES) == {"juggernaut", "chroma", "qwen21"}, "the lineup is Juggernaut, Chroma, 2.1")
     check(all("bigasp" not in k.lower() and "flux.2" not in k.lower() for k in fd.COMFY_RECIPES), "no removed picture-model ids")
     check(fd.COMFY_RECIPES["Comfy-Org/Qwen-Image-2.1"] == "qwen21", "the phone's 2.1 model id maps to its recipe")
     check(fd.BRAIN_ALIASES[fd.DENSE_BRAIN] == fd.MOE_BRAIN, "the 27B maps to the MoE brain")
@@ -258,7 +258,7 @@ def case_recipe_and_lineup():
     check('"explicit"' in cfg["photo_tools"] and cfg["photo_tools"].count('"explicit": false') == 3
           and 'never changes the words' in cfg["photo_tools"], "photo_tools describes the explicit flag on make, redraw, video")
     src = Path(fd.__file__).read_text(encoding="utf-8")
-    live = [ln for ln in src.splitlines() if re.search(r"flux2|_sdxl|bigasp|flux-klein|FALLBACK_IMAGE|DEFAULT_IMAGE", ln)
+    live = [ln for ln in src.splitlines() if re.search(r"flux2|bigasp|flux-klein|FALLBACK_IMAGE|DEFAULT_IMAGE", ln)
             and not ln.lstrip().startswith("#")]
     check(not live, f"no code is left that points at removed models ({live[:3]})")
     check(not re.search(r'"(black-forest-labs/FLUX|GraydientPlatformAPI)', src), "nothing names a removed model repo")
@@ -266,7 +266,7 @@ def case_recipe_and_lineup():
     fd._recipe_ready_saved = fd._recipe_ready
     fd._recipe_ready = lambda r_: True
     try:
-        check(fd._picture_recipe({"model_choice": "bigasp", "prompt": "a cat"}) is fd.CREATE_RECIPES["zimage"],
+        check(fd._picture_recipe({"model_choice": "bigasp", "prompt": "a cat"}) is fd.CREATE_RECIPES["juggernaut"],
               "a saved choice that is gone (bigASP) falls through to Auto")
     finally:
         fd._recipe_ready = fd._recipe_ready_saved
@@ -278,7 +278,7 @@ def case_recipe_and_lineup():
               "the brain's explicit true picks the explicit list")
         check(fd._picture_recipe({"prompt": "a naked woman", "explicit": False}) is fd.CREATE_RECIPES["chroma"],
               "the brain's explicit false means not said: the word check still routes explicit words")
-        check(fd._picture_recipe({"prompt": "a cat", "explicit": False}) is fd.CREATE_RECIPES["zimage"],
+        check(fd._picture_recipe({"prompt": "a cat", "explicit": False}) is fd.CREATE_RECIPES["juggernaut"],
               "explicit false and plain words stay on the clean model")
         check(fd._picture_recipe({"prompt": "a naked woman"}) is fd.CREATE_RECIPES["chroma"],
               "an old phone (no flag) keeps the word check")
@@ -297,8 +297,11 @@ def case_paths_yaml():
     check(fd._snapshot(fd.QWEN21_TE_REPO).as_posix() in y, "the 2.1 text reader folder is listed")
     check(fd._snapshot(fd.QWEN21_LORA_REPO).as_posix() in y and "loras:" in y, "the add-on's folder is listed under loras")
     check("flux" not in y.lower() and "sdxl" not in y.lower() and "diffusers:" not in y, "no FLUX / SDXL / diffusers entries")
-    z = snap("Comfy-Org/Z-Image-Turbo", {"split_files/vae/ae.safetensors": 1})
-    check((z / "split_files" / "vae").as_posix() in fd._comfy_paths_yaml(), "ae.safetensors (Chroma needs it) stays")
+    fd.COMFY_VAE.mkdir(parents=True, exist_ok=True)
+    (fd.COMFY_VAE / "ae.safetensors").write_bytes(b"x")
+    yv = fd._comfy_paths_yaml()
+    check(fd.COMFY_VAE.as_posix() in yv, "Chroma's VAE folder (moved out of the Z-Image repo) is listed under vae")
+    check("z-image" not in yv.lower() and "z_image" not in yv.lower(), "no Z-Image paths remain")
 
 
 # ------------------------------------------------------------------ making and editing through the real code paths
@@ -320,7 +323,7 @@ def case_pictures():
     cancel = threading.Event()
     out: list[dict] = []
     emit = out.append
-    r21, rz = fd.CREATE_RECIPES["qwen21"], fd.CREATE_RECIPES["zimage"]
+    r21, rz = fd.CREATE_RECIPES["qwen21"], fd.CREATE_RECIPES["juggernaut"]
     fd._TL.rec = fd._new_timing_record("picture")
     try:
         # a new 2.1 picture: add-on Off / Auto = clean base, On = the add-on node
@@ -348,21 +351,16 @@ def case_pictures():
         fd._qwen_edit_ready = lambda explicit=False: True
         fd._qwen_explicit = lambda prompt, recipe_id=None: False
         fd._create_pictures(rz, {**rz["defaults"], "image_mode": "edit", "prompt": "make it night"}, 1024, 1024, 1, 1,
-                            [], photo, "p.png", "edit", emit, cancel, lambda s: None, (), "zimage")
+                            [], photo, "p.png", "edit", emit, cancel, lambda s: None, (), "juggernaut")
         check(any(n["class_type"] == "TextEncodeQwenImageEditPlus" for n in run.graphs[-1].values()),
-              "defaults do not change: a Z-Image picture is still edited by Qwen-Image-Edit 2511")
+              "defaults do not change: a Juggernaut picture is still edited by Qwen-Image-Edit 2511")
         fd._create_pictures(rz, {**rz["defaults"], "image_mode": "edit", "editor": "qwen21", "prompt": "x"}, 1024, 1024,
-                            1, 1, [], photo, "p.png", "edit", emit, cancel, lambda s: None, (), "zimage")
+                            1, 1, [], photo, "p.png", "edit", emit, cancel, lambda s: None, (), "juggernaut")
         check("TextEncodeQwenImage21" in {n["class_type"] for n in run.graphs[-1].values()}, "the editor menu can choose 2.1")
         fd._create_pictures(rz, {**rz["defaults"], "image_mode": "edit", "editor": "flux", "prompt": "x"}, 1024, 1024,
-                            1, 1, [], photo, "p.png", "edit", emit, cancel, lambda s: None, (), "zimage")
+                            1, 1, [], photo, "p.png", "edit", emit, cancel, lambda s: None, (), "juggernaut")
         check(any(n["class_type"] == "TextEncodeQwenImageEditPlus" for n in run.graphs[-1].values()),
               "an old phone's 'flux' editor choice is treated as Auto")
-        # explicit zimage-nsfw picture edited with the 2.1 editor: Auto follows the explicit model
-        fd._create_pictures(fd.CREATE_RECIPES["zimage-nsfw"], {**rz["defaults"], "image_mode": "edit", "editor": "qwen21",
-                                                               "prompt": "x"}, 1024, 1024, 1, 1, [], photo, "p.png", "edit",
-                            emit, cancel, lambda s: None, (), "zimage-nsfw")
-        check("5" in run.graphs[-1], "Auto add-on + a picture from the explicit model: the add-on loads")
         # no add-on file: On says so and nothing is drawn
         install_21(lora=False)
         n = len(run.graphs)
@@ -373,7 +371,7 @@ def case_pictures():
         fd._qwen_edit_ready = lambda explicit=False: False
         install_21()
         msg = raises_user_facing(fd._create_pictures, rz, {**rz["defaults"], "image_mode": "edit", "prompt": "x"}, 1024,
-                                 1024, 1, 1, [], photo, "p.png", "edit", emit, cancel, lambda s: None, (), "zimage")
+                                 1024, 1, 1, [], photo, "p.png", "edit", emit, cancel, lambda s: None, (), "juggernaut")
         check(msg and "photo editor model" in msg, "no photo editor model: plain words")
     finally:
         fd._comfy_run, fd._qwen_edit_ready, fd._qwen_explicit = saved

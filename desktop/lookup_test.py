@@ -191,7 +191,7 @@ def case_facts():
         m = fd.lookup_facts(["models"], {})
         check("CHAT BRAIN" in m and "PICTURE AND EDIT MODELS" in m and "LOADED RIGHT NOW" in m and "VIDEO" in m,
               "models facts cover brain, pictures, video and what is loaded")
-        check("Z-Image Turbo" in m and "Chroma1-HD" in m and "Qwen-Image-Edit" in m, "every recipe is named")
+        check("Juggernaut XL Ragnarok" in m and "Chroma1-HD" in m and "Qwen-Image-Edit" in m, "every recipe is named")
         c = fd.lookup_facts(["computer"], {})
         check("graphics card" in c and "memory:" in c and "Windows" in c and "llama.cpp" in c and "ComfyUI" in c,
               "computer facts cover card, memory, Windows and engine versions")

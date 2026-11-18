@@ -9,6 +9,7 @@ struct SettingsScreen: View {
     @ObservedObject private var favorites = Favorites.shared
     @Environment(\.dismiss) private var dismiss
     @State private var connection: String?
+    @AppStorage("make.explicit") private var makeExplicit = false   // shows the explicit chips in Make (11-18)
 
     private var chatSlot: ModelSlot { ModelSlot.chat() }
     private var imageSlot: ModelSlot { ModelSlot.image() }
@@ -46,6 +47,14 @@ struct SettingsScreen: View {
                     Text("Pictures and video")
                 } footer: {
                     Text(desktop.isOn ? "Running on \(desktop.link?.name ?? "your computer")." : "Running on this iPhone.")
+                }
+
+                Section {
+                    Toggle("Explicit options in Make", isOn: $makeExplicit)
+                } footer: {
+                    Text("On: Make adds explicit models and words as their own chips, kept apart from the everyday "
+                         + "ones. Off: they stay out of sight. This only changes what Make offers — it is not a content "
+                         + "filter.")
                 }
 
                 Section("Privacy") {

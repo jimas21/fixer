@@ -109,24 +109,6 @@ enum MakeTarget: Hashable { case new, change }
 /// Which text field has the keyboard.
 enum MakeField: Hashable { case prefix, words, change }
 
-/// The pages of the settings drawer. Which of them show depends on what is being made.
-enum MakeSection: String, CaseIterable, Identifiable {
-    case picks, photo, tips, addons, settings, help
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .picks: "Quick picks"
-        case .photo: "Photo"
-        case .tips: "Style tips"
-        case .addons: "Add-ons"
-        case .settings: "Settings"
-        case .help: "How it works"
-        }
-    }
-}
-
 /// What a recipe set, so the row can say "Custom" once something was changed by hand.
 struct StyleSnapshot: Equatable {
     var recipeID = ""

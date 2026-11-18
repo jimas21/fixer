@@ -7,16 +7,6 @@ import UIKit
 extension CreateScreen {
     // MARK: layout
 
-    var makeStage: some View {
-        GeometryReader { geo in
-            ZStack(alignment: .bottom) {
-                makeCanvas
-                makePanel(containerHeight: geo.size.height)
-            }
-            .overlay(alignment: .top) { makeHeader }
-        }
-    }
-
     var unpairedCard: some View {
         VStack(spacing: 14) {
             Image(systemName: "desktopcomputer").font(.system(size: 34)).foregroundStyle(Fx.secondaryText)
@@ -35,40 +25,6 @@ extension CreateScreen {
         .frame(maxWidth: 420)
     }
 
-    // MARK: what is going on
-
-    /// The drawer pages that make sense for what the dock is doing right now.
-    var sections: [MakeSection] {
-        let picks: [MakeSection] = recipeStore.catalog != nil && !activeGroups.isEmpty ? [.picks] : []
-        if effectiveTarget == .change { return picks + [.help] }
-        // Add-ons is always there, so the first LoRA can be added from it.
-        if mode == "video" { return picks + [.photo, .addons, .settings] }
-        guard let r = recipe else { return [] }
-        var list = picks + [.photo]
-        if !r.toggles.isEmpty { list.append(.tips) }
-        list.append(.addons)
-        list.append(.settings)
-        return list
-    }
-
-    /// The page showing: the one last looked at when it still applies, else the first.
-    var section: MakeSection {
-        if let saved = MakeSection(rawValue: savedSection), sections.contains(saved) { return saved }
-        return sections.first ?? .settings
-    }
-
-    /// The drawer is on screen. Never while typing in one of Make's own fields: the panel then shows only what
-    /// typing needs, and the drawer comes back when the keyboard goes.
-    var drawerShowing: Bool { panelOpen && !isTyping && !sections.isEmpty }
-
-    func setPanel(open: Bool) {
-        if open, focus != nil {
-            focus = nil
-            Self.hideKeyboard()
-        }
-        withAnimation(Motion.snap) { panelOpen = open }
-    }
-
     /// The still pictures made this session, oldest first (videos left out).
     var sessionStills: [CreateResult] { store.results.filter { $0.videoURL == nil } }
 
@@ -80,22 +36,6 @@ extension CreateScreen {
         videoPhotoID = r.libraryID
         if mode != "video" { mode = "video" }
     }
-
-    /// Opens the drawer straight on one page.
-    func openSection(_ s: MakeSection) {
-        guard sections.contains(s) else { return }
-        if focus != nil {
-            focus = nil
-            Self.hideKeyboard()
-        }
-        withAnimation(Motion.snap) {
-            savedSection = s.rawValue
-            panelOpen = true
-        }
-    }
-
-    /// The keyboard is up on one of Make's own fields: the panel shows only what typing needs.
-    var isTyping: Bool { keyboard.visible && focus != nil }
 
     var createRunning: Bool { running != nil }
     var changeRunning: Bool { store.reviseStatus != nil }
@@ -210,11 +150,15 @@ extension CreateScreen {
 
     // MARK: recipes
 
-    /// The recipe row: pictures or videos, clean or explicit, as the switch says.
+    /// The recipe row. The everyday recipes are always there; the explicit ones are added after them, as their own
+    /// chips, only while "Explicit options in Make" is on in Settings (11-18: additive, not a mode swap).
     var visibleStyles: [StyleRecipe] {
         guard let c = recipeStore.catalog else { return [] }
         let kind = mode == "video" ? "video" : "picture"
-        return c.recipes.filter { $0.kind == kind && $0.explicit == makeExplicit }
+        let all = c.recipes.filter { $0.kind == kind }
+        let clean = all.filter { !$0.explicit }
+        guard makeExplicit else { return clean }
+        return clean + all.filter { $0.explicit }
     }
 
     /// Quick-pick rows for the recipe in use (or the usual ones before any recipe was used).

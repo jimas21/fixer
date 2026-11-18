@@ -1,32 +1,9 @@
 import PhotosUI
 import SwiftUI
 
-/// The part of the panel that is always there: the recipe row, the prompt box, the tiles, and one wide button with
-/// the round button that opens the settings beside it. It is kept short so the picture gets the room: while the
-/// settings are open or the keyboard is up it is just the prompt and the button.
+/// The compose-sheet building blocks: the recipe-chip row, the prompt box, the tile rows and the one wide Make
+/// button (MakeCompose.swift arranges them). The explicit chips are coloured per chip here.
 extension CreateScreen {
-    func makeDock(typing: Bool, open: Bool) -> some View {
-        VStack(spacing: 6) {
-            // With the settings open the row stays only while it holds the New / Change this switch.
-            if hasRecipeRow, !open || canChange { recipeRow }
-            if mode == "picture", effectiveTarget == .new, !loading, recipe == nil, failed != nil {
-                Button { Task { await load() } } label: {
-                    Label("Try again", systemImage: "arrow.clockwise").frame(maxWidth: .infinity, minHeight: 44)
-                }
-                .buttonStyle(.bordered)
-                .accessibilityHint("Asks your computer for its picture models again")
-            }
-            promptBox
-            if typing, recipeStore.catalog != nil { quickPicks(typing: true) }
-            if !typing, !open, hasTiles { tiles }
-            HStack(spacing: 8) {
-                mainButton
-                if !typing, !sections.isEmpty { panelToggle }
-            }
-            .padding(.top, 4)
-        }
-    }
-
     /// The prompt box is two lines at rest, so the picture keeps the room, and grows while it is being typed in.
     var wordLines: ClosedRange<Int> { focus == .words ? 3...6 : 2...3 }
 
@@ -87,30 +64,37 @@ extension CreateScreen {
         .accessibilityAddTraits(effectiveTarget == value ? .isSelected : [])
     }
 
-    var styleTint: Color { makeExplicit ? Fx.explicitText : Fx.accentSoftText }
-    var styleFill: Color { makeExplicit ? Fx.explicitFill : Fx.onTintStrong }
-    var styleStroke: Color { makeExplicit ? Fx.explicitStroke : Fx.accent }
+    // The everyday (accent) colours. Explicit chips and explicit quick picks get their own warm colours, per chip,
+    // so when "Explicit options in Make" is on they read as a distinct kind among the everyday ones (11-18).
+    var styleTint: Color { Fx.accentSoftText }
+    var styleFill: Color { Fx.onTintStrong }
+    var styleStroke: Color { Fx.accent }
 
-    private func recipeChipBody(_ title: String, on: Bool, check: Bool) -> some View {
-        HStack(spacing: 5) {
+    private func recipeChipBody(_ title: String, on: Bool, check: Bool, explicit: Bool = false) -> some View {
+        let tint = explicit ? Fx.explicitText : Fx.accentSoftText
+        let fill = explicit ? Fx.explicitFill : Fx.onTintStrong
+        let stroke = explicit ? Fx.explicitStroke : Fx.accent
+        // An explicit chip keeps a faint warm outline even unselected, so it is recognisable in the row.
+        let idleStroke = explicit ? Fx.explicitStroke.opacity(0.5) : Color.clear
+        return HStack(spacing: 5) {
             if check { Image(systemName: "checkmark").font(.system(size: 12, weight: .bold)) }
             Text(title).font(.system(size: 14, weight: .semibold)).lineLimit(1)
         }
-        .foregroundStyle(on ? styleTint : Color.primary)
+        .foregroundStyle(on ? tint : Color.primary)
         .padding(.horizontal, 13)
         .frame(height: 34)
-        .background(Capsule().fill(on ? styleFill : Fx.tile))
-        .overlay(Capsule().strokeBorder(on ? styleStroke : Color.clear, lineWidth: 1))
+        .background(Capsule().fill(on ? fill : Fx.tile))
+        .overlay(Capsule().strokeBorder(on ? stroke : idleStroke, lineWidth: 1))
         .frame(minHeight: 44)
         .contentShape(Capsule())
     }
 
     private func styleChip(_ s: StyleRecipe) -> some View {
         let on = applied?.id == s.id && !styleIsCustom
-        return Button { applyStyle(s) } label: { recipeChipBody(s.name, on: on, check: on) }
+        return Button { applyStyle(s) } label: { recipeChipBody(s.name, on: on, check: on, explicit: s.explicit) }
             .buttonStyle(.plain)
             .accessibilityAddTraits(on ? .isSelected : [])
-            .accessibilityHint(s.note ?? "")
+            .accessibilityHint(s.explicit ? "Explicit. \(s.note ?? "")" : (s.note ?? ""))
     }
 
     private var customChip: some View {
@@ -177,32 +161,8 @@ extension CreateScreen {
             }
             .font(.body)
             .frame(maxWidth: .infinity, alignment: .leading)
-            if effectiveTarget == .new, mode == "picture", recipe != nil {
-                if let photo {
-                    Button { openSection(.photo) } label: {
-                        Image(uiImage: photo)
-                            .resizable().scaledToFill()
-                            .frame(width: 32, height: 32)
-                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                            .frame(minWidth: 44, minHeight: 44)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Photo added")
-                    .accessibilityHint("Opens the photo settings")
-                } else {
-                    // One tap to bring a photo in; its settings page opens once it is picked.
-                    PhotosPicker(selection: $photoPick, matching: .images) {
-                        Image(systemName: "photo.badge.plus")
-                            .font(.system(size: 19))
-                            .foregroundStyle(Fx.secondaryText)
-                            .frame(minWidth: 44, minHeight: 44)
-                            .contentShape(Rectangle())
-                    }
-                    .accessibilityLabel("Add a photo")
-                    .accessibilityHint("Edit it, redraw it, or use it as a reference")
-                }
-            }
+            // The photo lives in the Photo card below the words (compose layout, 11-18), where one or several can be
+            // added at once; no separate photo button here.
         }
         .padding(10)
         .background(RoundedRectangle(cornerRadius: Fx.promptRadius, style: .continuous).fill(Fx.fieldWell))
@@ -211,16 +171,9 @@ extension CreateScreen {
 
     // MARK: quick picks
 
-    /// The one row that rides along while typing; every row is on the drawer's Quick picks page.
-    func quickPicks(typing: Bool) -> some View {
-        let groups = typing ? Array(activeGroups.prefix(1)) : Array(activeGroups.prefix(3))
-        return VStack(spacing: 0) {
-            ForEach(groups) { g in quickRow(g) }
-        }
-    }
-
     func quickRow(_ g: QuickGroup) -> some View {
         let options = g.options + (makeExplicit ? g.explicitOptions : [])
+        let explicitSet = Set(g.explicitOptions)
         let text = quickBinding.wrappedValue
         return HStack(spacing: 0) {
             Text(g.label)
@@ -232,20 +185,26 @@ extension CreateScreen {
                 HStack(spacing: 6) {
                     ForEach(options, id: \.self) { o in
                         let on = PhraseList.contains(text, o)
+                        let exp = explicitSet.contains(o)
+                        let tint = exp ? Fx.explicitText : styleTint
+                        let fill = exp ? Fx.explicitFill : styleFill
+                        let stroke = exp ? Fx.explicitStroke : styleStroke
+                        let idleStroke = exp ? Fx.explicitStroke.opacity(0.4) : Color.clear
                         Button { tapQuick(o) } label: {
                             Text(o)
                                 .font(.system(size: 14, weight: on ? .semibold : .regular))
                                 .lineLimit(1)
-                                .foregroundStyle(on ? styleTint : Color.primary)
+                                .foregroundStyle(on ? tint : Color.primary)
                                 .padding(.horizontal, 11)
                                 .frame(height: 32)
-                                .background(Capsule().fill(on ? styleFill : Fx.tile))
-                                .overlay(Capsule().strokeBorder(on ? styleStroke : Color.clear, lineWidth: 1))
+                                .background(Capsule().fill(on ? fill : Fx.tile))
+                                .overlay(Capsule().strokeBorder(on ? stroke : idleStroke, lineWidth: 1))
                                 .frame(minHeight: 44)
                                 .contentShape(Capsule())
                         }
                         .buttonStyle(.plain)
                         .accessibilityAddTraits(on ? .isSelected : [])
+                        .accessibilityHint(exp ? "Explicit" : "")
                     }
                 }
                 .padding(.trailing, 12)
@@ -256,22 +215,6 @@ extension CreateScreen {
     }
 
     // MARK: tiles
-
-    var hasTiles: Bool {
-        if effectiveTarget == .change { return true }
-        if mode == "video" { return true }
-        return recipe != nil
-    }
-
-    @ViewBuilder var tiles: some View {
-        if effectiveTarget == .change {
-            changeTiles
-        } else if mode == "video" {
-            videoTiles
-        } else if let r = recipe {
-            pictureTiles(r)
-        }
-    }
 
     func pictureTiles(_ r: CreateRecipe) -> some View {
         let enhanceOn = promptEnhance.wrappedValue
@@ -332,11 +275,7 @@ extension CreateScreen {
                 if let w = working, w.videoURL == nil {
                     Button { useForVideo(w) } label: { Label("Use the picture showing", systemImage: "photo") }
                 }
-                if !sessionStills.isEmpty {
-                    Button { openSection(.photo) } label: {
-                        Label("Pick from this session", systemImage: "photo.stack")
-                    }
-                }
+                // Picking from this session's pictures is on the video Photo card just below, which is always in view.
                 Button { showVideoPhotos = true } label: {
                     Label("Pick from Photos", systemImage: "photo.on.rectangle")
                 }

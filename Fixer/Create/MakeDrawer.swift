@@ -1,129 +1,10 @@
 import PhotosUI
 import SwiftUI
 
-/// Everything Make offers beyond the dock, as pages: quick picks, the photo, style tips, add-ons and settings. Each
-/// page is one tap away on the row of tabs, and the drawer is only as tall as the page needs (up to a limit that
-/// leaves the picture in view). The controls are the same ones that were on the old form, with the same bindings.
+/// The bodies of Make's control sections (the photo, style tips, add-ons, the model's settings, video and change
+/// help), plus `drawerSection`, the card they sit in. The compose sheet (MakeCompose.swift) lays these out inline;
+/// they used to be the pages of a settings drawer.
 extension CreateScreen {
-    func makeDrawer(maxHeight: CGFloat) -> some View {
-        let page = section
-        return VStack(spacing: 6) {
-            sectionTabs(page)
-            ScrollView {
-                sectionPage(page)
-                    .padding(.bottom, 4)
-                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { pageHeight = $0 }
-            }
-            .id(page)
-            .scrollDismissesKeyboard(.interactively)
-            .scrollIndicators(.hidden)
-            .scrollBounceBehavior(.basedOnSize)
-            .frame(height: Swift.min(Swift.max(pageHeight, 60), maxHeight))
-            .fxAnimation(Motion.snap, value: pageHeight)
-        }
-        .padding(.bottom, 8)
-    }
-
-    // MARK: tabs
-
-    func sectionTabs(_ page: MakeSection) -> some View {
-        ScrollViewReader { proxy in
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 6) {
-                    ForEach(sections) { s in
-                        Button {
-                            withAnimation(Motion.snap) { savedSection = s.rawValue }
-                        } label: {
-                            sectionChip(s, on: s == page)
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityAddTraits(s == page ? .isSelected : [])
-                        .id(s)
-                    }
-                }
-                .padding(.trailing, 12)
-            }
-            .padding(.trailing, -12)
-            .onChange(of: page) { _, p in
-                withAnimation(Motion.snap) { proxy.scrollTo(p, anchor: .center) }
-            }
-            .onAppear { proxy.scrollTo(page, anchor: .center) }
-        }
-        .frame(minHeight: 44)
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("Settings pages")
-    }
-
-    private func sectionChip(_ s: MakeSection, on: Bool) -> some View {
-        HStack(spacing: 5) {
-            Text(s.title).font(.system(size: 14, weight: .semibold)).lineLimit(1)
-            if let n = sectionCount(s) {
-                Text(String(n))
-                    .font(.caption2.weight(.bold))
-                    .monospacedDigit()
-                    .padding(.horizontal, 5)
-                    .frame(minWidth: 18, minHeight: 18)
-                    .background(Capsule().fill(Fx.onTintStrong))
-            }
-        }
-        .foregroundStyle(on ? Color.primary : Fx.secondaryText)
-        .padding(.horizontal, 13)
-        .frame(height: 34)
-        .background(Capsule().fill(on ? Fx.segment : Fx.tile))
-        .frame(minHeight: 44)
-        .contentShape(Capsule())
-    }
-
-    /// How many things a page has switched on (shown on its tab); nil for none.
-    private func sectionCount(_ s: MakeSection) -> Int? {
-        let n: Int
-        switch s {
-        case .photo:
-            if mode == "video" {
-                n = videoPhoto == nil ? 0 : 1
-            } else {
-                n = photo == nil ? 0 : 1 + morePhotos.count
-            }
-        case .tips:
-            n = recipe?.toggles.flatMap(\.items).filter { chosen.contains($0.id) }.count ?? 0
-        case .addons:
-            n = fittingLoras.filter { isLoraOn($0) }.count
-        default:
-            n = 0
-        }
-        return n > 0 ? n : nil
-    }
-
-    // MARK: pages
-
-    @ViewBuilder
-    func sectionPage(_ page: MakeSection) -> some View {
-        VStack(spacing: 10) {
-            switch page {
-            case .picks:
-                picksPage
-            case .photo:
-                if mode == "video" {
-                    videoPhotoPage
-                } else {
-                    drawerSection(nil) { photoSection }
-                }
-            case .tips:
-                if let r = recipe { drawerSection(nil) { styleTips(r) } }
-            case .addons:
-                drawerSection(nil) { loraSection }
-            case .settings:
-                if mode == "video" {
-                    videoSettingsPage
-                } else if let r = recipe {
-                    pictureSettingsPage(r)
-                }
-            case .help:
-                helpPage
-            }
-        }
-        .padding(.top, 2)
-    }
 
     func drawerSection<C: View>(_ title: String?, @ViewBuilder _ content: () -> C) -> some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -135,15 +16,6 @@ extension CreateScreen {
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(Fx.tile))
-    }
-
-    // MARK: quick picks
-
-    /// Every quick-pick row for the recipe in use. They edit whichever words the dock is showing.
-    var picksPage: some View {
-        drawerSection(nil) {
-            VStack(spacing: 0) { ForEach(activeGroups) { g in quickRow(g) } }
-        }
     }
 
     // MARK: picture
@@ -218,7 +90,7 @@ extension CreateScreen {
                     }
                 }
                 if !morePhotos.isEmpty {
-                    Text("Say which part comes from which: “Put the shirt from photo 2 on the person in photo 1, in the pose from photo 3. Keep the face from photo 1.”")
+                    Text("Combining \(1 + morePhotos.count) photos. Say which part comes from which: “Put the shirt from photo 2 on the person in photo 1, in the pose from photo 3. Keep the face from photo 1.”")
                         .font(.caption).foregroundStyle(Fx.secondaryText)
                 }
             }
@@ -240,10 +112,11 @@ extension CreateScreen {
             }
             Text(photoHelp).font(.caption).foregroundStyle(Fx.secondaryText)
         } else {
-            PhotosPicker(selection: $photoPick, matching: .images) {
-                Label("Add a photo", systemImage: "photo.badge.plus").frame(minHeight: 44)
+            PhotosPicker(selection: $photoPicks, maxSelectionCount: 3, matching: .images) {
+                Label("Add photos", systemImage: "photo.badge.plus").frame(minHeight: 44)
             }
-            Text("Edit it, redraw it with a picture model, or borrow a person, outfit or style from it.")
+            Text("Add one to edit it, redraw it, or borrow a person, outfit or style from it. Add two or three to "
+                 + "combine them into one scene — then say which part comes from which.")
                 .font(.caption).foregroundStyle(Fx.secondaryText)
         }
     }

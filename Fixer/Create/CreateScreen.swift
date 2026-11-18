@@ -399,17 +399,16 @@ struct CreateScreen: View {
     @State var preview: UIImage?
     @State var viewing: CreateResult?
     @State var photo: UIImage?                 // a photo to edit, start from, or use as a reference
-    @State var photoPick: PhotosPickerItem?
     @AppStorage("make.editor") var editor = "auto"   // which editor changes a photo (11-17)
     @AppStorage("make.explicitAddon") var explicitAddon = "Auto"   // 11-17: Qwen-Image 2.1 add-on for photo edits
     @AppStorage("make.enhance") var enhanceNew = true              // 11-17: Enhance my prompt, new pictures
     @AppStorage("make.enhanceEdits") var enhanceEdits = false      // ... and changes to a photo or picture
     @State var morePhotos: [UIImage] = []      // photos 2 and 3 for an edit that combines photos
     @State var morePick: PhotosPickerItem?
+    @State var photoPicks: [PhotosPickerItem] = []   // 11-18: pick several at once to combine them into one scene
     @State var photoMode = "edit"              // edit, start, reference
     @State var strength = 0.6                  // "start": how much of the photo gets redrawn
-    @State var chosen: Set<String> = []        // prompt helpers switched on
-    @State var showHelpers = false
+    @State var chosen: Set<String> = []        // the model's style tips switched on
     @State var showModels = false
     @State var mode = "picture"                // picture or video
     @State var videoPrompt = ""
@@ -421,12 +420,10 @@ struct CreateScreen: View {
     @State var changeText = ""
     @State var changeMode = "edit"             // edit: keep the rest. redraw: the picture's own model again
 
-    // The focus layout (11-17): recipes, quick picks, the panel and what has the keyboard.
+    // Make's compose sheet (11-18): recipes, quick picks and what has the keyboard.
     @ObservedObject var recipeStore = MakeRecipeStore.shared
     @EnvironmentObject var keyboard: KeyboardObserver
-    @AppStorage("make.explicit") var makeExplicit = false              // swaps in the explicit recipes, chips and models
-    @State var panelOpen = false                                       // the settings drawer is up (closed each time Make opens)
-    @AppStorage("make.section") var savedSection = MakeSection.photo.rawValue   // the drawer page last looked at
+    @AppStorage("make.explicit") var makeExplicit = false              // adds the explicit chips (toggled in Settings)
     @FocusState var focus: MakeField?
     @State var target = MakeTarget.new                 // new: the form makes a picture. change: it changes the one on the canvas
     @State var stylePrefix = ""                        // a recipe's opening words, shown and editable
@@ -441,10 +438,6 @@ struct CreateScreen: View {
     @State var videoSignature = ""
     @State var startTick = 0
     @State var stopTick = 0
-    @State var panelHeight: CGFloat = 260              // the panel's height right now, whatever it shows (the picture is fitted above it)
-    @GestureState var panelDrag: CGFloat = 0
-    @State var dockHeight: CGFloat = 200
-    @State var pageHeight: CGFloat = 220               // the open drawer page's own height (the drawer is no taller than it needs)
     @State var noteDismissed: String?
     @State var resultsAtStart = 0                      // how many results there were when the last Create began
 
@@ -465,7 +458,7 @@ struct CreateScreen: View {
                 if !desktop.isPaired {
                     unpairedCard
                 } else {
-                    makeStage
+                    makeComposeStage
                 }
             }
             .tabBarClearance()
@@ -481,9 +474,8 @@ struct CreateScreen: View {
                 if new > old, store.reviseStatus == nil { workingID = nil }       // a new picture: work on it
             }
             .onChange(of: createRunning) { was, now in
-                // A Create that made pictures ends: the dock moves on to changing the newest one. Not while the
-                // settings are open: then the form is being tuned, and the next tap is Create again.
-                if was, !now, mode == "picture", store.results.count > resultsAtStart, !panelOpen { target = .change }
+                // A Create that made pictures ends: the sheet moves on to changing the newest one.
+                if was, !now, mode == "picture", store.results.count > resultsAtStart { target = .change }
             }
             .onChange(of: working?.id) { _, _ in
                 if let w = working { changeMode = CreateStore.defaultChangeMode(for: w.recipeID) }
@@ -498,16 +490,27 @@ struct CreateScreen: View {
                     morePick = nil
                 }
             }
-            .onChange(of: photoPick) { _, item in
+            .onChange(of: photoPicks) { _, items in
+                // 11-18: one or several photos at once. The first is the base on the canvas; the rest (up to two) are
+                // the photos to combine with it, so "put the shirt from photo 2 on photo 1" works straight away. With
+                // more than one, the editor must keep the extras, so never leave it on "start".
+                guard !items.isEmpty else { return }
+                let picks = Array(items.prefix(3))
                 Task {
-                    if let data = try? await item?.loadTransferable(type: Data.self), let ui = UIImage(data: data) {
-                        let up = ImageKit.upright(ui)
-                        photo = up
-                        openSection(.photo)                       // straight to what to do with it: edit, redraw or reference
-                        LibraryStore.shared.add(picture: up, meta: Made(source: .added, action: "added")
+                    var imgs: [UIImage] = []
+                    for it in picks {
+                        if let data = try? await it.loadTransferable(type: Data.self), let ui = UIImage(data: data) {
+                            imgs.append(ImageKit.upright(ui))
+                        }
+                    }
+                    if let first = imgs.first {
+                        photo = first
+                        morePhotos = Array(imgs.dropFirst().prefix(2))
+                        if !morePhotos.isEmpty, photoMode == "start" { photoMode = "edit" }
+                        LibraryStore.shared.add(picture: first, meta: Made(source: .added, action: "added")
                             .meta(kind: .picture, conversation: nil))
                     }
-                    photoPick = nil
+                    photoPicks = []
                 }
             }
             .onChange(of: videoPhotoPick) { _, item in
@@ -541,9 +544,6 @@ struct CreateScreen: View {
             .onChange(of: rawNote) { _, n in if n == nil { noteDismissed = nil } }
             .sheet(isPresented: $showQueue) { NavigationStack { QueueScreen(inSheet: true) } }
             .sheet(isPresented: $showModels) { MakeModelSheet(recipes: recipes, chosen: modelChoice) }
-            .sheet(isPresented: $showHelpers) {
-                if let r = recipe { PromptHelpers(groups: r.toggles, chosen: $chosen) }
-            }
             .onChange(of: router.clearedCount) { _, _ in
                 workingID = nil; changeText = ""
                 running?.cancel(); running = nil; runToken = nil
@@ -1037,44 +1037,6 @@ struct MakeModelSheet: View {
             .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Done") { dismiss() } } }
         }
         .presentationDetents([.large])
-    }
-}
-
-/// The prompt helpers: groups of tap-on/off phrasings (from the computer, worded for the chosen model).
-struct PromptHelpers: View {
-    let groups: [PromptToggleGroup]
-    @Binding var chosen: Set<String>
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        NavigationStack {
-            List {
-                ForEach(groups) { g in
-                    Section(g.name) {
-                        ForEach(g.items) { t in
-                            Button {
-                                if chosen.contains(t.id) { chosen.remove(t.id) } else { chosen.insert(t.id) }
-                            } label: {
-                                HStack {
-                                    Text(t.label).foregroundStyle(.primary)
-                                    Spacer()
-                                    if chosen.contains(t.id) {
-                                        Image(systemName: "checkmark").foregroundStyle(Color.accentColor)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            .navigationTitle("Style tips")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) { Button("Clear") { chosen.removeAll() }.disabled(chosen.isEmpty) }
-                ToolbarItem(placement: .topBarTrailing) { Button("Done") { dismiss() } }
-            }
-        }
-        .presentationDetents([.medium, .large])
     }
 }
 

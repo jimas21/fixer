@@ -18,7 +18,6 @@ extension CreateScreen {
                 .accessibilityHint("See what's running on your computer")
             }
             MakeModeSwitch(mode: $mode)
-            explicitSwitch
             Spacer(minLength: 0)
             Button(action: stopEverything) {
                 Text("Stop all")
@@ -40,29 +39,6 @@ extension CreateScreen {
         .fxAnimation(Motion.pop, value: showStopAll)
     }
 
-    /// Swaps Make to the explicit recipes, models and quick picks (and back). Off never blocks or rewrites anything.
-    var explicitSwitch: some View {
-        Button { makeExplicit.toggle() } label: {
-            HStack(spacing: 6) {
-                Text("Explicit").font(.footnote.weight(.semibold)).lineLimit(1)
-                ZStack(alignment: makeExplicit ? .trailing : .leading) {
-                    Capsule().fill(makeExplicit ? Fx.explicitStroke : Fx.switchTrack).frame(width: 30, height: 18)
-                    Circle().fill(Color.white).frame(width: 14, height: 14).padding(2)
-                }
-            }
-            .foregroundStyle(makeExplicit ? Fx.explicitText : Color.primary)
-            .padding(.horizontal, 10)
-            .frame(height: 44)
-            .background(Capsule().fill(makeExplicit ? Fx.explicitSwitch : Fx.bar))
-            .overlay(Capsule().strokeBorder(makeExplicit ? Fx.explicitStroke : Fx.hairline, lineWidth: makeExplicit ? 1 : 0.5))
-            .contentShape(Capsule())
-        }
-        .buttonStyle(.plain)
-        .fxAnimation(Motion.pop, value: makeExplicit)
-        .accessibilityLabel("Explicit recipes")
-        .accessibilityValue(makeExplicit ? "On" : "Off")
-        .accessibilityAddTraits(.isToggle)
-    }
 }
 
 /// Picture | Video, a two-part capsule.

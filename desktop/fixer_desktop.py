@@ -3792,7 +3792,7 @@ def job_comfy_recipes(p: dict, emit, cancel):
     emit({"t": "info", "recipes": recipes, "loras": loras, "lora_library": _lora_entries()})
 
 
-# ---------------------------------------------------------------- Make's style recipes and the age floor (11-17)
+# ---------------------------------------------------------------- Make's style recipes (11-17)
 
 
 # The recipes and quick picks live in a PRIVATE file beside the server (never in git; the owner edits it, and an

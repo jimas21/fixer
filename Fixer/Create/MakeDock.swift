@@ -496,7 +496,7 @@ extension CreateScreen {
         let style = applied?.kind == "video" ? applied?.id : nil
         store.startVideo(prompt: assembledVideoPrompt, start: videoPhoto, explicit: rules.explicitVideo,
                          parent: videoPhotoID, action: videoPhoto == nil ? "video" : "animate",
-                         style: style, age: recipeStore.catalog == nil ? nil : Int(age),
+                         style: style,
                          loras: activeLoras.map { LoraSetting(name: $0.name, strength: $0.strength) })
     }
 }

@@ -233,6 +233,7 @@ extension CreateScreen {
     func currentSnapshot(_ a: AppliedStyle) -> StyleSnapshot {
         var snap = StyleSnapshot()
         if a.kind == "video" {
+            snap.prefix = videoPrefix
             snap.suffix = videoSuffix
             snap.explicitVideo = rules.explicitVideo
             return snap
@@ -246,6 +247,7 @@ extension CreateScreen {
             if let c = recipe?.controls.first(where: { $0.key == k }) { snap.menus[k] = menus[k] ?? c.defaultText ?? c.options.first ?? "" }
         }
         snap.negative = texts["negative"] ?? ""
+        snap.prefix = stylePrefix
         snap.suffix = styleSuffix
         return snap
     }
@@ -266,6 +268,7 @@ extension CreateScreen {
         var menuKeys: [String] = []
         if s.kind == "video" {
             mode = "video"
+            videoPrefix = s.prefix
             videoSuffix = s.suffix
             if let ev = s.explicitVideo { rules.explicitVideo = ev }
         } else {
@@ -291,6 +294,7 @@ extension CreateScreen {
                     texts["negative"] = neg
                 }
             }
+            stylePrefix = s.prefix
             styleSuffix = s.suffix
         }
         var a = AppliedStyle(id: s.id, kind: s.kind, numberKeys: numberKeys.sorted(), menuKeys: menuKeys.sorted(),

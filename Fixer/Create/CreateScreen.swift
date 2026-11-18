@@ -156,7 +156,7 @@ final class CreateStore: ObservableObject {
     /// Makes a video on the computer, from words and/or a start photo, checks it with the content filter and adds it to
     /// this session's results and the Library. One at a time. Used by the Video form and by "Animate" in the viewer.
     func startVideo(prompt: String, start: UIImage?, explicit: String, parent: UUID?, action: String,
-                   style: String? = nil, age: Int? = nil, loras: [LoraSetting] = []) {
+                   style: String? = nil, loras: [LoraSetting] = []) {
         // 11-17: a new video from here replaces the unfinished one (the computer drops the old one itself).
         var cg: CGImage?
         if let start {
@@ -179,7 +179,7 @@ final class CreateStore: ObservableObject {
         videoJob = Task {
             do {
                 let data = try await Desktop.shared.video(
-                    prompt: sent, start: startPhoto, explicit: explicit, slot: "make:video", style: style, age: age,
+                    prompt: sent, start: startPhoto, explicit: explicit, slot: "make:video", style: style,
                     loras: loras,
                     status: { msg in Task { @MainActor in if myEpoch == self.epoch { self.videoStatus = msg } } },
                     progress: { v in Task { @MainActor in if myEpoch == self.epoch { self.videoProgress = v } } })
@@ -435,7 +435,6 @@ struct CreateScreen: View {
     @State var videoSuffix = ""
     @State var applied: AppliedStyle?                  // the recipe in use, with what it set
     @State var styleNote: String?                      // "That recipe's model isn't on your computer"
-    @State var age: Double = 28                        // fills a recipe's {age}; the computer sets the default
     @State var quickTick = 0                          // bumped when a quick pick is tapped (for its haptic)
     @State var createSignature = ""                    // the form as it was when the run started
     @State var reviseSignature = ""

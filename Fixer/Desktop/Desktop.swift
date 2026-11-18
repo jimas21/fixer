@@ -396,7 +396,7 @@ final class Desktop: ObservableObject {
     /// A short video from the computer: from `prompt`, or animating `start` when given. Returns MP4 data.
     /// `explicit` is "off", "on" or "auto" (the chat always sends "auto": the computer decides from the words).
     func video(prompt: String, start: CGImage?, explicit: String, slot: String? = nil,
-               style: String? = nil, age: Int? = nil, loras: [LoraSetting] = [],
+               style: String? = nil, loras: [LoraSetting] = [],
                queued: @escaping @Sendable (String) -> Void = { _ in },
                status: @escaping @Sendable (String) -> Void,
                progress: @escaping @Sendable (Double) -> Void) async throws -> Data {
@@ -404,7 +404,6 @@ final class Desktop: ObservableObject {
         var payload: [String: Any] = ["prompt": prompt, "model": Rules.shared.pcVideoID,
                                       "explicit": explicit]
         if let style { payload["style"] = style }
-        if let age { payload["age"] = age }
         if !loras.isEmpty {
             payload["loras"] = loras.map { l -> [String: Any] in ["name": l.name, "strength": l.strength] }
         }
@@ -677,7 +676,7 @@ final class Desktop: ObservableObject {
         throw PCError.bad
     }
 
-    /// The style recipes, quick picks and the age floor for Make (the computer re-reads its file on every call, so
+    /// The style recipes and quick picks for Make (the computer re-reads its file on every call, so
     /// edits there show up the next time Make opens). Held in memory only.
     func makeRecipes() async throws -> MakeCatalog {
         guard let link else { throw PCError.notPaired }

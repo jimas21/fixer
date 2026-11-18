@@ -16,7 +16,7 @@ struct StyleRecipe: Identifiable, Equatable {
     let numbers: [String: Double]       // steps, cfg, shift
     let menus: [String: String]         // sampler, scheduler, explicit (labelled exactly as the model's menus are)
     let negative: String?
-    let prefix: String                  // 
+    let prefix: String                  // the prompt's opening words (any age comes from the owner's own words)
     let suffix: String
     let chips: [String]                 // which quick-pick groups to show
     let note: String?

@@ -366,11 +366,45 @@ extension CreateScreen {
                     .accessibilityLabel("Remove the photo")
                 }
             } else {
-                PhotosPicker(selection: $videoPhotoPick, matching: .images) {
-                    Label("Animate a photo", systemImage: "photo.badge.plus").frame(minHeight: 44)
+                Text("Start the video from a picture, or leave this empty and it is made from your words alone.")
+                    .font(.footnote).foregroundStyle(Fx.secondaryText)
+            }
+            let stills = sessionStills
+            if !stills.isEmpty {
+                Text("Made this session").font(.footnote.weight(.semibold)).foregroundStyle(Fx.secondaryText)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(stills.reversed()) { r in sessionStill(r) }
+                    }
+                    .padding(.trailing, 12)
                 }
+                .padding(.trailing, -12)
+            }
+            PhotosPicker(selection: $videoPhotoPick, matching: .images) {
+                Label("Pick from Photos", systemImage: "photo.badge.plus").frame(minHeight: 44)
             }
         }
+    }
+
+    /// One of this session's pictures, to start the video from. The one in use is outlined.
+    private func sessionStill(_ r: CreateResult) -> some View {
+        let on = videoPhoto != nil && r.libraryID != nil && r.libraryID == videoPhotoID
+        return Button { useForVideo(r) } label: {
+            Image(uiImage: r.image)
+                .resizable()
+                .scaledToFill()
+                .frame(width: 64, height: 64)
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(Fx.accent, lineWidth: on ? 2 : 0)
+                }
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Picture made this session")
+        .accessibilityHint("Starts the video from it")
+        .accessibilityAddTraits(on ? .isSelected : [])
     }
 
     @ViewBuilder var videoSettingsPage: some View {

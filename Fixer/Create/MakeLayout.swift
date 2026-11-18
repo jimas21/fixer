@@ -68,6 +68,18 @@ extension CreateScreen {
         withAnimation(Motion.snap) { panelOpen = open }
     }
 
+    /// The still pictures made this session, oldest first (videos left out).
+    var sessionStills: [CreateResult] { store.results.filter { $0.videoURL == nil } }
+
+    /// A picture made this session becomes the photo the next video starts from, straight from memory: it never has
+    /// to be saved to the phone's Photos first. From the picture side this also switches Make to Video.
+    func useForVideo(_ r: CreateResult) {
+        guard r.videoURL == nil else { return }
+        videoPhoto = r.image
+        videoPhotoID = r.libraryID
+        if mode != "video" { mode = "video" }
+    }
+
     /// Opens the drawer straight on one page.
     func openSection(_ s: MakeSection) {
         guard sections.contains(s) else { return }

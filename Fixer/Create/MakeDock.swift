@@ -326,16 +326,29 @@ extension CreateScreen {
             MakeTile(caption: "Model", value: "Wan 2.2 14B")
                 .accessibilityLabel("Video model: Wan 2.2 14B")
                 .accessibilityHint("The explicit add-on is decided by your words")
-            PhotosPicker(selection: $videoPhotoPick, matching: .images) {
-                MakeTile(caption: "Photo", value: videoPhoto == nil ? "None" : "Added", systemImage: "photo")
-            }
-            .contextMenu {
+            // The start photo comes from what was just made here as readily as from Photos: nothing has to be
+            // saved to the phone first.
+            Menu {
+                if let w = working, w.videoURL == nil {
+                    Button { useForVideo(w) } label: { Label("Use the picture showing", systemImage: "photo") }
+                }
+                if !sessionStills.isEmpty {
+                    Button { openSection(.photo) } label: {
+                        Label("Pick from this session", systemImage: "photo.stack")
+                    }
+                }
+                Button { showVideoPhotos = true } label: {
+                    Label("Pick from Photos", systemImage: "photo.on.rectangle")
+                }
                 if videoPhoto != nil {
                     Button(role: .destructive) { videoPhoto = nil; videoPhotoID = nil } label: {
                         Label("Remove the photo", systemImage: "xmark")
                     }
                 }
+            } label: {
+                MakeTile(caption: "Photo", value: videoPhoto == nil ? "None" : "Added", systemImage: "photo")
             }
+            .photosPicker(isPresented: $showVideoPhotos, selection: $videoPhotoPick, matching: .images)
             .accessibilityLabel("Start photo: \(videoPhoto == nil ? "none" : "added")")
             Menu {
                 Picker("Explicit videos", selection: $rules.explicitVideo) {

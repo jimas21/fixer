@@ -238,6 +238,12 @@ extension CreateScreen {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .contextMenu {
+            if r.videoURL == nil {
+                Button { useForVideo(r) } label: { Label("Make a video from it", systemImage: "film") }
+            }
+            Button { viewing = r } label: { Label("Open full screen", systemImage: "arrow.up.left.and.arrow.down.right") }
+        }
         .fxAnimation(Motion.pop, value: on)
         .accessibilityLabel("\(r.videoURL != nil ? "Video" : "Picture") \(index + 1) of \(count)")
         .accessibilityHint(on ? "Opens it full screen" : "Shows it on the canvas")

@@ -526,6 +526,15 @@ final class Desktop: ObservableObject {
         throw PCError.bad
     }
 
+    /// Every model on the computer the Models screen can remove: one entry per model (picture, video, chat, other).
+    func installedInventory() async throws -> [InstalledModel] {
+        guard let link else { throw PCError.notPaired }
+        for try await f in call("installed", [:], link: link) where f["t"] as? String == "info" {
+            return (f["installed"] as? [[String: Any]] ?? []).compactMap(InstalledModel.init)
+        }
+        throw PCError.bad
+    }
+
     // MARK: Create screen (ComfyUI recipes on the computer)
 
     /// The recipes the computer can run, with the controls to show for each, and its LoRA files.

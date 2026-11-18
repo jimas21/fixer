@@ -67,6 +67,9 @@ struct SettingsScreen: View {
                         NavigationLink { ModelPicker(slot: .desktopVideo) } label: {
                             LabeledContent("Video model", value: name(.desktopVideo))
                         }
+                        NavigationLink { ModelsOnComputer() } label: {
+                            Label("Models on your computer", systemImage: "externaldrive")
+                        }
                     }
                     desktopDetails
                     if !desktop.isOn {
@@ -316,6 +319,111 @@ struct ThresholdSlider: View {
         case ..<0.75: return "Standard"
         default: return "Relaxed"
         }
+    }
+}
+
+/// One model on the computer, from the `installed` op.
+struct InstalledModel: Identifiable, Hashable {
+    let id: String
+    let name: String
+    let kind: String        // "picture", "video", "chat", "other"
+    let sizeGB: Double
+    let inUse: Bool
+
+    init?(_ d: [String: Any]) {
+        guard let id = d["id"] as? String, !id.isEmpty else { return nil }
+        self.id = id
+        name = d["name"] as? String ?? id
+        kind = d["kind"] as? String ?? "other"
+        sizeGB = (d["size_gb"] as? NSNumber)?.doubleValue ?? 0
+        inUse = d["in_use"] as? Bool ?? false
+    }
+}
+
+/// Settings → Models on your computer: the picture, video and chat models downloaded on the PC, each removable.
+/// (LoRAs and the Civitai key are added here once the LoRA library exists.)
+struct ModelsOnComputer: View {
+    @ObservedObject private var desktop = Desktop.shared
+    @State private var models: [InstalledModel] = []
+    @State private var loading = true
+    @State private var failed: String?
+    @State private var removing: InstalledModel?
+    @State private var notice: String?
+
+    private static let sections: [(kind: String, title: String)] =
+        [("picture", "Picture models"), ("video", "Video"), ("chat", "Chat models")]
+
+    var body: some View {
+        List {
+            if loading && models.isEmpty {
+                HStack { ProgressView(); Text("Reading your computer…").foregroundStyle(.secondary) }
+            }
+            if let failed { Text(failed).font(.footnote).foregroundStyle(.secondary) }
+            ForEach(Self.sections, id: \.kind) { section in
+                let items = models.filter { $0.kind == section.kind }
+                if !items.isEmpty {
+                    Section(section.title) { ForEach(items) { row($0) } }
+                }
+            }
+        }
+        .navigationTitle("Models on your computer")
+        .task { await load() }
+        .refreshable { await load() }
+        .confirmationDialog(removing.map { "Remove \($0.name) from your computer?" } ?? "",
+                            isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }),
+                            titleVisibility: .visible) {
+            if let m = removing {
+                Button("Remove from computer", role: .destructive) {
+                    removing = nil
+                    Task {
+                        do { notice = try await desktop.removeModel(m.id) }
+                        catch { notice = error.localizedDescription }
+                        await load()
+                    }
+                }
+            }
+            Button("Cancel", role: .cancel) { removing = nil }
+        } message: {
+            Text("Frees its space on the computer. Choosing it again later downloads it again.")
+        }
+        .alert("Fixer", isPresented: Binding(get: { notice != nil }, set: { if !$0 { notice = nil } })) {
+            Button("OK", role: .cancel) {}
+        } message: { Text(notice ?? "") }
+    }
+
+    @ViewBuilder private func row(_ m: InstalledModel) -> some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(m.name)
+                Text(m.inUse ? "In use · \(sizeText(m.sizeGB))" : sizeText(m.sizeGB))
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+        .contextMenu {
+            if m.inUse {
+                Text("In use: switch to another model before removing this one")
+            } else {
+                Button(role: .destructive) { removing = m } label: {
+                    Label("Remove from computer", systemImage: "trash")
+                }
+            }
+        }
+        .swipeActions {
+            if !m.inUse {
+                Button(role: .destructive) { removing = m } label: { Label("Remove", systemImage: "trash") }
+            }
+        }
+    }
+
+    private func sizeText(_ gb: Double) -> String { gb >= 0.1 ? String(format: "%.1f GB", gb) : "small" }
+
+    private func load() async {
+        guard desktop.isPaired else { failed = "Your computer isn't connected."; loading = false; return }
+        loading = true; failed = nil
+        do { models = try await desktop.installedInventory() }
+        catch { failed = "Couldn't reach your computer. Pull down to try again." }
+        loading = false
     }
 }
 

@@ -109,19 +109,22 @@ enum MakeTarget: Hashable { case new, change }
 /// Which text field has the keyboard.
 enum MakeField: Hashable { case prefix, words, change }
 
-/// How far the settings panel is pulled up.
-enum MakeDetent: Int, CaseIterable {
-    case collapsed, mid, large
+/// The pages of the settings drawer. Which of them show depends on what is being made.
+enum MakeSection: String, CaseIterable, Identifiable {
+    case picks, photo, tips, addons, settings, help
+
+    var id: String { rawValue }
 
     var title: String {
         switch self {
-        case .collapsed: "Collapsed"
-        case .mid: "Half open"
-        case .large: "Open"
+        case .picks: "Quick picks"
+        case .photo: "Photo"
+        case .tips: "Style tips"
+        case .addons: "Add-ons"
+        case .settings: "Settings"
+        case .help: "How it works"
         }
     }
-    var up: MakeDetent { MakeDetent(rawValue: min(rawValue + 1, MakeDetent.large.rawValue)) ?? .large }
-    var down: MakeDetent { MakeDetent(rawValue: max(rawValue - 1, 0)) ?? .collapsed }
 }
 
 /// What a recipe set, so the row can say "Custom" once something was changed by hand.

@@ -1,22 +1,20 @@
 import SwiftUI
 
-/// The settings panel under the picture. Three heights: closed (prompt, tiles, Create), half open (adds quick picks
-/// and Age) and open (adds everything else Make offers). It is an overlay, not a sheet: a sheet would cover the tab
-/// bar, fight the keyboard and need a second presentation for every list opened from it.
+/// The panel under the picture. Closed, it is the dock: the prompt, the tiles and Create. Open, a drawer of pages
+/// (quick picks, photo, style tips, add-ons, settings) sits above a shorter dock, one tap per page, and the picture
+/// shrinks to stay in view above it. It is an overlay, not a sheet: a sheet would cover the tab bar, fight the
+/// keyboard and need a second presentation for every list opened from it.
 extension CreateScreen {
     func makePanel(containerHeight: CGFloat) -> some View {
         let typing = isTyping
-        let open = detent == .large && !typing
-        let drawerHeight = Swift.max(160, containerHeight - 44 - 16 - dockHeight - 48 - 70)
+        let open = drawerShowing
         return VStack(spacing: 0) {
-            panelGrabber
-            panelProgressBar
+            panelHandle
             if open {
-                makeDrawer
-                    .frame(height: drawerHeight)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                makeDrawer(maxHeight: drawerCap(containerHeight))
+                    .transition(.opacity)
             }
-            makeDock(typing: typing)
+            makeDock(typing: typing, open: open)
                 .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { dockHeight = $0 }
         }
         .padding(.horizontal, 12)
@@ -24,29 +22,47 @@ extension CreateScreen {
         .glass(radius: Fx.panelRadius, tint: Fx.panel)
         .padding(.horizontal, 8)
         .padding(.bottom, 8)
-        .offset(y: panelDrag > 0 ? panelDrag : Swift.max(panelDrag * 0.2, -14))
+        .offset(y: panelOffset)
         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { h in
-            if detent == .collapsed, !isTyping, h > 0 { restingPanelHeight = h }
+            if h > 0 { panelHeight = h }            // always measured: the canvas fits the picture above whatever shows
         }
-        .fxAnimation(Motion.snap, value: detent)
+        .fxAnimation(Motion.snap, value: open)
         .fxAnimation(Motion.snap, value: typing)
+        .fxAnimation(Motion.snap, value: section)
         .fxAnimation(Motion.follow, value: panelDrag)
-        .sensoryFeedback(.selection, trigger: savedDetent)
+        .sensoryFeedback(.selection, trigger: panelOpen)
+        .sensoryFeedback(.selection, trigger: savedSection)
     }
 
-    var panelGrabber: some View {
+    /// The most height the open page may take, so the picture above always keeps a strip of its own.
+    func drawerCap(_ containerHeight: CGFloat) -> CGFloat {
+        let picture: CGFloat = keyboard.visible ? 0 : 150
+        let chrome: CGFloat = 64 + 30 + 52 + 36          // the header, the handle, the page tabs, paddings and gaps
+        return Swift.max(120, containerHeight - picture - chrome - dockHeight)
+    }
+
+    /// While the handle is dragged the panel follows a little: down when there is something to put away, barely
+    /// otherwise, and hardly at all upwards (it opens when the finger lifts).
+    private var panelOffset: CGFloat {
+        if panelDrag > 0 {
+            return drawerShowing || keyboard.visible ? Swift.min(panelDrag * 0.5, 60) : Swift.min(panelDrag * 0.2, 14)
+        }
+        return Swift.max(panelDrag * 0.2, -14)
+    }
+
+    /// The grabber: tap it or flick it up to open the settings, tap or flick down to close them. The thin progress
+    /// line lives in the same strip, so a run starting never changes the panel's height.
+    var panelHandle: some View {
         Button {
-            setDetent(detent == .collapsed ? .mid : detent == .mid ? .large : .mid)
+            setPanel(open: !drawerShowing)
         } label: {
-            VStack(spacing: 6) {
+            VStack(spacing: 7) {
                 Capsule().fill(Fx.grabber).frame(width: 36, height: 5)
-                Text(detent == .large ? "Pull down for less" : "Pull up for photo, style tips, add-ons, advanced")
-                    .font(.caption)
-                    .foregroundStyle(Fx.secondaryText)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
+                panelProgressBar
             }
-            .frame(maxWidth: .infinity, minHeight: 44)
+            .padding(.top, 8)
+            .padding(.bottom, 6)
+            .frame(maxWidth: .infinity)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -55,21 +71,25 @@ extension CreateScreen {
                 .updating($panelDrag) { value, state, _ in state = value.translation.height }
                 .onEnded { value in
                     let predicted = value.predictedEndTranslation.height
-                    if predicted < -260 { setDetent(detent.up.up) }
-                    else if predicted < -60 { setDetent(detent.up) }
-                    else if predicted > 60 {
-                        if focus != nil { focus = nil; Self.hideKeyboard() }
-                        setDetent(detent.down)
+                    if predicted < -60 {
+                        setPanel(open: true)
+                    } else if predicted > 60 {
+                        if keyboard.visible {
+                            focus = nil
+                            Self.hideKeyboard()
+                        } else {
+                            setPanel(open: false)
+                        }
                     }
                 })
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Picture settings")
-        .accessibilityValue(detent.title)
-        .accessibilityHint("Swipe up or down to open or close the settings")
+        .accessibilityLabel("More settings")
+        .accessibilityValue(drawerShowing ? "Open, \(section.title)" : "Closed")
+        .accessibilityHint("Photo, style tips, add-ons and advanced settings")
         .accessibilityAdjustableAction { direction in
             switch direction {
-            case .increment: setDetent(detent.up)
-            case .decrement: setDetent(detent.down)
+            case .increment: setPanel(open: true)
+            case .decrement: setPanel(open: false)
             @unknown default: break
             }
         }
@@ -85,8 +105,26 @@ extension CreateScreen {
         }
         .frame(height: 4)
         .padding(.horizontal, 4)
-        .padding(.bottom, 10)
         .opacity(anyRunning ? 1 : 0)
         .accessibilityHidden(true)
+    }
+
+    /// The round button beside Create: the same thing as the handle, where a thumb already is.
+    var panelToggle: some View {
+        let open = drawerShowing
+        return Button {
+            setPanel(open: !open)
+        } label: {
+            Image(systemName: "chevron.up")
+                .font(.system(size: 17, weight: .semibold))
+                .rotationEffect(.degrees(open ? 180 : 0))
+                .foregroundStyle(Color.primary)
+                .frame(width: 50, height: 50)
+                .background(Circle().fill(Fx.solidSoft))
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(open ? "Close the settings" : "More settings")
+        .accessibilityHint(open ? "" : "Photo, style tips, add-ons and advanced settings")
     }
 }

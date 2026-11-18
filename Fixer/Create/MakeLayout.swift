@@ -1,8 +1,9 @@
 import SwiftUI
 import UIKit
 
-/// Make, "focus mode": the picture fills the screen, the settings are a panel you pull up from the bottom. This file
-/// holds the layout and the small rules every part shares (what is running, what the prompt is, what a recipe sets).
+/// Make, "focus mode": the picture fills the room above a short panel, with a roll of this session's pictures under
+/// it; the settings are pages in a drawer the panel opens. This file holds the layout and the small rules every part
+/// shares (what is running, what the prompt is, what a recipe sets).
 extension CreateScreen {
     // MARK: layout
 
@@ -36,10 +37,48 @@ extension CreateScreen {
 
     // MARK: what is going on
 
-    var detent: MakeDetent { MakeDetent(rawValue: savedDetent) ?? .collapsed }
+    /// The drawer pages that make sense for what the dock is doing right now.
+    var sections: [MakeSection] {
+        let picks: [MakeSection] = recipeStore.catalog != nil && !activeGroups.isEmpty ? [.picks] : []
+        if effectiveTarget == .change { return picks + [.help] }
+        if mode == "video" { return picks + [.photo, .settings] }
+        guard let r = recipe else { return [] }
+        var list = picks + [.photo]
+        if !r.toggles.isEmpty { list.append(.tips) }
+        if !loraFiles.isEmpty { list.append(.addons) }
+        list.append(.settings)
+        return list
+    }
 
-    func setDetent(_ d: MakeDetent) {
-        withAnimation(Motion.snap) { savedDetent = d.rawValue }
+    /// The page showing: the one last looked at when it still applies, else the first.
+    var section: MakeSection {
+        if let saved = MakeSection(rawValue: savedSection), sections.contains(saved) { return saved }
+        return sections.first ?? .settings
+    }
+
+    /// The drawer is on screen. Never while typing in one of Make's own fields: the panel then shows only what
+    /// typing needs, and the drawer comes back when the keyboard goes.
+    var drawerShowing: Bool { panelOpen && !isTyping && !sections.isEmpty }
+
+    func setPanel(open: Bool) {
+        if open, focus != nil {
+            focus = nil
+            Self.hideKeyboard()
+        }
+        withAnimation(Motion.snap) { panelOpen = open }
+    }
+
+    /// Opens the drawer straight on one page.
+    func openSection(_ s: MakeSection) {
+        guard sections.contains(s) else { return }
+        if focus != nil {
+            focus = nil
+            Self.hideKeyboard()
+        }
+        withAnimation(Motion.snap) {
+            savedSection = s.rawValue
+            panelOpen = true
+        }
     }
 
     /// The keyboard is up on one of Make's own fields: the panel shows only what typing needs.

@@ -417,7 +417,8 @@ struct CreateScreen: View {
     @ObservedObject var recipeStore = MakeRecipeStore.shared
     @EnvironmentObject var keyboard: KeyboardObserver
     @AppStorage("make.explicit") var makeExplicit = false              // swaps in the explicit recipes, chips and models
-    @AppStorage("make.detent") var savedDetent = MakeDetent.collapsed.rawValue
+    @State var panelOpen = false                                       // the settings drawer is up (closed each time Make opens)
+    @AppStorage("make.section") var savedSection = MakeSection.photo.rawValue   // the drawer page last looked at
     @FocusState var focus: MakeField?
     @State var target = MakeTarget.new                 // new: the form makes a picture. change: it changes the one on the canvas
     @State var stylePrefix = ""                        // a recipe's opening words, shown and editable
@@ -433,9 +434,10 @@ struct CreateScreen: View {
     @State var videoSignature = ""
     @State var startTick = 0
     @State var stopTick = 0
-    @State var restingPanelHeight: CGFloat = 250       // the panel's height when closed (the picture is centred above it; open panels cover the picture)
+    @State var panelHeight: CGFloat = 260              // the panel's height right now, whatever it shows (the picture is fitted above it)
     @GestureState var panelDrag: CGFloat = 0
-    @State var dockHeight: CGFloat = 230
+    @State var dockHeight: CGFloat = 200
+    @State var pageHeight: CGFloat = 220               // the open drawer page's own height (the drawer is no taller than it needs)
     @State var noteDismissed: String?
     @State var resultsAtStart = 0                      // how many results there were when the last Create began
 
@@ -472,8 +474,9 @@ struct CreateScreen: View {
                 if new > old, store.reviseStatus == nil { workingID = nil }       // a new picture: work on it
             }
             .onChange(of: createRunning) { was, now in
-                // A Create that made pictures ends: the dock moves on to changing the newest one.
-                if was, !now, mode == "picture", store.results.count > resultsAtStart { target = .change }
+                // A Create that made pictures ends: the dock moves on to changing the newest one. Not while the
+                // settings are open: then the form is being tuned, and the next tap is Create again.
+                if was, !now, mode == "picture", store.results.count > resultsAtStart, !panelOpen { target = .change }
             }
             .onChange(of: working?.id) { _, _ in
                 if let w = working { changeMode = CreateStore.defaultChangeMode(for: w.recipeID) }
@@ -493,6 +496,7 @@ struct CreateScreen: View {
                     if let data = try? await item?.loadTransferable(type: Data.self), let ui = UIImage(data: data) {
                         let up = ImageKit.upright(ui)
                         photo = up
+                        openSection(.photo)                       // straight to what to do with it: edit, redraw or reference
                         LibraryStore.shared.add(picture: up, meta: Made(source: .added, action: "added")
                             .meta(kind: .picture, conversation: nil))
                     }

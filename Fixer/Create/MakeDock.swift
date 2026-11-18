@@ -1,12 +1,14 @@
 import PhotosUI
 import SwiftUI
 
-/// The part of the panel that is always there: the recipe row, the prompt box, quick picks and Age, four tiles and
-/// one wide button.
+/// The part of the panel that is always there: the recipe row, the prompt box, the tiles, and one wide button with
+/// the round button that opens the settings beside it. It is kept short so the picture gets the room: while the
+/// settings are open or the keyboard is up it is just the prompt and the button.
 extension CreateScreen {
-    func makeDock(typing: Bool) -> some View {
+    func makeDock(typing: Bool, open: Bool) -> some View {
         VStack(spacing: 6) {
-            if hasRecipeRow { recipeRow }
+            // With the settings open the row stays only while it holds the New / Change this switch.
+            if hasRecipeRow, !open || canChange { recipeRow }
             if mode == "picture", effectiveTarget == .new, !loading, recipe == nil, failed != nil {
                 Button { Task { await load() } } label: {
                     Label("Try again", systemImage: "arrow.clockwise").frame(maxWidth: .infinity, minHeight: 44)
@@ -15,11 +17,18 @@ extension CreateScreen {
                 .accessibilityHint("Asks your computer for its picture models again")
             }
             promptBox
-            if recipeStore.catalog != nil, detent != .collapsed || typing { quickPicks(typing: typing) }
-            if !typing, hasTiles { tiles }
-            mainButton
+            if typing, recipeStore.catalog != nil { quickPicks(typing: true) }
+            if !typing, !open, hasTiles { tiles }
+            HStack(spacing: 8) {
+                mainButton
+                if !typing, !sections.isEmpty { panelToggle }
+            }
+            .padding(.top, 4)
         }
     }
+
+    /// The prompt box is two lines at rest, so the picture keeps the room, and grows while it is being typed in.
+    var wordLines: ClosedRange<Int> { focus == .words ? 3...6 : 2...3 }
 
     // MARK: recipe row
 
@@ -152,7 +161,7 @@ extension CreateScreen {
                             .focused($focus, equals: .prefix)
                     }
                     TextField("What should the video show?", text: $videoPrompt, axis: .vertical)
-                        .lineLimit(3...5)
+                        .lineLimit(wordLines)
                         .focused($focus, equals: .words)
                 } else {
                     if !stylePrefix.isEmpty {
@@ -162,24 +171,37 @@ extension CreateScreen {
                             .focused($focus, equals: .prefix)
                     }
                     TextField("What should the picture show?", text: promptBinding, axis: .vertical)
-                        .lineLimit(3...5)
+                        .lineLimit(wordLines)
                         .focused($focus, equals: .words)
                 }
             }
             .font(.body)
             .frame(maxWidth: .infinity, alignment: .leading)
-            if effectiveTarget == .new, mode == "picture", let photo {
-                Button { setDetent(.large) } label: {
-                    Image(uiImage: photo)
-                        .resizable().scaledToFill()
-                        .frame(width: 32, height: 32)
-                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                        .frame(minWidth: 44, minHeight: 44)
-                        .contentShape(Rectangle())
+            if effectiveTarget == .new, mode == "picture", recipe != nil {
+                if let photo {
+                    Button { openSection(.photo) } label: {
+                        Image(uiImage: photo)
+                            .resizable().scaledToFill()
+                            .frame(width: 32, height: 32)
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                            .frame(minWidth: 44, minHeight: 44)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Photo added")
+                    .accessibilityHint("Opens the photo settings")
+                } else {
+                    // One tap to bring a photo in; its settings page opens once it is picked.
+                    PhotosPicker(selection: $photoPick, matching: .images) {
+                        Image(systemName: "photo.badge.plus")
+                            .font(.system(size: 19))
+                            .foregroundStyle(Fx.secondaryText)
+                            .frame(minWidth: 44, minHeight: 44)
+                            .contentShape(Rectangle())
+                    }
+                    .accessibilityLabel("Add a photo")
+                    .accessibilityHint("Edit it, redraw it, or use it as a reference")
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Photo added")
-                .accessibilityHint("Opens the photo settings")
             }
         }
         .padding(10)
@@ -189,6 +211,7 @@ extension CreateScreen {
 
     // MARK: quick picks
 
+    /// The one row that rides along while typing; every row is on the drawer's Quick picks page.
     func quickPicks(typing: Bool) -> some View {
         let groups = typing ? Array(activeGroups.prefix(1)) : Array(activeGroups.prefix(3))
         return VStack(spacing: 0) {
@@ -444,7 +467,6 @@ extension CreateScreen {
         }
         .buttonStyle(.plain)
         .disabled(!spec.enabled)
-        .padding(.top, 4)
         .accessibilityLabel(spec.title)
     }
 

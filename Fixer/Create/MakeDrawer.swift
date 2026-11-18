@@ -1,35 +1,128 @@
 import PhotosUI
 import SwiftUI
 
-/// Everything Make offers beyond the dock, shown when the panel is pulled all the way up: the photo, style tips,
-/// add-ons, advanced settings, more quick picks and this session's pictures. The controls are the same ones that
-/// were on the old form, with the same bindings.
+/// Everything Make offers beyond the dock, as pages: quick picks, the photo, style tips, add-ons and settings. Each
+/// page is one tap away on the row of tabs, and the drawer is only as tall as the page needs (up to a limit that
+/// leaves the picture in view). The controls are the same ones that were on the old form, with the same bindings.
 extension CreateScreen {
-    var makeDrawer: some View {
-        ScrollView {
-            VStack(spacing: 10) {
-                if effectiveTarget == .change {
-                    drawerSection(nil) {
-                        Text(changeMode == "edit"
-                             ? "Keep the rest: only what you ask for changes."
-                             : "Redraw it: the picture's own model draws it again with your change; the layout mostly stays.")
-                            .font(.footnote).foregroundStyle(Fx.secondaryText)
-                    }
-                    if canChange { drawerSection("How changes work") { changeHelp } }
-                } else if mode == "video" {
-                    videoDrawer
-                } else if let r = recipe {
-                    pictureDrawer(r)
-                }
-                moreQuickPicks
-                recipeWords
-                thisSession
+    func makeDrawer(maxHeight: CGFloat) -> some View {
+        let page = section
+        return VStack(spacing: 6) {
+            sectionTabs(page)
+            ScrollView {
+                sectionPage(page)
+                    .padding(.bottom, 4)
+                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { pageHeight = $0 }
             }
-            .padding(.top, 2)
-            .padding(.bottom, 4)
+            .id(page)
+            .scrollDismissesKeyboard(.interactively)
+            .scrollIndicators(.hidden)
+            .scrollBounceBehavior(.basedOnSize)
+            .frame(height: Swift.min(Swift.max(pageHeight, 60), maxHeight))
+            .fxAnimation(Motion.snap, value: pageHeight)
         }
-        .scrollDismissesKeyboard(.interactively)
-        .scrollIndicators(.hidden)
+        .padding(.bottom, 8)
+    }
+
+    // MARK: tabs
+
+    func sectionTabs(_ page: MakeSection) -> some View {
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(sections) { s in
+                        Button {
+                            withAnimation(Motion.snap) { savedSection = s.rawValue }
+                        } label: {
+                            sectionChip(s, on: s == page)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityAddTraits(s == page ? .isSelected : [])
+                        .id(s)
+                    }
+                }
+                .padding(.trailing, 12)
+            }
+            .padding(.trailing, -12)
+            .onChange(of: page) { _, p in
+                withAnimation(Motion.snap) { proxy.scrollTo(p, anchor: .center) }
+            }
+            .onAppear { proxy.scrollTo(page, anchor: .center) }
+        }
+        .frame(minHeight: 44)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Settings pages")
+    }
+
+    private func sectionChip(_ s: MakeSection, on: Bool) -> some View {
+        HStack(spacing: 5) {
+            Text(s.title).font(.system(size: 14, weight: .semibold)).lineLimit(1)
+            if let n = sectionCount(s) {
+                Text(String(n))
+                    .font(.caption2.weight(.bold))
+                    .monospacedDigit()
+                    .padding(.horizontal, 5)
+                    .frame(minWidth: 18, minHeight: 18)
+                    .background(Capsule().fill(Fx.onTintStrong))
+            }
+        }
+        .foregroundStyle(on ? Color.primary : Fx.secondaryText)
+        .padding(.horizontal, 13)
+        .frame(height: 34)
+        .background(Capsule().fill(on ? Fx.segment : Fx.tile))
+        .frame(minHeight: 44)
+        .contentShape(Capsule())
+    }
+
+    /// How many things a page has switched on (shown on its tab); nil for none.
+    private func sectionCount(_ s: MakeSection) -> Int? {
+        let n: Int
+        switch s {
+        case .photo:
+            if mode == "video" {
+                n = videoPhoto == nil ? 0 : 1
+            } else {
+                n = photo == nil ? 0 : 1 + morePhotos.count
+            }
+        case .tips:
+            n = recipe?.toggles.flatMap(\.items).filter { chosen.contains($0.id) }.count ?? 0
+        case .addons:
+            n = loras.count
+        default:
+            n = 0
+        }
+        return n > 0 ? n : nil
+    }
+
+    // MARK: pages
+
+    @ViewBuilder
+    func sectionPage(_ page: MakeSection) -> some View {
+        VStack(spacing: 10) {
+            switch page {
+            case .picks:
+                picksPage
+            case .photo:
+                if mode == "video" {
+                    videoPhotoPage
+                } else {
+                    drawerSection(nil) { photoSection }
+                }
+            case .tips:
+                if let r = recipe { drawerSection(nil) { styleTips(r) } }
+            case .addons:
+                if !loraFiles.isEmpty { drawerSection(nil) { loraSection } }
+            case .settings:
+                if mode == "video" {
+                    videoSettingsPage
+                } else if let r = recipe {
+                    pictureSettingsPage(r)
+                }
+            case .help:
+                helpPage
+            }
+        }
+        .padding(.top, 2)
     }
 
     func drawerSection<C: View>(_ title: String?, @ViewBuilder _ content: () -> C) -> some View {
@@ -44,19 +137,22 @@ extension CreateScreen {
         .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(Fx.tile))
     }
 
+    // MARK: quick picks
+
+    /// Every quick-pick row for the recipe in use. They edit whichever words the dock is showing.
+    var picksPage: some View {
+        drawerSection(nil) {
+            VStack(spacing: 0) { ForEach(activeGroups) { g in quickRow(g) } }
+        }
+    }
+
     // MARK: picture
 
     @ViewBuilder
-    func pictureDrawer(_ r: CreateRecipe) -> some View {
-        drawerSection("Photo") { photoSection }
-        if let note = r.note {
-            drawerSection("About this model") {
-                Text(note).font(.footnote).foregroundStyle(Fx.secondaryText)
-            }
-        }
+    func pictureSettingsPage(_ r: CreateRecipe) -> some View {
         let settings = r.controls.filter { !$0.advanced && !["prompt", "shape", "count"].contains($0.key) }
         if !settings.isEmpty {
-            drawerSection("Settings") {
+            drawerSection(nil) {
                 ForEach(settings) { c in
                     if c.kind == "text" {
                         VStack(alignment: .leading, spacing: 4) {
@@ -71,9 +167,13 @@ extension CreateScreen {
                 }
             }
         }
-        if !r.toggles.isEmpty { drawerSection("Style tips") { styleTips(r) } }
-        if !loraFiles.isEmpty { drawerSection("Style add-ons (LoRAs)") { loraSection } }
+        recipeWords
         drawerSection(nil) { advancedSection(r) }
+        if let note = r.note {
+            drawerSection("About this model") {
+                Text(note).font(.footnote).foregroundStyle(Fx.secondaryText)
+            }
+        }
     }
 
     @ViewBuilder var photoSection: some View {
@@ -143,39 +243,57 @@ extension CreateScreen {
             PhotosPicker(selection: $photoPick, matching: .images) {
                 Label("Add a photo", systemImage: "photo.badge.plus").frame(minHeight: 44)
             }
+            Text("Edit it, redraw it with a picture model, or borrow a person, outfit or style from it.")
+                .font(.caption).foregroundStyle(Fx.secondaryText)
         }
     }
 
+    /// The style tips, right on the page: a row of tap-on / tap-off phrasings per group.
     func styleTips(_ r: CreateRecipe) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Button { showHelpers = true } label: {
-                Label(chosen.isEmpty ? "Style tips" : "Style tips (\(chosen.count) on)", systemImage: "checklist")
-                    .frame(minHeight: 44)
-                    .contentShape(Rectangle())
-            }
-            let on = r.toggles.flatMap(\.items).filter { chosen.contains($0.id) }
-            if !on.isEmpty {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(r.toggles) { g in
+                if !g.name.isEmpty {
+                    Text(g.name).font(.caption).foregroundStyle(Fx.secondaryText).padding(.top, 4)
+                }
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
-                        ForEach(on) { t in
-                            Button { chosen.remove(t.id) } label: {
-                                HStack(spacing: 4) { Text(t.label); Image(systemName: "xmark").font(.caption2) }
-                                    .font(.footnote).padding(.horizontal, 10)
-                                    .frame(minHeight: 32)
-                                    .background(Capsule().fill(Fx.onTint))
-                                    .frame(minHeight: 44)
-                                    .contentShape(Capsule())
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel("\(t.label), on")
-                            .accessibilityHint("Turns it off")
-                        }
+                        ForEach(g.items) { t in tipChip(t) }
                     }
+                    .padding(.trailing, 12)
                 }
+                .padding(.trailing, -12)
             }
-            Text("Tried-and-true phrasings, worded for this model, added to your prompt when you create.")
-                .font(.caption).foregroundStyle(Fx.secondaryText)
+            HStack(alignment: .center, spacing: 8) {
+                Text("Tried-and-true phrasings, worded for this model, added to your prompt when you create.")
+                    .font(.caption).foregroundStyle(Fx.secondaryText)
+                Spacer(minLength: 0)
+                Button("Clear") { chosen.removeAll() }
+                    .frame(minHeight: 44)
+                    .disabled(chosen.isEmpty)
+            }
+            .padding(.top, 4)
         }
+    }
+
+    private func tipChip(_ t: PromptToggle) -> some View {
+        let on = chosen.contains(t.id)
+        return Button {
+            if on { chosen.remove(t.id) } else { chosen.insert(t.id) }
+            quickTick += 1
+        } label: {
+            Text(t.label)
+                .font(.system(size: 14, weight: on ? .semibold : .regular))
+                .lineLimit(1)
+                .foregroundStyle(on ? styleTint : Color.primary)
+                .padding(.horizontal, 11)
+                .frame(height: 32)
+                .background(Capsule().fill(on ? styleFill : Fx.tile))
+                .overlay(Capsule().strokeBorder(on ? styleStroke : Color.clear, lineWidth: 1))
+                .frame(minHeight: 44)
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(on ? .isSelected : [])
     }
 
     var loraSection: some View {
@@ -232,8 +350,8 @@ extension CreateScreen {
 
     // MARK: video
 
-    @ViewBuilder var videoDrawer: some View {
-        drawerSection("Start photo") {
+    var videoPhotoPage: some View {
+        drawerSection(nil) {
             if let videoPhoto {
                 HStack(alignment: .top, spacing: 12) {
                     Image(uiImage: videoPhoto).resizable().scaledToFill().frame(width: 72, height: 72).clipped()
@@ -253,6 +371,9 @@ extension CreateScreen {
                 }
             }
         }
+    }
+
+    @ViewBuilder var videoSettingsPage: some View {
         drawerSection("Explicit videos") {
             Picker("Explicit videos", selection: $rules.explicitVideo) {
                 Text("Off").tag("off")
@@ -263,6 +384,7 @@ extension CreateScreen {
             Text("Off never uses the explicit add-on. On always does. Auto decides from your words. This is for videos made here; the chat always decides by your words.")
                 .font(.caption).foregroundStyle(Fx.secondaryText)
         }
+        recipeWords
         drawerSection(nil) {
             Text("Made on your computer by a video model that turns words, or a photo, into a 5-second clip with natural motion. About 2–3 minutes.")
                 .font(.footnote).foregroundStyle(Fx.secondaryText)
@@ -270,15 +392,6 @@ extension CreateScreen {
     }
 
     // MARK: shared
-
-    @ViewBuilder var moreQuickPicks: some View {
-        let rest = Array(activeGroups.dropFirst(3))
-        if recipeStore.catalog != nil, !rest.isEmpty {
-            drawerSection("More quick picks") {
-                VStack(spacing: 0) { ForEach(rest) { g in quickRow(g) } }
-            }
-        }
-    }
 
     /// The recipe's closing words, added after the owner's own.
     @ViewBuilder var recipeWords: some View {
@@ -295,48 +408,15 @@ extension CreateScreen {
         }
     }
 
-    /// Everything made in Make this session, newest first. It lives in the app-level store, so it survives switching
-    /// tabs; the Library also has every item.
-    @ViewBuilder var thisSession: some View {
-        if !store.results.isEmpty {
-            drawerSection("This session") {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        ForEach(store.results.reversed()) { res in
-                            Image(uiImage: res.image).resizable().scaledToFill()
-                                .frame(width: 72, height: 72).clipped()
-                                .overlay {
-                                    if res.videoURL != nil {
-                                        Image(systemName: "play.circle.fill").font(.title2)
-                                            .foregroundStyle(.white).shadow(radius: 3)
-                                    }
-                                }
-                                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                                .overlay {
-                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                        .strokeBorder(Fx.accent, lineWidth: working?.id == res.id ? 2 : 0)
-                                }
-                                .contentShape(Rectangle())
-                                .onTapGesture {
-                                    workingID = res.id
-                                    if res.videoURL == nil { target = .change }
-                                    setDetent(.mid)
-                                }
-                                .onLongPressGesture { viewing = res }
-                                .accessibilityElement()
-                                .accessibilityLabel(res.videoURL != nil ? "Video" : "Picture")
-                                .accessibilityAddTraits(.isButton)
-                                .accessibilityAction(named: "Open full screen") { viewing = res }
-                        }
-                    }
-                }
-                Button { router.tab = .library } label: {
-                    HStack { Text("All in Library"); Spacer(); Image(systemName: "chevron.right").font(.footnote) }
-                        .frame(minHeight: 44)
-                        .contentShape(Rectangle())
-                }
-            }
+    /// Changing the picture on the canvas: what the two ways do, and what the chosen editor is good at.
+    @ViewBuilder var helpPage: some View {
+        drawerSection(nil) {
+            Text(changeMode == "edit"
+                 ? "Keep the rest: only what you ask for changes."
+                 : "Redraw it: the picture's own model draws it again with your change; the layout mostly stays.")
+                .font(.footnote).foregroundStyle(Fx.secondaryText)
         }
+        if canChange { drawerSection("How changes work") { changeHelp } }
     }
 
     var changeHelp: some View {

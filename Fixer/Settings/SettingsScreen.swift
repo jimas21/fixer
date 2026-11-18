@@ -425,14 +425,27 @@ struct ModelsOnComputer: View {
         }
     }
 
-    private var loraSection: some View {
-        Section {
-            if loras.isEmpty {
+    /// The downloaded LoRAs grouped by the model they are for, so each shows under its own model; anything the
+    /// computer could not sort falls into a "Not sorted yet" group at the end.
+    private var loraGroups: [(family: String, name: String, items: [LoraEntry])] {
+        let byFamily = Dictionary(grouping: loras) { LoraEntry.families.contains($0.family) ? $0.family : "unknown" }
+        return (LoraEntry.families + ["unknown"]).compactMap { fam in
+            guard let items = byFamily[fam], !items.isEmpty else { return nil }
+            return (fam, fam == "unknown" ? "Not sorted yet" : LoraEntry.familyName(fam), items)
+        }
+    }
+
+    @ViewBuilder private var loraSection: some View {
+        if loras.isEmpty {
+            Section("Add-ons (LoRAs)") {
                 Text("None yet. Add one in Make, on the Add-ons page.").font(.footnote).foregroundStyle(.secondary)
             }
-            ForEach(loras) { l in loraRow(l) }
-        } header: {
-            Text("Add-ons (LoRAs)")
+        } else {
+            ForEach(loraGroups, id: \.family) { g in
+                Section("Add-ons · \(g.name)") {
+                    ForEach(g.items) { l in loraRow(l) }
+                }
+            }
         }
     }
 
@@ -502,7 +515,7 @@ struct ModelsOnComputer: View {
     }
 
     private func loraDetail(_ l: LoraEntry) -> String {
-        var parts = ["For " + LoraEntry.familyName(l.family), LoraEntry.sizeText(l.size)]
+        var parts = [LoraEntry.sizeText(l.size)]            // the section header already names the model
         if l.alwaysOn { parts.append("Always on") }
         return parts.joined(separator: " · ")
     }

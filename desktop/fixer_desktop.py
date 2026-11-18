@@ -143,12 +143,8 @@ GGUF_QUANTS = ("Q5_K_M", "Q4_K_M", "Q6_K", "Q8_0", "Q4_K_S", "Q3_K_L")       # p
 BRAIN_VRAM_GB = float(os.environ.get("FIXER_BRAIN_VRAM_GB", "15.5"))   # weights + vision projector
 BRAIN_CTX = int(os.environ.get("FIXER_BRAIN_CTX", "16384"))
 # Picture models that are a single retrained "transformer" file on top of a base diffusers model:
-# id -> (base repo, file in the id's repo, diffusers class).
-TRANSFORMER_SWAPS = {
-    # Z-Image Turbo retrained for explicit content (Apache-2.0, community; v2, 12.6 GB bf16).
-    "tewea/z_image_turbo_bf16_nsfw": ("Tongyi-MAI/Z-Image-Turbo", "z_image_turbo_bf16_nsfw_v2.safetensors",
-                                      "ZImageTransformer2DModel"),
-}
+# id -> (base repo, file in the id's repo, diffusers class). Empty now; the name stays (used in the diffusers path).
+TRANSFORMER_SWAPS: dict = {}
 DEFAULT_VIDEO = "yetter-ai/Wan2.2-TI2V-5B-Turbo-Diffusers"   # 4-step distill; 11-17: only used if already on disk
 MAX_BODY = 40 * 1024 * 1024
 
@@ -1872,9 +1868,7 @@ def job_image(p: dict, emit, cancel):
     steps = max(1, int(p.get("steps", 4)))
     guidance = p.get("guidance")
     family = TRANSFORMER_SWAPS.get(repo, (repo,))[0].lower()   # an add-on uses its base model's settings
-    if "z-image-turbo" in family:
-        steps, guidance = 9, 0.0                       # model card: 9 steps (8 model passes), no guidance
-    elif "chroma1-hd" in family:
+    if "chroma1-hd" in family:
         steps, guidance = 40, 3.0                      # model card: 40 steps, guidance 3
         if not p.get("negative"):                      # the card's quality-only negative (nothing about content)
             p = {**p, "negative": "low quality, ugly, unfinished, out of focus, deformed, disfigure, blurry, "
@@ -2263,10 +2257,12 @@ COMFY_PORT = int(os.environ.get("FIXER_COMFY_PORT", "8188"))
 COMFY_ON = os.environ.get("FIXER_COMFY", "1") == "1"       # 0 = old diffusers path for everything
 COMFY_RECIPES = {                                               # phone model id -> Create recipe
     "Kandoo/Juggernaut-XL-Ragnarok": "juggernaut",
-    "tewea/z_image_turbo_bf16_nsfw": "zimage-nsfw",
-    "Tongyi-MAI/Z-Image-Turbo": "zimage",
     "lodestones/Chroma1-HD": "chroma",
     "Comfy-Org/Qwen-Image-2.1": "qwen21",              # 11-17: Qwen-Image 2.1 Turbo (opt-in, makes and edits)
+}
+RETIRED_PICTURE_IDS = {   # old phone ids the app may still send -> the model that replaced them (NOT in COMFY_RECIPES)
+    "Tongyi-MAI/Z-Image-Turbo": "Kandoo/Juggernaut-XL-Ragnarok",
+    "tewea/z_image_turbo_bf16_nsfw": "Kandoo/Juggernaut-XL-Ragnarok",
 }
 
 
@@ -2277,8 +2273,6 @@ def _snapshot(repo: str) -> Path | None:
 
 def _comfy_paths_yaml() -> str:
     """Points ComfyUI at the files already in Fixer's capped model folder (no second copy)."""
-    z = _snapshot("Comfy-Org/Z-Image-Turbo")
-    t = _snapshot("tewea/z_image_turbo_bf16_nsfw")
     ch = _snapshot("Comfy-Org/Chroma1-HD_repackaged")
     t5 = _snapshot("comfyanonymous/flux_text_encoders")
     up = _snapshot("Comfy-Org/Real-ESRGAN_repackaged")
@@ -2293,11 +2287,12 @@ def _comfy_paths_yaml() -> str:
     def block(paths):
         return "|\n" + "".join(f"    {Path(x).as_posix()}\n" for x in paths if x)
     COMFY_LORAS.mkdir(parents=True, exist_ok=True)
+    COMFY_VAE.mkdir(parents=True, exist_ok=True)
     return ("fixer:\n"
-            f"  diffusion_models: {block([t, z / 'split_files' / 'diffusion_models' if z else None, ch / 'split_files' / 'diffusion_models' if ch else None, wan / 'split_files' / 'diffusion_models' if wan else None, qe, q21 / 'diffusion_models' if q21 else None])}"
-            f"  text_encoders: {block([z / 'split_files' / 'text_encoders' if z else None, t5, wan_te / 'split_files' / 'text_encoders' if wan_te else None, qb / 'split_files' / 'text_encoders' if qb else None, q21te, q21te_bf])}"
+            f"  diffusion_models: {block([ch / 'split_files' / 'diffusion_models' if ch else None, wan / 'split_files' / 'diffusion_models' if wan else None, qe, q21 / 'diffusion_models' if q21 else None])}"
+            f"  text_encoders: {block([t5, wan_te / 'split_files' / 'text_encoders' if wan_te else None, qb / 'split_files' / 'text_encoders' if qb else None, q21te, q21te_bf])}"
             f"  upscale_models: {block([up])}"
-            f"  vae: {block([z / 'split_files' / 'vae' if z else None, wan / 'split_files' / 'vae' if wan else None, qb / 'split_files' / 'vae' if qb else None, q21 / 'vae' if q21 else None])}"
+            f"  vae: {block([COMFY_VAE, wan / 'split_files' / 'vae' if wan else None, qb / 'split_files' / 'vae' if qb else None, q21 / 'vae' if q21 else None])}"
             f"  checkpoints: {block([qa / QWEN_AIO_DIR if qa else None, jug])}"
             f"  loras: {block([COMFY_LORAS, wan / 'split_files' / 'loras' if wan else None, wan_x, q21x])}")
 
@@ -2683,11 +2678,11 @@ class Comfy:
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
             # 11-17 (fast switches): ComfyUI's default RAM-pressure cache drops every model of an earlier workflow as
             # soon as free RAM is under its "inactive" headroom, which defaults to ALL of the RAM (execution.py:809),
-            # so every switch Chroma <-> Qwen 2.1 <-> Z-Image re-read the files. Inactive headroom 6 GB keeps earlier
+            # so every switch between picture models re-read the files. Inactive headroom 6 GB keeps earlier
             # models cached until free RAM really runs short; active headroom 3 GB (default would be 6.4) lets the
             # current job keep its big intermediates. Budget on 64 GB: MoE brain ~20 GB, Chroma 14.7 GB (fp8 model 9.2
             # + T5 fp8 5.2 + ae 0.3), Qwen 2.1 14.3 GB (int8 7.3 + heretic W4A8 reader 6.3 + VAE 0.7), Windows and
-            # apps ~8-10 GB: both picture models stay, ~6-8 GB free. A third (Z-Image, 20.7 GB) pushes out the oldest
+            # apps ~8-10 GB: both picture models stay, ~6-8 GB free. A third picture model pushes out the oldest
             # by ComfyUI's own score. Video still frees everything first (_room_for_video). Not --high-ram (no limit
             # at 64 GB: Windows would page) and not --cache-classic. Knobs (apply on ComfyUI's next start):
             # comfy_cache_active_gb / comfy_cache_inactive_gb in local.json.
@@ -2741,57 +2736,6 @@ class Comfy:
 COMFY = Comfy()
 
 
-def _zimage_workflow(prompt: str, w: int, h: int, seed: int, steps: int = 8, cfg: float = 1.0,
-                     sampler: str = "res_multistep", scheduler: str = "simple", shift: float = 3.0,
-                     loras: list | None = None, unet: str = "z_image_turbo_bf16_nsfw_v2.safetensors",
-                     detail: float = 0.0, te: str = "qwen_3_4b_fp8_mixed.safetensors") -> dict:
-    """Z-Image Turbo (stock or the NSFW transformer) as ComfyUI's own template builds it: 8 steps, cfg 1,
-    res_multistep / simple, AuraFlow shift 3, empty negative. LoRAs [(file, strength)] chain between the model and
-    the sampler."""
-    wf = {
-        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": unet, "weight_dtype": "default"}},
-        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": te, "type": "lumina2", "device": "default"}},
-        "3": {"class_type": "VAELoader", "inputs": {"vae_name": "ae.safetensors"}},
-        "4": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["2", 0]}},
-        "5": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["4", 0]}},
-        "6": {"class_type": "EmptySD3LatentImage", "inputs": {"width": w, "height": h, "batch_size": 1}},
-        "7": {"class_type": "ModelSamplingAuraFlow", "inputs": {"model": ["1", 0], "shift": float(shift)}},
-        "8": {"class_type": "KSampler", "inputs": {"model": ["7", 0], "seed": seed, "steps": int(steps),
-                                                   "cfg": float(cfg), "sampler_name": sampler, "scheduler": scheduler,
-                                                   "positive": ["4", 0], "negative": ["5", 0],
-                                                   "latent_image": ["6", 0], "denoise": 1.0}},
-        "9": {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["3", 0]}},
-        "10": {"class_type": "SaveImageWebsocket", "inputs": {"images": ["9", 0]}},
-    }
-    model = ["1", 0]
-    for i, (name, strength) in enumerate(loras or []):
-        nid = f"20{i}"
-        wf[nid] = {"class_type": "LoraLoaderModelOnly",
-                   "inputs": {"model": model, "lora_name": name, "strength_model": float(strength)}}
-        model = [nid, 0]
-    wf["7"]["inputs"]["model"] = model
-    if detail > 1:
-        _detail_pass(wf, image=["9", 0], model=["7", 0], vae=["3", 0], pos=["4", 0], neg=["5", 0], seed=seed,
-                     scale=detail)
-    return wf
-
-
-def _detail_pass(wf: dict, image, model, vae, pos, neg, seed: int, scale: float):
-    """ComfyUI's official Z-Image "2K upscaler": enlarge with an upscaling model, then redraw lightly (5 steps,
-    denoise 0.33, dpmpp_2m_sde / beta) so fine texture (rock, water, skin, fabric) is rebuilt at the larger size."""
-    wf["30"] = {"class_type": "UpscaleModelLoader", "inputs": {"model_name": "RealESRGAN_x4plus.safetensors"}}
-    wf["31"] = {"class_type": "ImageUpscaleWithModel", "inputs": {"upscale_model": ["30", 0], "image": image}}
-    wf["32"] = {"class_type": "ImageScaleBy", "inputs": {"image": ["31", 0], "upscale_method": "lanczos",
-                                                         "scale_by": scale / 4.0}}
-    wf["33"] = {"class_type": "VAEEncode", "inputs": {"pixels": ["32", 0], "vae": vae}}
-    wf["34"] = {"class_type": "KSampler", "inputs": {"model": model, "seed": seed, "steps": 5, "cfg": 1.0,
-                                                     "sampler_name": "dpmpp_2m_sde", "scheduler": "beta",
-                                                     "positive": pos, "negative": neg, "latent_image": ["33", 0],
-                                                     "denoise": 0.33}}
-    wf["35"] = {"class_type": "VAEDecode", "inputs": {"samples": ["34", 0], "vae": vae}}
-    wf["10"]["inputs"]["images"] = ["35", 0]
-
-
 # Photo edits (11-17): Qwen-Image-Edit-2511 replaces FLUX.2 klein, which ignored pose changes ("make them sit") and
 # toned explicit edits down. Up to three photos ("the shirt from image 2"). Stock 2511 with the 4-step Lightning
 # merge for ordinary edits; Phr00t's Rapid-AIO NSFW merge (one checkpoint: model, text encoder and VAE) for explicit.
@@ -2803,7 +2747,7 @@ QWEN_VAE = "qwen_image_vae.safetensors"
 QWEN_AIO_REPO = "Phr00t/Qwen-Image-Edit-Rapid-AIO"
 QWEN_AIO_DIR = "v19"
 QWEN_AIO_FILE = "Qwen-Rapid-AIO-NSFW-v19.safetensors"
-QWEN_EXPLICIT_RECIPES = {"zimage-nsfw"}   # a photo edit under these Make models is explicit
+QWEN_EXPLICIT_RECIPES: set = set()        # no Make model is explicit-by-default now (explicit comes from the words)
 
 
 # Off until it is measured on this PC (11-17: switched on untested, its first load clogged the card and every
@@ -3115,6 +3059,7 @@ def _sdxl_workflow(prompt: str, negative: str, w: int, h: int, seed: int, steps:
 
 SHAPES = {"square": (1024, 1024), "portrait": (832, 1216), "landscape": (1216, 832), "wallpaper": (704, 1472)}
 COMFY_LORAS = MODELS / "comfy-loras"       # LoRA files ComfyUI can use (inside the capped folder)
+COMFY_VAE = MODELS / "comfy-vae"           # ae.safetensors, copied out of the old Z-Image repo (inside the capped folder)
 
 CREATE_RECIPES = {
     "juggernaut": {
@@ -3129,29 +3074,11 @@ CREATE_RECIPES = {
         "shapes": {"wallpaper": (768, 1344)},
         "cfg_help": "5 suits portraits, 6 suits everything else. Too high looks harsh.",
     },
-    "zimage": {
-        # Stock Z-Image Turbo: scenery, objects, everything that isn't the NSFW retrain's speciality.
-        "name": "Z-Image Turbo", "kind": "image", "note": 'Fast all-rounder: places, objects, scenery and people, very photo-like. Keeps things clothed; for explicit pictures pick the NSFW version. Changes under a picture keep the rest.', "unet": "z_image_turbo_bf16.safetensors",
-        "needs": ["Comfy-Org/Z-Image-Turbo"],
-        "file": ("Comfy-Org/Z-Image-Turbo", "split_files/diffusion_models/z_image_turbo_bf16.safetensors"),
-        "defaults": {"steps": 8, "cfg": 1.0, "sampler": "res_multistep", "scheduler": "simple", "shift": 3.0,
-                     "detail": "1.5x"},
-        "negative": False,                     # cfg 1: a negative prompt does nothing on this model
-        "cfg_help": "Made for 1 (fastest). Above 1 follows your words more strictly but takes about twice as long.",
-    },
-    "zimage-nsfw": {
-        # Community retrain for people and explicit content; worse at scenery (11-16: blocky rocks in a seascape).
-        "name": "Z-Image Turbo NSFW", "kind": "image", "note": 'Same speed, retrained for people and explicit pictures. Weaker at scenery (rocks and water can look blocky). Changes under a picture redraw it with this model.', "unet": "z_image_turbo_bf16_nsfw_v2.safetensors",
-        "needs": ["tewea/z_image_turbo_bf16_nsfw", "Comfy-Org/Z-Image-Turbo"],
-        "defaults": {"steps": 8, "cfg": 1.0, "sampler": "res_multistep", "scheduler": "simple", "shift": 3.0,
-                     "detail": "1.5x"},
-        "negative": False,
-        "cfg_help": "Made for 1 (fastest). Above 1 follows your words more strictly but takes about twice as long.",
-    },
     "chroma": {
         # Strong on fine natural detail and on explicit content alike; slower (26 steps with guidance).
-        "name": "Chroma1-HD", "kind": "image", "note": "The finest natural detail (skin, hair, fabric, fur) and fine with explicit pictures. About three times slower than Z-Image. Uses 'Leave out'.", "builder": "chroma", "lora_family": "chroma",
-        "needs": ["Comfy-Org/Chroma1-HD_repackaged", "comfyanonymous/flux_text_encoders", "Comfy-Org/Z-Image-Turbo"],
+        "name": "Chroma1-HD", "kind": "image", "note": "The finest natural detail (skin, hair, fabric, fur) and fine with explicit pictures. About three times slower. Uses 'Leave out'.", "builder": "chroma", "lora_family": "chroma",
+        "needs": ["Comfy-Org/Chroma1-HD_repackaged", "comfyanonymous/flux_text_encoders"],
+        "ready": lambda: (COMFY_VAE / "ae.safetensors").is_file(),   # ae.safetensors moved out of the Z-Image repo
         "file": ("Comfy-Org/Chroma1-HD_repackaged", "split_files/diffusion_models/Chroma1-HD-fp8mixed.safetensors"),
         "defaults": {"steps": 26, "cfg": 4.5, "sampler": "euler", "scheduler": "beta", "shift": 1.0},
         "negative": True,
@@ -3176,7 +3103,6 @@ CREATE_RECIPES = {
 
 
 _START_POINTS = {   # builder -> (blank-canvas node, vae output, node whose denoise sets the strength)
-    "zimage": ("6", ["3", 0], "8"),
     "chroma": ("13", ["3", 0], "11"),
     "sdxl": ("6", ["1", 2], "8"),
 }
@@ -3193,7 +3119,7 @@ def _start_from(wf: dict, builder: str, image: str, w: int, h: int, strength: fl
     wf[denoise_node]["inputs"]["denoise"] = max(0.05, min(1.0, float(strength)))
 
 
-PAINT_STRENGTH = {"zimage": 0.9, "chroma": 0.9, "qwen21": 1.0, "sdxl": 0.8}   # "Auto" on the phone's Change slider
+PAINT_STRENGTH = {"chroma": 0.9, "qwen21": 1.0, "sdxl": 0.8}   # "Auto" on the phone's Change slider
 
 
 def _paint_crop(photo, mask_img):
@@ -3226,7 +3152,7 @@ def _paint_workflow(r: dict, v: dict, w: int, h: int, seed: int, loras: list, cr
                     strength: float) -> dict:
     """The recipe's own graph redrawing only the masked part of the crop: the crop is encoded as the starting
     latent, SetLatentNoiseMask limits the noise to the spot, Differential Diffusion follows the soft edge."""
-    builder = r.get("builder", "zimage")
+    builder = r["builder"]
     if builder == "qwen21":
         # The crop is image 1 of the 2.1 editor at its own size (resolution 0, so the mask lines up); only the masked
         # part is redrawn, at full strength (the 8 sigmas are fixed).
@@ -3269,11 +3195,9 @@ def _paint_picture(r, v, seed, loras, photo, mask_b64, emit, cancel):
     try:
         crop.save(folder / crop_name, format="PNG")
         crop_mask.convert("RGB").save(folder / mask_name, format="PNG")
-        builder = r.get("builder", "zimage")
+        builder = r["builder"]
         strength = v.get("strength")
         strength = float(strength) if strength not in (None, "") else PAINT_STRENGTH.get(builder, 0.9)
-        if builder == "zimage" and strength < 0.7:
-            v = {**v, "steps": max(int(v["steps"]), 12)}   # 8 steps x low denoise leaves ~5 real steps: soft
         wf = _paint_workflow(r, v, crop.width, crop.height, seed, loras, crop_name, mask_name, strength)
         png = asyncio.run(_comfy_run(wf, emit, cancel, previews=True))
     finally:
@@ -3325,10 +3249,8 @@ def _is_explicit(text: str) -> bool:
 # The chat picks models by itself (the owner 11-17: chat is "just another way"; the Make tab is where the choosing happens). Editable
 # in phone_config "auto_models"; a missing or not-installed choice falls back down each list.
 AUTO_MODELS_DEFAULT = {
-    "picture_explicit": ["chroma", "zimage-nsfw", "zimage"],
-    "picture": ["zimage", "zimage-nsfw", "chroma"],
-    "edit_explicit": ["zimage-nsfw", "chroma"],
-    "edit_explicit_strength": 0.6,
+    "picture_explicit": ["chroma", "juggernaut"],
+    "picture": ["juggernaut", "chroma"],
 }
 
 
@@ -3351,7 +3273,7 @@ def _first_ready(ids: list) -> dict | None:
 def _picture_recipe(p: dict) -> dict | None:
     """The recipe for a chat picture: the phone's explicit choice (newer builds send "model_choice"), otherwise
     chosen from the brain's "explicit" flag (or, on old phones, the words): explicit -> the explicit model, anything
-    else -> stock Z-Image. A saved choice that is gone (bigASP, FLUX klein) falls through to this."""
+    else -> the default picture model. A saved choice that is gone (bigASP, FLUX klein) falls through to this."""
     choice = p.get("model_choice")
     if choice and choice != "auto":
         r = CREATE_RECIPES.get(choice) or _chat_recipe(choice)
@@ -3502,7 +3424,7 @@ def job_comfy_video(p: dict, emit, cancel):
 
 def _comfy_video(p: dict, emit, cancel):
     """A 5 s clip with Wan 2.2 A14B in ComfyUI. From a photo it animates that photo; from words alone it first draws
-    the opening frame with Z-Image Turbo, then animates it (the 14B model only works from a picture)."""
+    the opening frame with a picture model, then animates it (the 14B model only works from a picture)."""
     import uuid
     import numpy as np
     from PIL import Image
@@ -3524,11 +3446,15 @@ def _comfy_video(p: dict, emit, cancel):
             w, h = _wan14_size(*start.size)
         else:
             w, h = _wan14_size(16, 9) if p.get("aspect") != "portrait" else _wan14_size(9, 16)
-            r = CREATE_RECIPES["zimage"] if _recipe_ready(CREATE_RECIPES["zimage"]) else CREATE_RECIPES["zimage-nsfw"]
-            v = {**r["defaults"], "prompt": prompt, "detail": "Off"}
-            fw, fh = (w * 2) // 16 * 16, (h * 2) // 16 * 16          # draw the first frame sharp, at ~1.6 MP
+            a = _auto_models()
+            first = (_first_ready(a["picture_explicit"]) if _explicit_video(prompt, p.get("explicit")) > 0
+                     else _first_ready(a["picture"]))
+            if first is None:
+                raise UserFacing("No picture model is on your computer to draw the first frame.")
+            v = {**first["defaults"], "prompt": prompt, "detail": "Off"}
+            fw, fh = (1344, 768) if p.get("aspect") != "portrait" else (768, 1344)   # ~1 MP in the clip's shape
             status("Drawing the first frame…")
-            png = asyncio.run(_comfy_run(_recipe_workflow(r, v, fw, fh, seed), lambda o: None, cancel))
+            png = asyncio.run(_comfy_run(_recipe_workflow(first, v, fw, fh, seed), lambda o: None, cancel))
             if cancel.is_set() or not png:
                 return
             start = Image.open(io.BytesIO(png)).convert("RGB")
@@ -3576,24 +3502,15 @@ def _recipe_workflow(r: dict, v: dict, w: int, h: int, seed: int, loras: list | 
     if r.get("builder") == "sdxl":
         return _sdxl_workflow(prompt, v.get("negative") or r.get("default_negative", ""), w, h, seed, v["steps"],
                               v["cfg"], v["sampler"], v["scheduler"], loras, ckpt=r["ckpt"])
-    detail = {"1.5x": 1.5, "2x": 2.0}.get(str(v.get("detail") or "Off"), 0.0)
-    return _zimage_workflow(prompt, w, h, seed, v["steps"], v["cfg"], v["sampler"], v["scheduler"], v["shift"],
-                            loras, unet=r["unet"], detail=detail, te=_zimage_text_reader())
+    raise UserFacing("That picture model isn't available.")
 
 
 def _chat_recipe(model: str) -> dict | None:
-    """The Create recipe behind a phone picture-model id, if its files are on this computer."""
-    r = CREATE_RECIPES.get(COMFY_RECIPES.get(model or "", ""))
+    """The Create recipe behind a phone picture-model id, if its files are on this computer. A retired id
+    (an old phone still asking for Z-Image) resolves to the model that replaced it."""
+    model = RETIRED_PICTURE_IDS.get(model or "", model or "")
+    r = CREATE_RECIPES.get(COMFY_RECIPES.get(model, ""))
     return r if r and _recipe_ready(r) else None
-
-
-def _zimage_text_reader() -> str:
-    """The full-precision Qwen3 4B reader ComfyUI's own Z-Image template uses, once downloaded; the 8-bit one until
-    then."""
-    z = _snapshot("Comfy-Org/Z-Image-Turbo")
-    full = "qwen_3_4b.safetensors"
-    return full if z is not None and (z / "split_files" / "text_encoders" / full).is_file() \
-        else "qwen_3_4b_fp8_mixed.safetensors"
 
 
 def _recipe_ready(r: dict) -> bool:
@@ -3636,7 +3553,6 @@ SCHEDULE_WORDS = {
     "normal": "standard spacing",
 }
 RECIPE_CHOICES = {   # builder -> (samplers, schedules), recommended first
-    "zimage": (["res_multistep", "euler", "dpmpp_2m", "dpmpp_2m_sde"], ["simple", "beta", "sgm_uniform"]),
     "chroma": (["euler", "res_multistep", "dpmpp_2m", "uni_pc"], ["beta", "simple", "sgm_uniform"]),
     "qwen21": (["euler"], ["simple"]),
     "sdxl": (["dpmpp_2m_sde", "dpmpp_2m", "euler_ancestral", "dpmpp_sde"], ["karras", "exponential", "normal"]),
@@ -3654,7 +3570,7 @@ def _menu_value(choice) -> str:
 
 def _recipe_controls(r: dict) -> list[dict]:
     d = r["defaults"]
-    samplers, schedules = RECIPE_CHOICES.get(r.get("builder", "zimage"), RECIPE_CHOICES["zimage"])
+    samplers, schedules = RECIPE_CHOICES.get(r["builder"], (["euler"], ["simple"]))
     c = [
         {"key": "prompt", "label": "Describe the picture", "kind": "text",
          "help": r.get("prompt_help", "Say what's in it, where, the light and the style. Your words go to the model "
@@ -3663,9 +3579,6 @@ def _recipe_controls(r: dict) -> list[dict]:
          "help": "Square, tall (phone screen) or wide (TV). Changes the layout, not the quality."},
         {"key": "count", "label": "How many", "kind": "int", "min": 1, "max": 4, "step": 1, "default": 1,
          "help": "Pictures from one press, each a little different. Each one adds the same time again."},
-        {"key": "detail", "label": "Detail pass", "kind": "menu", "options": ["Off", "1.5x", "2x"],
-         "default": d.get("detail", "Off"),
-         "help": "Enlarges the picture and redraws fine texture (rock, water, skin). Adds a few seconds."},
         {"key": "cfg", "label": "Guidance", "kind": "float", "min": 1.0, "max": 10.0, "step": 0.1, "default": d["cfg"],
          "left": "Looser, more creative", "right": "Stricter, follows your words",
          "help": r.get("cfg_help", "How strictly to follow your words.")},
@@ -3703,8 +3616,6 @@ def _recipe_controls(r: dict) -> list[dict]:
         c.insert(1, {"key": "negative", "label": "Leave out", "kind": "text", "advanced": True,
                      "help": "Things to keep out of the picture (e.g. 'text, blurry, extra fingers'). Empty uses the "
                              "model's own recommended list."})
-    if not r.get("detail_pass", True):
-        c = [x for x in c if x["key"] != "detail"]
     if not r.get("uses_shift", True):
         c = [x for x in c if x["key"] != "shift"]
     if not r.get("uses_scheduler", True):
@@ -3732,8 +3643,8 @@ def job_config(p: dict, emit, cancel):
 
 
 def _prompt_style(r: dict) -> str:
-    """Which phrasing a recipe's toggles use: Chroma sentences with negatives, or the positive sentences of Z-Image
-    and Qwen-Image 2.1 (both run at guidance 1, so negatives do nothing there)."""
+    """Which phrasing a recipe's toggles use: Chroma / SDXL sentences with negatives, or the positive-only sentences
+    (the legacy "zimage" style) that Qwen-Image 2.1 uses at guidance 1, where negatives do nothing."""
     return {"chroma": "chroma", "sdxl": "chroma"}.get(r.get("builder", ""), "zimage")
 
 
@@ -3851,23 +3762,23 @@ def _make_catalog() -> dict:
                          "negative": (d.get("negative") or None) if r.get("negative") else None})
         recipes.append(item)
     qs = data.get("quickselect") or {}
-    age = qs.get("age") or {}
-
-    def num(x, fallback):
-        try:
-            return int(x)
-        except (TypeError, ValueError):
-            return fallback
+    return {"recipes": recipes, "quickselect": {"groups": qs.get("groups") or []}}
 
 
 def job_make_recipes(p: dict, emit, cancel):
-    """Make's recipe row, quick picks and age range (op `make_recipes`). Read fresh on every call."""
+    """Make's recipe row and quick picks (op `make_recipes`). Read fresh on every call."""
     emit({"t": "info", **_make_catalog()})
 
 
 def job_comfy_run(p: dict, emit, cancel):
     """One Create request: `count` pictures from a recipe and the phone's values, with live previews."""
-    r = CREATE_RECIPES.get(p.get("recipe") or "")
+    recipe = p.get("recipe") or ""
+    if recipe in ("zimage", "zimage-nsfw"):            # an old phone's Make screen: use Juggernaut, with its settings
+        recipe = "juggernaut"
+        vals = {k: val for k, val in (p.get("values") or {}).items()
+                if k not in ("steps", "cfg", "sampler", "scheduler", "shift", "detail")}
+        p = {**p, "recipe": recipe, "values": vals}
+    r = CREATE_RECIPES.get(recipe)
     if not r:
         raise UserFacing("That recipe isn't on your computer.")
     v = {**r["defaults"], **(p.get("values") or {})}
@@ -3932,7 +3843,7 @@ def _create_pictures(r, v, w, h, count, seed, loras, photo, photo_name, mode, em
                      extra_names=(), recipe_id=None):
     status("Loading image model…")
     recipe_id = recipe_id or _recipe_id(r)
-    builder = r.get("builder", "zimage")
+    builder = r["builder"]
     own_explicit = recipe_id in QWEN_EXPLICIT_RECIPES
     if photo is not None and mode == "paint":
         _timing(model=r["name"], recipe=recipe_id, explicit=own_explicit, mp=None, steps=r["defaults"].get("steps"))
@@ -4082,7 +3993,9 @@ def _quietly(fn):
 
 def job_comfy_image(p: dict, emit, cancel):
     status = lambda s: emit({"t": "status", "v": s})  # noqa: E731
-    r = _picture_recipe(p) or CREATE_RECIPES["zimage-nsfw"]
+    r = _picture_recipe(p)
+    if r is None:
+        raise UserFacing("No picture model is on your computer.")
     COMFY.ensure_current(status)                        # a freshly downloaded model, add-on, reader or LoRA shows up
     _room_for_pictures()                               # dense brain: the card goes to the picture; the MoE brain stays
     if _worker_alive():
@@ -4176,8 +4089,9 @@ def _warmup_workflow(recipe: str) -> dict:
 def job_comfy_warm(p: dict, emit, cancel):
     """The phone opened Fixer: get the chosen ComfyUI recipe's models into memory now, so the first picture doesn't
     wait for the disk. The chat model is left alone; ComfyUI then lets go of the card (models stay in RAM)."""
-    recipe = COMFY_RECIPES.get(p.get("model") or "")
-    if recipe and _chat_recipe(p.get("model")) and recipe not in COMFY.warmed:
+    model = RETIRED_PICTURE_IDS.get(p.get("model") or "", p.get("model") or "")
+    recipe = COMFY_RECIPES.get(model)
+    if recipe and _chat_recipe(model) and recipe not in COMFY.warmed:
         COMFY.ensure_current()
         try:
             asyncio.run(_comfy_run(_warmup_workflow(recipe), lambda obj: None, cancel))

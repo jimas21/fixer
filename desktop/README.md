@@ -51,7 +51,7 @@ repo's `mmproj` file for photos). The old 27B model is gone; a phone that still 
 
 Pictures and photo edits run in ComfyUI (own venv, `127.0.0.1` only):
 
-- Chroma1-HD (finest natural detail, explicit-capable), Z-Image Turbo and its NSFW retrain.
+- **Juggernaut XL Ragnarok** (`Kandoo/Juggernaut-XL-Ragnarok`, SDXL, the default): photo-real people, portraits and scenes, explicit-capable. Chroma1-HD: the finest natural detail (skin, hair, fabric), explicit-capable.
 - **Qwen-Image 2.1 Turbo** (`Comfy-Org/Qwen-Image-2.1`, int8, with an uncensored Heretic text reader): makes AND edits
   photos with the same loaded model, so a picture and its edit never reload. Opt-in: the defaults do not change until
   its timings (Queue screen, Recent) show it is at least as good. The **explicit add-on** is a LoRA switched on per

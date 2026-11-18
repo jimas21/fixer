@@ -28,6 +28,7 @@ jobs:
     env:
       BUNDLE_ID: ${{ vars.BUNDLE_ID }}
       TEAM_ID: ${{ vars.TEAM_ID }}
+      BUILD_OFFSET: "54"   # highest build on TestFlight when this repo started; run 1 becomes build 55
       HOMEBREW_NO_AUTO_UPDATE: "1"
       XCODE_MAJOR: ${{ vars.XCODE_MAJOR || '26' }}
       HOMEBREW_NO_INSTALL_CLEANUP: "1"
@@ -104,7 +105,7 @@ jobs:
           {
             echo "### Uploaded to TestFlight"
             echo ""
-            echo "- Build number: \`${GITHUB_RUN_NUMBER}\`"
+            echo "- Build number: \`$((GITHUB_RUN_NUMBER + BUILD_OFFSET))\`"
             echo "- Commit: \`${GITHUB_SHA::7}\`"
             echo ""
             echo "The build appears in TestFlight after Apple finishes processing it."

@@ -29,11 +29,13 @@ MSG
 }
 trap hints ERR
 
-# The version rolls with every release: major.minor from project.yml, patch = this run's number (0.1.58, 0.1.59...).
-# Bump major.minor in project.yml by hand for a bigger step.
+# The version rolls with every release: major.minor from project.yml, patch = the build number (1.0.55, 1.0.56...).
+# Bump major.minor in project.yml by hand for a bigger step. BUILD_OFFSET carries the count over from builds already
+# on TestFlight, because a new repo's run numbers restart at 1.
+BUILD_NUMBER=$((GITHUB_RUN_NUMBER + ${BUILD_OFFSET:-0}))
 BASE_VERSION=$(grep -m1 'MARKETING_VERSION' project.yml | sed 's/.*: *//; s/"//g; s/ *#.*//')
-MARKETING_VERSION="$(echo "$BASE_VERSION" | cut -d. -f1-2).$GITHUB_RUN_NUMBER"
-echo "Version: $MARKETING_VERSION  Build number: $GITHUB_RUN_NUMBER"
+MARKETING_VERSION="$(echo "$BASE_VERSION" | cut -d. -f1-2).$BUILD_NUMBER"
+echo "Version: $MARKETING_VERSION  Build number: $BUILD_NUMBER"
 xcodegen generate
 
 xcodebuild \
@@ -49,7 +51,7 @@ xcodebuild \
   DEVELOPMENT_TEAM="$TEAM_ID" \
   CODE_SIGN_STYLE=Automatic \
   CODE_SIGNING_ALLOWED=NO \
-  CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
+  CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
   MARKETING_VERSION="$MARKETING_VERSION" \
   archive 2>&1 | tee build/archive.log
 

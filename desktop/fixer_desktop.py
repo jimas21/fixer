@@ -2845,9 +2845,9 @@ def _qwen_explicit(prompt: str, recipe_id: str | None = None) -> bool:
 
 
 def _qwen_edit_workflow(prompt: str, images: list, seed: int, w: int, h: int, explicit: bool,
-                        steps: int = 4) -> dict:
+                        steps: int = 4, loras: list | None = None) -> dict:
     """Qwen-Image-Edit-2511 as ComfyUI's own template builds it: each photo (image 1 is the base and sets the shape)
-    goes to the vision model and as a reference latent; 4 steps, CFG 1."""
+    goes to the vision model and as a reference latent; 4 steps, CFG 1. `loras` chain after the model output."""
     import re
     # The node labels the photos "Picture 1/2/3"; the phone says "photo 2", people say "image 3" or "pic 1".
     prompt = re.sub(r"\b(?:photo|image|pic|picture)\s*#?\s*([123])\b", r"Picture \1", prompt, flags=re.IGNORECASE)
@@ -2865,6 +2865,11 @@ def _qwen_edit_workflow(prompt: str, images: list, seed: int, w: int, h: int, ex
         }
         model, clip, vae = ["31", 0], ["2", 0], ["3", 0]
         sampler, scheduler = "euler", "simple"
+    for i, (name, strength) in enumerate(loras or []):            # LoRAs chain on the model, before the sampler
+        nid = f"7{i}0"
+        wf[nid] = {"class_type": "LoraLoaderModelOnly",
+                   "inputs": {"model": model, "lora_name": name, "strength_model": float(strength)}}
+        model = [nid, 0]
     enc = {"clip": clip, "vae": vae}
     for i, name in enumerate(images[:3]):
         wf[f"1{i}0"] = {"class_type": "LoadImage", "inputs": {"image": name}}
@@ -3393,9 +3398,10 @@ def _wan14_ready() -> bool:
 
 
 def _wan14_workflow(prompt: str, image: str, w: int, h: int, length: int, seed: int, steps: int = 4,
-                    split: int = 2, shift: float = 5.0, explicit: float = 0.0) -> dict:
+                    split: int = 2, shift: float = 5.0, explicit: float = 0.0, loras: list | None = None) -> dict:
     """Wan 2.2 image-to-video A14B as ComfyUI's own template builds it: the high-noise expert draws the motion for the
-    first half of the steps, the low-noise expert the detail for the rest, each with its lightx2v 4-step LoRA, cfg 1."""
+    first half of the steps, the low-noise expert the detail for the rest, each with its lightx2v 4-step LoRA, cfg 1.
+    `loras` are [(high, low, strength)] pairs, chained after the explicit add-on, high on the high expert, low on low."""
     f = WAN14_FILES
     if explicit > 0:
         prompt = f"{WAN_EXPLICIT[2]}, {prompt}"
@@ -3437,6 +3443,17 @@ def _wan14_workflow(prompt: str, image: str, w: int, h: int, length: int, seed: 
                                                                     "strength_model": float(explicit)}}
         wf["8"]["inputs"]["model"] = ["60", 0]
         wf["9"]["inputs"]["model"] = ["70", 0]
+    high_model, low_model = wf["8"]["inputs"]["model"], wf["9"]["inputs"]["model"]
+    for i, (hi, lo, strength) in enumerate(loras or []):   # user LoRA pairs, after the explicit add-on
+        if hi:
+            wf[f"80{i}"] = {"class_type": "LoraLoaderModelOnly",
+                            "inputs": {"model": high_model, "lora_name": hi, "strength_model": float(strength)}}
+            high_model = [f"80{i}", 0]
+        if lo:
+            wf[f"90{i}"] = {"class_type": "LoraLoaderModelOnly",
+                            "inputs": {"model": low_model, "lora_name": lo, "strength_model": float(strength)}}
+            low_model = [f"90{i}", 0]
+    wf["8"]["inputs"]["model"], wf["9"]["inputs"]["model"] = high_model, low_model
     return wf
 
 
@@ -3533,7 +3550,8 @@ def _comfy_video(p: dict, emit, cancel):
         start.resize((w, h), Image.LANCZOS).save(folder / name, format="PNG")
         status("Loading the video model…")
         strength = _explicit_video(prompt, p.get("explicit"))
-        wf = _wan14_workflow(prompt, name, w, h, length, seed, explicit=strength)
+        vloras, vtrig = _job_loras(p.get("loras"), "wan22")
+        wf = _wan14_workflow(_with_triggers(prompt, vtrig), name, w, h, length, seed, explicit=strength, loras=vloras)
         _timing(model="Wan 2.2 14B", explicit=strength > 0, mp=w * h / 1e6, steps=4, count=length)
         def part(o):
             if o.get("t") != "progress":
@@ -3871,8 +3889,9 @@ def job_comfy_run(p: dict, emit, cancel):
     count = max(1, min(4, int(v.get("count") or 1)))
     seed = v.get("seed")
     seed = int(seed) if seed not in (None, "", -1) else int.from_bytes(os.urandom(4), "big")
-    loras = [(x["name"], float(x.get("strength", 1.0))) for x in (v.get("loras") or [])
-             if x.get("name") and (COMFY_LORAS / x["name"]).is_file()]
+    loras, triggers = _job_loras(v.get("loras"), r.get("lora_family"))
+    if v.get("image_mode") not in ("edit", "reference"):   # an edit adds its editor's triggers in _create_pictures
+        v["prompt"] = _with_triggers(v.get("prompt"), triggers)
     photo, photo_name, mode = None, None, str(v.get("image_mode") or "start")
     extra_names = []                                  # photos 2 and 3 for a multi-photo edit
     for b64 in (v.get("images") or [])[:2]:
@@ -3935,10 +3954,10 @@ def _create_pictures(r, v, w, h, count, seed, loras, photo, photo_name, mode, em
         if use21:
             if not _qwen21_ready():
                 raise UserFacing("Qwen-Image 2.1 isn't all on your computer yet, so nothing was changed.")
+            eloras, etrig = _job_loras(v.get("loras"), "qwen21")
             lora = _qwen21_explicit(v.get("explicit"), None, recipe_id)
-            wf = _qwen21_edit_workflow(prompt, [photo_name, *extra_names], s_i, lora,
-                                       loras=loras if builder == "qwen21" else [],
-                                       reference_size=(w, h) if mode == "reference" else None)
+            wf = _qwen21_edit_workflow(_with_triggers(prompt, etrig), [photo_name, *extra_names], s_i, lora,
+                                       loras=eloras, reference_size=(w, h) if mode == "reference" else None)
             budget = int(_tune("qwen21_edit_resolution", 1024))
             _timing(model=QWEN21_NAME, recipe=recipe_id, editor="qwen21", explicit=bool(lora), steps=8, count=count,
                     mp=(w * h / 1e6) if mode == "reference" else (None if budget else
@@ -3953,7 +3972,9 @@ def _create_pictures(r, v, w, h, count, seed, loras, photo, photo_name, mode, em
             if not (explicit or _qwen_edit_ready()):
                 raise UserFacing("Editing a photo needs a photo editor model on your computer.")
             qw, qh = _photo_size(photo) if mode == "edit" else (w, h)
-            wf = _qwen_edit_workflow(prompt, [photo_name, *extra_names], s_i, qw, qh, explicit)
+            eloras, etrig = _job_loras(v.get("loras"), "qwen-edit")
+            wf = _qwen_edit_workflow(_with_triggers(prompt, etrig), [photo_name, *extra_names], s_i, qw, qh,
+                                     explicit, loras=eloras)
             _timing(model="Qwen Rapid-AIO" if explicit else "Qwen Edit 2511", recipe=recipe_id,
                     editor="qwen-explicit" if explicit else "qwen", explicit=explicit, mp=qw * qh / 1e6, steps=4,
                     count=count)
@@ -4079,9 +4100,10 @@ def job_comfy_image(p: dict, emit, cancel):
         w, h = int(w * sc), int(h * sc)
     seed = int(p.get("seed") or int.from_bytes(os.urandom(4), "big")) % (2 ** 32)
     rid = _recipe_id(r)
+    aloras, atrig = _job_loras(None, r.get("lora_family"))     # chat pictures: only the family's always-on LoRAs
     flag = p.get("explicit") if isinstance(p.get("explicit"), bool) else None     # the brain's own call (new phones)
-    v = {**r["defaults"], "prompt": p.get("prompt"), "detail": "Off", "brain_explicit": flag}
-    wf = _recipe_workflow(r, v, w // 16 * 16, h // 16 * 16, seed)
+    v = {**r["defaults"], "prompt": _with_triggers(p.get("prompt"), atrig), "detail": "Off", "brain_explicit": flag}
+    wf = _recipe_workflow(r, v, w // 16 * 16, h // 16 * 16, seed, aloras)
     on = _has_addon(wf) or rid in QWEN_EXPLICIT_RECIPES
     _timing(model=r["name"], recipe=rid, explicit=on, mp=(w // 16 * 16) * (h // 16 * 16) / 1e6,
             steps=r["defaults"].get("steps"), count=1)
@@ -4122,8 +4144,9 @@ def job_comfy_edit(p: dict, emit, cancel):
         if want21:
             if not _qwen21_ready():
                 raise UserFacing("Qwen-Image 2.1 isn't all on your computer yet, so nothing was changed.")
+            aloras, atrig = _job_loras(None, "qwen21")
             lora = _qwen21_explicit(None, flag)
-            wf = _qwen21_edit_workflow(words, [name], seed, lora)
+            wf = _qwen21_edit_workflow(_with_triggers(words, atrig), [name], seed, lora, loras=aloras)
             budget = int(_tune("qwen21_edit_resolution", 1024))
             _timing(model=QWEN21_NAME, recipe="qwen21", editor="qwen21", explicit=bool(lora), steps=8, count=1,
                     mp=None if budget else start.size[0] * start.size[1] / 1e6)
@@ -4133,7 +4156,8 @@ def job_comfy_edit(p: dict, emit, cancel):
             if not (explicit or _qwen_edit_ready()):
                 raise UserFacing("Editing a photo needs a photo editor model on your computer.")
             pw, ph = _photo_size(start, min(2.0, max(0.25, longest * longest / 1_000_000)))
-            wf = _qwen_edit_workflow(words, [name], seed, pw, ph, explicit)
+            aloras, atrig = _job_loras(None, "qwen-edit")
+            wf = _qwen_edit_workflow(_with_triggers(words, atrig), [name], seed, pw, ph, explicit, loras=aloras)
             _timing(model="Qwen Rapid-AIO" if explicit else "Qwen Edit 2511",
                     editor="qwen-explicit" if explicit else "qwen", explicit=explicit, mp=pw * ph / 1e6, steps=4,
                     count=1)
@@ -4388,6 +4412,76 @@ def _family_model_name(family: str) -> str:
         if r.get("lora_family") == family:
             return r["name"]
     return {"qwen-edit": "Qwen photo edits", "wan22": "Wan 2.2 video"}.get(family, family)
+
+
+def _job_loras(requested, family, extra_always_on: bool = True):
+    """The LoRAs to use for a job of `family`, plus their trigger words. `requested` is the phone's list
+    ([{name, strength}] or file names). Keeps installed LoRAs of the right family (plus 'unknown' ones the user
+    chose), adds the family's always-on LoRAs, caps a job at 4 and strength at 0-2. Returns (loras, triggers):
+    loras is [(file, strength)] for a picture/edit, or [(high, low, strength)] pairs for wan22 video."""
+    if not family:
+        return ([], [])
+    lib = {e["file"]: e for e in _lora_entries()}
+    want, strengths = [], {}
+    for item in requested or []:
+        if isinstance(item, dict):
+            nm, st = item.get("name") or item.get("file"), item.get("strength")
+        else:
+            nm, st = item, None
+        if nm in lib:
+            want.append(nm)
+            if st is not None:
+                strengths[nm] = st
+    picked, seen = [], set()
+
+    def add(fn):
+        if fn in seen or fn not in lib:
+            return
+        seen.add(fn)
+        e = lib[fn]
+        s = max(0.0, min(2.0, float(strengths.get(fn, e.get("strength", 1.0)))))
+        picked.append((fn, s, e))
+    for fn in want:                                      # the user's chosen ones, of this family or unknown
+        if lib[fn].get("family") in (family, "unknown"):
+            add(fn)
+    if extra_always_on:
+        for fn, e in lib.items():
+            if e.get("always_on") and e.get("family") == family:
+                add(fn)
+    picked = picked[:4]
+    triggers: list[str] = []
+    for _, _, e in picked:
+        for t in e.get("triggers") or []:
+            if t and t not in triggers:
+                triggers.append(t)
+    if family == "wan22":
+        pairs, bypair = [], {}
+        for fn, s, e in picked:
+            pid = e.get("pair")
+            if not pid:
+                pairs.append((fn, fn, s))                # a single-file Wan LoRA loads on both experts
+                continue
+            d = bypair.setdefault(pid, {"high": None, "low": None, "strength": s})
+            role = e.get("role")
+            if role == "high" or (role not in ("high", "low") and d["high"] is None):
+                d["high"] = fn
+            else:
+                d["low"] = fn
+            d["strength"] = s
+        for d in bypair.values():
+            pairs.append((d["high"], d["low"], d["strength"]))
+        return pairs, triggers
+    return [(fn, s) for fn, s, _ in picked], triggers
+
+
+def _with_triggers(prompt: str, triggers: list) -> str:
+    """Add each trigger word to the prompt unless it is already there (case-insensitive)."""
+    p = (prompt or "").strip()
+    low = p.lower()
+    extra = [t for t in (triggers or []) if t and t.lower() not in low]
+    if not extra:
+        return p or prompt or ""
+    return (p.rstrip(".") + ((". " if p else "") + ", ".join(extra))).strip()
 
 
 def _resolve_family(label: str, header: dict | None) -> tuple[str | None, str | None]:

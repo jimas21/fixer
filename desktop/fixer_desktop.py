@@ -3766,11 +3766,12 @@ def _apply_toggles(r: dict, v: dict) -> dict:
 def job_comfy_recipes(p: dict, emit, cancel):
     """The Create screen's list: recipes whose files are on this computer, their controls, and the LoRA files."""
     COMFY.ensure()
-    recipes = [{"id": k, "name": r["name"], "kind": r["kind"], "note": r.get("note"), "controls": _recipe_controls(r),
+    recipes = [{"id": k, "name": r["name"], "kind": r["kind"], "note": r.get("note"),
+                "lora_family": r.get("lora_family"), "controls": _recipe_controls(r),
                 "toggles": _recipe_toggles(r)}
                for k, r in CREATE_RECIPES.items() if _recipe_ready(r)]
     loras = sorted(f.name for f in COMFY_LORAS.glob("*.safetensors")) if COMFY_LORAS.is_dir() else []
-    emit({"t": "info", "recipes": recipes, "loras": loras})
+    emit({"t": "info", "recipes": recipes, "loras": loras, "lora_library": _lora_entries()})
 
 
 # ---------------------------------------------------------------- Make's style recipes and the age floor (11-17)
@@ -4230,6 +4231,569 @@ def job_forget(p: dict, emit, cancel):
     emit({"t": "info", "forgot": True, "erased": erased, "left": left})
 
 
+# ---------------------------------------------------------------- LoRA library (add-ons)
+# LoRAs live in COMFY_LORAS as "<clean-name>-<sha8>.safetensors"; their details in COMFY_LORAS/library.json. All of
+# this runs on the PC; the phone only ever sees results. Nothing about a search (words, links, thumbnails) is written
+# to disk, links are never logged, and the Civitai key is sent only to civitai.com / civitai.red.
+
+LORA_UA = "Fixer/1.0"                                   # Cloudflare rejects Python's default agent
+LORA_MAX_BYTES = 2 * 1024 ** 3
+SAFE_HEADER_MAX = 16 * 1024 * 1024
+LORA_LOCK = threading.Lock()                            # one download at a time, off the picture queue
+CIVITAI_API = "https://civitai.com/api/v1"
+CIVITAI_TOKEN = ROOT / "civitai_token"
+LORA_FAMILIES = ("sdxl", "chroma", "qwen21", "qwen-edit", "wan22")
+LORA_CIVITAI_BASE = {                                   # family -> Civitai baseModel labels to browse
+    "sdxl": ["SDXL 1.0", "Pony", "Illustrious", "NoobAI"],
+    "chroma": ["Chroma"], "qwen21": ["Qwen"], "qwen-edit": ["Qwen"], "wan22": ["Wan Video 2.2 I2V-A14B"],
+}
+LORA_WARN_RELATED = "Made for a related model, may look wrong."
+LORA_NO_FIT = "This add-on doesn't fit any model on your computer."
+
+
+def _civitai_token() -> str:
+    try:
+        return CIVITAI_TOKEN.read_text(encoding="utf-8").strip()
+    except Exception:                                    # noqa: BLE001
+        return ""
+
+
+def _is_civitai_host(host: str) -> bool:
+    h = (host or "").lower()
+    return h in ("civitai.com", "civitai.red") or h.endswith(".civitai.com") or h.endswith(".civitai.red")
+
+
+def _lora_headers(url: str) -> dict:
+    import urllib.parse
+    h = {"User-Agent": LORA_UA}
+    tok = _civitai_token()
+    if tok and _is_civitai_host(urllib.parse.urlsplit(url).hostname or ""):   # key only to Civitai, never a redirect host
+        h["Authorization"] = f"Bearer {tok}"
+    return h
+
+
+def _public_host(host: str) -> None:
+    """Refuse a host that resolves to a non-public address (SSRF guard)."""
+    import ipaddress
+    import socket
+    if not host:
+        raise UserFacing("That link has no address.")
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception as e:                               # noqa: BLE001
+        raise UserFacing("Couldn't resolve that address.") from e
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast
+                or ip.is_unspecified):
+            raise UserFacing("That link points inside a private network and was refused.")
+
+
+def _open_checked(url: str, timeout: float = 60, max_redirects: int = 6):
+    """An https GET with every redirect re-checked: scheme https only, host must be public, Civitai key only on a
+    Civitai host. Returns the response for the caller to read. Raises UserFacing on any refusal."""
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):            # don't auto-follow: a 3xx surfaces as HTTPError below
+            return None
+    opener = urllib.request.build_opener(_NoRedirect)
+    seen = 0
+    while True:
+        p = urllib.parse.urlsplit(url)
+        if p.scheme != "https":
+            raise UserFacing("Only secure (https) links are allowed.")
+        _public_host(p.hostname or "")
+        req = urllib.request.Request(url, headers=_lora_headers(url), method="GET")
+        try:
+            return opener.open(req, timeout=timeout)     # 2xx
+        except urllib.error.HTTPError as e:
+            if e.code in (301, 302, 303, 307, 308):
+                loc = e.headers.get("Location")
+                e.close()
+                if not loc or seen >= max_redirects:
+                    raise UserFacing("That link redirected too many times.") from None
+                url = urllib.parse.urljoin(url, loc)
+                seen += 1
+                continue
+            e.close()
+            if e.code in (401, 403) and _is_civitai_host(p.hostname or ""):
+                raise UserFacing("A free Civitai key is needed for this one. Add one in Settings; it stays on your "
+                                 "computer.") from None
+            raise UserFacing(f"That link returned an error ({e.code}).") from None
+        except (urllib.error.URLError, OSError) as e:
+            raise UserFacing("Couldn't reach that link.") from e
+
+
+def _api_json(url: str, timeout: float = 30):
+    r = _open_checked(url, timeout=timeout)
+    try:
+        return json.loads(r.read(SAFE_HEADER_MAX) or b"null")
+    finally:
+        r.close()
+
+
+def _api_text(url: str, timeout: float = 30, limit: int = 2_000_000) -> str:
+    r = _open_checked(url, timeout=timeout)
+    try:
+        return r.read(limit).decode("utf-8", "replace")
+    finally:
+        r.close()
+
+
+def _clean_lora_name(name: str) -> str:
+    """A file-system-safe stem: no path separators, no leading dots, so a name can never leave the folder."""
+    base = re.sub(r"\.safetensors$", "", (name or "").strip(), flags=re.I)
+    base = re.sub(r"[^A-Za-z0-9._-]+", "-", base).strip("-._")
+    return (base or "lora")[:60]
+
+
+def _lora_lib() -> dict:
+    try:
+        return json.loads((COMFY_LORAS / "library.json").read_text(encoding="utf-8"))
+    except Exception:                                    # noqa: BLE001
+        return {}
+
+
+def _lora_lib_write(lib: dict) -> None:
+    COMFY_LORAS.mkdir(parents=True, exist_ok=True)
+    tmp = COMFY_LORAS / "library.json.tmp"
+    tmp.write_text(json.dumps(lib), encoding="utf-8")
+    tmp.replace(COMFY_LORAS / "library.json")            # atomic
+
+
+def _lora_entries() -> list[dict]:
+    """The library: one row per .safetensors file. A file with no record is listed with family 'unknown'."""
+    lib = _lora_lib()
+    out = []
+    files = sorted(f.name for f in COMFY_LORAS.glob("*.safetensors")) if COMFY_LORAS.is_dir() else []
+    for fn in files:
+        e = lib.get(fn)
+        if e:
+            out.append({"file": fn, "name": e.get("name") or fn, "family": e.get("family") or "unknown",
+                        "triggers": e.get("triggers") or [], "strength": e.get("strength", 1.0),
+                        "always_on": bool(e.get("always_on")), "pair": e.get("pair"), "role": e.get("role"),
+                        "source": e.get("source", ""), "size": e.get("size") or (COMFY_LORAS / fn).stat().st_size})
+        else:
+            out.append({"file": fn, "name": re.sub(r"\.safetensors$", "", fn), "family": "unknown", "triggers": [],
+                        "strength": 1.0, "always_on": False, "pair": None, "role": None, "source": "",
+                        "size": (COMFY_LORAS / fn).stat().st_size})
+    return out
+
+
+def _family_model_name(family: str) -> str:
+    for r in CREATE_RECIPES.values():
+        if r.get("lora_family") == family:
+            return r["name"]
+    return {"qwen-edit": "Qwen photo edits", "wan22": "Wan 2.2 video"}.get(family, family)
+
+
+def _resolve_family(label: str, header: dict | None) -> tuple[str | None, str | None]:
+    """(family, warning) from a source label then the file header (metadata, then key names), in that order.
+    (None, reason) when it doesn't fit any model here; (None, None) when it stays unknown and the card must ask."""
+    meta = (header or {}).get("__metadata__", {}) if isinstance(header, dict) else {}
+    keys = [k for k in (header or {}) if k != "__metadata__"]
+    kj = " ".join(keys).lower()
+    arch = str(meta.get("modelspec.architecture") or "").lower()
+    base = str(meta.get("ss_base_model_version") or "").lower()
+    qwen21_file = ("qwen-image-2.1/lora" in kj or "qwen_image_21" in kj or "qwen-image-2.1" in arch
+                   or ("2.1" in base and "qwen" in base))
+    L = (label or "").strip().lower()
+    if L:
+        if L == "sdxl 1.0":
+            return "sdxl", None
+        if L in ("pony", "illustrious", "noobai"):
+            return "sdxl", LORA_WARN_RELATED
+        if L == "chroma":
+            return "chroma", None
+        if "wan" in L and "2.2" in L:
+            return "wan22", None
+        if "qwen" in L:
+            return ("qwen21", None) if ("2" in L and qwen21_file) else ("qwen-edit", None)
+        return None, LORA_NO_FIT
+    if "qwen-image-2.1/lora" in kj or "qwen_image_21" in kj:
+        return "qwen21", None
+    if any(k.startswith("diffusion_model.blocks.") and ".cross_attn" in k for k in keys):
+        return "wan22", None
+    if any(s in kj for s in ("lora_unet_input_blocks", "lora_te1_", "lora_te2_")):
+        return "sdxl", None
+    if "sdxl" in arch or "sdxl" in base or "xl-base" in base:
+        return "sdxl", None
+    if "chroma" in arch or "chroma" in base:
+        return "chroma", None
+    if "qwen" in arch or "qwen" in base:
+        return ("qwen21" if ("2.1" in base or "2.1" in arch) else "qwen-edit"), None
+    if "wan" in arch or "wan" in base:
+        return "wan22", None
+    return None, None
+
+
+def _wan_role(name: str) -> str | None:
+    n = (name or "").lower()
+    if "high" in n or re.search(r"(?:^|[^a-z])(?:hn|h)(?:[^a-z]|$)", n):
+        return "high"
+    if "low" in n or re.search(r"(?:^|[^a-z])(?:ln|l)(?:[^a-z]|$)", n):
+        return "low"
+    return None
+
+
+def _stream_lora(url: str, dest: Path, emit, cancel, max_bytes: int = LORA_MAX_BYTES):
+    """Download a safetensors file to `dest`, parsing and validating its header as it arrives. Returns
+    (header dict, sha256 hex, size). Raises UserFacing on anything that isn't a safetensors file within the limits."""
+    import hashlib
+    r = _open_checked(url)
+    try:
+        cl = r.headers.get("Content-Length")
+        if cl and int(cl) > max_bytes:
+            raise UserFacing("That add-on is too large (over 2 GB).")
+    except (TypeError, ValueError):
+        pass
+    h = hashlib.sha256()
+    head = bytearray()
+    header = None
+    total = None
+    try:
+        total = int(r.headers.get("Content-Length") or 0) or None
+    except (TypeError, ValueError):
+        total = None
+    got, last = 0, 0.0
+    try:
+        with open(dest, "wb") as f:
+            while True:
+                if cancel.is_set():
+                    raise UserFacing("Stopped.")
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                got += len(chunk)
+                if got > max_bytes:
+                    raise UserFacing("That add-on is too large (over 2 GB).")
+                h.update(chunk)
+                f.write(chunk)
+                if header is None:
+                    head += chunk
+                    if len(head) >= 8:
+                        n = struct.unpack("<Q", bytes(head[:8]))[0]
+                        if n <= 0 or n > SAFE_HEADER_MAX:
+                            raise UserFacing("That file isn't a valid safetensors add-on.")
+                        if len(head) >= 8 + n:
+                            try:
+                                header = json.loads(bytes(head[8:8 + n]).decode("utf-8"))
+                            except Exception as e:       # noqa: BLE001
+                                raise UserFacing("That file isn't a valid safetensors add-on.") from e
+                now = time.monotonic()
+                if total and now - last > 0.3:
+                    last = now
+                    emit({"t": "progress", "v": round(min(0.99, got / total), 3)})
+    finally:
+        r.close()
+    if header is None:
+        raise UserFacing("That file isn't a valid safetensors add-on.")
+    return header, h.hexdigest(), got
+
+
+def _parse_lora_link(link: str) -> dict:
+    """A pasted link / urn / search-result id -> a source descriptor. Raises UserFacing on an unusable one."""
+    import urllib.parse
+    s = (link or "").strip()
+    m = re.match(r"urn:air:[^:]*:[^:]*:civitai:(\d+)@(\d+)", s, re.I) or re.match(r"civitai:(\d+)@(\d+)$", s)
+    if m:
+        return {"kind": "civitai_version", "model": m.group(1), "version": m.group(2)}
+    m = re.match(r"hf:(.+)$", s)
+    if m:
+        return {"kind": "hf_repo", "repo": m.group(1)}
+    p = urllib.parse.urlsplit(s if "://" in s else "https://" + s)
+    host, path = (p.hostname or "").lower(), p.path or ""
+    qs = urllib.parse.parse_qs(p.query or "")
+    if _is_civitai_host(host):
+        m = re.search(r"/api/download/models/(\d+)", path) or re.search(r"/model-versions/(\d+)", path)
+        if m:
+            return {"kind": "civitai_version", "version": m.group(1)}
+        m = re.search(r"/models/(\d+)", path)
+        if m:
+            return {"kind": "civitai_model", "model": m.group(1), "version": (qs.get("modelVersionId") or [None])[0]}
+    if host in ("huggingface.co", "www.huggingface.co"):
+        m = re.search(r"/([^/]+/[^/]+)/(?:blob|resolve)/[^/]+/(.+\.safetensors)$", path)
+        if m:
+            return {"kind": "hf_file", "repo": m.group(1), "file": m.group(2)}
+        m = re.match(r"/([^/]+/[^/]+)/?$", path)
+        if m:
+            return {"kind": "hf_repo", "repo": m.group(1)}
+    if p.scheme in ("http", "https") and path.lower().endswith(".safetensors"):
+        return {"kind": "direct", "url": "https://" + s.split("://", 1)[-1] if "://" in s else "https://" + s}
+    if p.scheme in ("http", "https") and ("." in host):
+        return {"kind": "page", "url": "https://" + s.split("://", 1)[-1] if "://" in s else "https://" + s}
+    raise UserFacing("That doesn't look like a link to an add-on.")
+
+
+def _civitai_file_rows(files: list) -> list[dict]:
+    rows = []
+    for f in files or []:
+        if not str(f.get("name", "")).lower().endswith(".safetensors"):
+            continue
+        rows.append({"name": f.get("name"), "url": f.get("downloadUrl"),
+                     "size": int((f.get("sizeKB") or 0) * 1024),
+                     "sha256": str((f.get("hashes") or {}).get("SHA256") or "").lower(),
+                     "pickle": f.get("pickleScanResult"), "virus": f.get("virusScanResult")})
+    return rows
+
+
+def _plan_from_descriptor(d: dict) -> dict:
+    """A source descriptor -> a download plan {source, source_id, name, base, triggers, files:[...]} or a
+    {choices:[...]} when the user must pick one of several files."""
+    import urllib.parse
+    k = d["kind"]
+    if k in ("civitai_version", "civitai_model"):
+        version = d.get("version")
+        model = d.get("model")
+        if k == "civitai_model" and not version:
+            m = _api_json(f"{CIVITAI_API}/models/{model}")
+            version = str(((m.get("modelVersions") or [{}])[0]).get("id") or "")
+        v = _api_json(f"{CIVITAI_API}/model-versions/{version}")
+        model = model or str(v.get("modelId") or "")
+        rows = _civitai_file_rows(v.get("files"))
+        if not rows:
+            raise UserFacing("That add-on has no safetensors file.")
+        name = (v.get("model") or {}).get("name") or v.get("name") or f"civitai-{version}"
+        return {"source": "civitai", "source_id": f"civitai:{model}@{version}", "name": name,
+                "base": v.get("baseModel", ""), "triggers": v.get("trainedWords") or [], "files": rows}
+    if k in ("hf_repo", "hf_file"):
+        repo = d["repo"]
+        if k == "hf_file":
+            files = [d["file"]]
+        else:
+            info = _api_json(f"https://huggingface.co/api/models/{urllib.parse.quote(repo)}")
+            files = [s["rfilename"] for s in (info.get("siblings") or [])
+                     if str(s.get("rfilename", "")).lower().endswith(".safetensors")]
+            if not files:
+                raise UserFacing("That page has no safetensors add-on.")
+            if len(files) > 1:
+                return {"choices": files, "repo": repo, "source": "hf"}
+        rows = [{"name": f.split("/")[-1],
+                 "url": f"https://huggingface.co/{repo}/resolve/main/" + urllib.parse.quote(f),
+                 "size": None, "sha256": "", "pickle": None, "virus": None} for f in files]
+        return {"source": "hf", "source_id": f"hf:{repo}", "name": repo.split("/")[-1], "base": "",
+                "triggers": [], "files": rows}
+    if k == "direct":
+        url = d["url"]
+        nm = urllib.parse.unquote(urllib.parse.urlsplit(url).path.split("/")[-1]) or "lora.safetensors"
+        return {"source": "link", "source_id": url, "name": re.sub(r"\.safetensors$", "", nm, flags=re.I),
+                "base": "", "triggers": [], "files": [{"name": nm, "url": url, "size": None, "sha256": "",
+                                                       "pickle": None, "virus": None}]}
+    if k == "page":
+        html = _api_text(d["url"])
+        links = list(dict.fromkeys(re.findall(r'https://[^\s"\'<>]+\.safetensors', html)))
+        if not links:
+            raise UserFacing("No add-on file was found on that page.")
+        if len(links) > 1:
+            return {"choices": [l.split("/")[-1] for l in links], "links": links, "source": "link"}
+        return _plan_from_descriptor({"kind": "direct", "url": links[0]})
+    raise UserFacing("That doesn't look like a link to an add-on.")
+
+
+def job_lora_key(p: dict, emit, cancel):
+    """Saves (or clears) the Civitai key. Never returns it."""
+    key = str(p.get("key") or "").strip()
+    if key:
+        CIVITAI_TOKEN.write_text(key, encoding="utf-8")
+        try:
+            CIVITAI_TOKEN.chmod(0o600)
+        except Exception:                                # noqa: BLE001
+            pass
+    else:
+        CIVITAI_TOKEN.unlink(missing_ok=True)
+    emit({"t": "info", "civitai_key": bool(key)})
+
+
+def job_lora_list(p: dict, emit, cancel):
+    emit({"t": "info", "library": _lora_entries()})
+
+
+def job_lora_set(p: dict, emit, cancel):
+    """Change strength, always_on or family for one file (and, for a pair, both halves)."""
+    fn = str(p.get("file") or "")
+    lib = _lora_lib()
+    if fn not in lib and not (COMFY_LORAS / fn).is_file():
+        raise UserFacing("That add-on isn't on your computer.")
+    e = lib.get(fn) or {"name": re.sub(r"\.safetensors$", "", fn), "family": "unknown", "triggers": [],
+                        "strength": 1.0, "always_on": False, "pair": None, "role": None, "source": "", "source_id": "",
+                        "sha256": "", "size": (COMFY_LORAS / fn).stat().st_size}
+    if "strength" in p:
+        e["strength"] = max(0.0, min(2.0, float(p.get("strength") or 1.0)))
+    if "always_on" in p:
+        e["always_on"] = bool(p.get("always_on"))
+    if "family" in p and p.get("family") in LORA_FAMILIES:
+        e["family"] = p["family"]
+    lib[fn] = e
+    pair = e.get("pair")
+    if pair:                                             # keep both halves of a Wan pair in step
+        for k, v in lib.items():
+            if v.get("pair") == pair and k != fn:
+                for field in ("strength", "always_on", "family"):
+                    if field in p:
+                        v[field] = e[field]
+    _lora_lib_write(lib)
+    emit({"t": "info", "library": _lora_entries()})
+
+
+def job_lora_remove(p: dict, emit, cancel):
+    """Delete a file (or a whole pair) and its library entry."""
+    fn = str(p.get("file") or "")
+    lib = _lora_lib()
+    pair = (lib.get(fn) or {}).get("pair")
+    targets = [k for k, v in lib.items() if v.get("pair") == pair] if pair else [fn]
+    if fn not in targets:
+        targets.append(fn)
+    freed = 0
+    for t in targets:
+        f = COMFY_LORAS / t
+        if f.is_file():
+            freed += f.stat().st_size
+            f.unlink(missing_ok=True)
+        lib.pop(t, None)
+    _lora_lib_write(lib)
+    COMFY.warmed.clear()
+    emit({"t": "info", "removed": fn, "freed_gb": round(freed / 1024 ** 3, 2), "library": _lora_entries()})
+
+
+def job_lora_search(p: dict, emit, cancel):
+    """Browse Civitai or Hugging Face for LoRAs that fit `family`. Nothing is kept on disk."""
+    import urllib.parse
+    source = str(p.get("source") or "civitai").lower()
+    family = str(p.get("family") or "")
+    query = str(p.get("query") or "").strip()
+    cursor = p.get("cursor")
+    if source == "hf":
+        base = {"sdxl": "stabilityai/stable-diffusion-xl-base-1.0"}.get(family)
+        params = [("filter", "lora"), ("limit", "20"), ("sort", "downloads"), ("direction", "-1")]
+        if base:
+            params.append(("filter", f"base_model:adapter:{base}"))
+        if query:
+            params.append(("search", query))
+        elif not base:
+            params.append(("search", family))
+        data = _api_json("https://huggingface.co/api/models?" + urllib.parse.urlencode(params))
+        items = [{"source": "hf", "source_id": f"hf:{m.get('id')}", "name": m.get("id", ""),
+                  "downloads": m.get("downloads"), "thumb": None, "triggers": []} for m in (data or [])]
+        emit({"t": "info", "loras": items, "cursor": None})
+        return
+    bases = LORA_CIVITAI_BASE.get(family, [])
+    params = [("types", "LORA"), ("nsfw", "true"), ("limit", "20"), ("sort", "Most Downloaded")]
+    if query:
+        params.append(("query", query))
+    if cursor:
+        params.append(("cursor", str(cursor)))
+    for b in bases:
+        params.append(("baseModels", b))
+    data = _api_json(f"{CIVITAI_API}/models?" + urllib.parse.urlencode(params))
+    items = []
+    for m in data.get("items", []):
+        v = (m.get("modelVersions") or [{}])[0]
+        rows = _civitai_file_rows(v.get("files"))
+        if not rows:
+            continue
+        thumb = next((im.get("url") for im in (v.get("images") or []) if im.get("url")), None)
+        items.append({"source": "civitai", "source_id": f"civitai:{m.get('id')}@{v.get('id')}",
+                      "name": m.get("name", ""), "base": v.get("baseModel", ""),
+                      "size_mb": round(sum(r["size"] for r in rows) / 1024 ** 2, 1),
+                      "downloads": (m.get("stats") or {}).get("downloadCount"),
+                      "thumb": thumb, "triggers": v.get("trainedWords") or []})
+    emit({"t": "info", "loras": items, "cursor": (data.get("metadata") or {}).get("nextCursor")})
+
+
+def job_lora_thumb(p: dict, emit, cancel):
+    """Fetch a preview image through the PC and return a 256 px JPEG (kept in memory only)."""
+    from PIL import Image
+    url = str(p.get("url") or "")
+    if not url:
+        raise UserFacing("No preview to show.")
+    r = _open_checked(url, timeout=20)
+    try:
+        raw = r.read(8 * 1024 * 1024)
+    finally:
+        r.close()
+    img = Image.open(io.BytesIO(raw)).convert("RGB")
+    img.thumbnail((256, 256), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    emit({"t": "info", "thumb": base64.b64encode(buf.getvalue()).decode()})
+
+
+def job_lora_inspect(p: dict, emit, cancel):
+    """A link or a search result -> the confirmation card (name, size, which model it fits, triggers, warnings)."""
+    d = _parse_lora_link(str(p.get("link") or p.get("source_id") or ""))
+    plan = _plan_from_descriptor(d)
+    if "choices" in plan:
+        emit({"t": "info", "choices": plan["choices"], "repo": plan.get("repo"), "links": plan.get("links")})
+        return
+    fam, warn = _resolve_family(plan.get("base", ""), None)
+    size = sum((f.get("size") or 0) for f in plan["files"])
+    emit({"t": "info", "card": {
+        "name": plan["name"], "source": plan["source"], "source_id": plan["source_id"],
+        "size_mb": round(size / 1024 ** 2, 1) if size else None,
+        "family": fam, "fits": _family_model_name(fam) if fam else None,
+        "triggers": plan.get("triggers") or [], "files": [f["name"] for f in plan["files"]],
+        "warning": warn, "needs_pick": fam is None and warn is None}})
+
+
+def job_lora_add(p: dict, emit, cancel):
+    """Download and install a LoRA. One at a time (its own lock), off the picture queue, streaming progress."""
+    with LORA_LOCK:
+        d = _parse_lora_link(str(p.get("link") or p.get("source_id") or ""))
+        plan = _plan_from_descriptor(d)
+        if "choices" in plan:
+            raise UserFacing("That page has several files — choose one first.")
+        files = plan["files"]
+        picked = str(p.get("family") or "")              # the model the user chose on the card, if any
+        is_pair = picked == "wan22" and len(files) >= 2
+        if not is_pair and len(files) > 1:
+            files = files[:1]
+        pair_id = secrets.token_hex(4) if is_pair else None
+        COMFY_LORAS.mkdir(parents=True, exist_ok=True)
+        lib = _lora_lib()
+        added = []
+        warn_out = None
+        for f in files:
+            if plan["source"] == "civitai" and (f.get("pickle") not in (None, "Success")
+                                                or f.get("virus") not in (None, "Success")):
+                raise UserFacing("That file hasn't passed Civitai's safety scan, so nothing was added.")
+            if f.get("size") and f["size"] > LORA_MAX_BYTES:
+                raise UserFacing("That add-on is too large (over 2 GB).")
+            if not str(f["name"]).lower().endswith(".safetensors"):
+                raise UserFacing("Only .safetensors add-ons are allowed.")
+            clean = _clean_lora_name(f["name"])
+            part = COMFY_LORAS / (clean + ".part")
+            try:
+                emit({"t": "status", "v": "Downloading the add-on…"})
+                header, sha, size = _stream_lora(f["url"], part, emit, cancel)
+                if cancel.is_set():
+                    raise UserFacing("Stopped.")
+                if f.get("sha256") and f["sha256"] != sha:
+                    raise UserFacing("The download didn't match its checksum, so nothing was added.")
+                fam, fam_warn = _resolve_family(plan.get("base", ""), header)
+                fam = picked or fam
+                if fam is None:
+                    part.unlink(missing_ok=True)
+                    raise UserFacing(fam_warn or "Pick the model this add-on is for, then add it again.")
+                warn_out = warn_out or fam_warn
+                final = COMFY_LORAS / f"{clean}-{sha[:8]}.safetensors"
+                part.replace(final)
+            except BaseException:
+                part.unlink(missing_ok=True)
+                raise
+            role = _wan_role(f["name"]) if fam == "wan22" and is_pair else None
+            lib[final.name] = {"name": plan["name"], "family": fam, "source": plan["source"],
+                               "source_id": plan.get("source_id", ""), "sha256": sha, "size": size,
+                               "triggers": plan.get("triggers") or [], "strength": 1.0, "pair": pair_id,
+                               "role": role, "always_on": False}
+            added.append({"file": final.name, "family": fam})
+        _lora_lib_write(lib)
+        COMFY.stop()                                     # so the next job's ComfyUI sees the new file
+        emit({"t": "info", "added": added, "warning": warn_out, "library": _lora_entries()})
+
+
 def _no_job(p: dict, emit, cancel):
     raise RuntimeError("answered on the event loop")
 
@@ -4239,6 +4803,9 @@ JOBS = {"status": job_status, "chat": job_chat, "image": job_image, "video": job
         "remove_model": job_remove_model, "installed": job_installed, "warm": job_warm,
         "comfy_recipes": job_comfy_recipes, "comfy_run": job_comfy_run, "config": job_config,
         "make_recipes": job_make_recipes,
+        "lora_search": job_lora_search, "lora_thumb": job_lora_thumb, "lora_inspect": job_lora_inspect,
+        "lora_add": job_lora_add, "lora_list": job_lora_list, "lora_set": job_lora_set,
+        "lora_remove": job_lora_remove, "lora_key": job_lora_key,
         "stop_all": _no_job, "queue": _no_job, "free_memory": _no_job}   # these three answer on the event loop
 # 11-17: never wait for the line, stream as before. (comfy_recipes never needed the card: it waited behind videos and
 # left Make on "Asking your computer..." for minutes.)

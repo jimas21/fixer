@@ -4790,27 +4790,57 @@ def job_lora_search(p: dict, emit, cancel):
         emit({"t": "info", "loras": items, "cursor": None})
         return
     bases = LORA_CIVITAI_BASE.get(family, [])
-    params = [("types", "LORA"), ("nsfw", "true"), ("limit", "20"), ("sort", "Most Downloaded")]
-    if query:
-        params.append(("query", query))
-    if cursor:
-        params.append(("cursor", str(cursor)))
-    for b in bases:
-        params.append(("baseModels", b))
-    data = _api_json(f"{CIVITAI_API}/models?" + urllib.parse.urlencode(params))
-    items = []
-    for m in data.get("items", []):
-        v = (m.get("modelVersions") or [{}])[0]
-        rows = _civitai_file_rows(v.get("files"))
-        if not rows:
-            continue
-        thumb = next((im.get("url") for im in (v.get("images") or []) if im.get("url")), None)
-        items.append({"source": "civitai", "source_id": f"civitai:{m.get('id')}@{v.get('id')}",
-                      "name": m.get("name", ""), "base": v.get("baseModel", ""),
-                      "size_mb": round(sum(r["size"] for r in rows) / 1024 ** 2, 1),
-                      "downloads": (m.get("stats") or {}).get("downloadCount"),
-                      "thumb": thumb, "triggers": v.get("trainedWords") or []})
-    emit({"t": "info", "loras": items, "cursor": (data.get("metadata") or {}).get("nextCursor")})
+
+    def _fits(base: str) -> bool:                          # does this result belong to the model family in use
+        f = _resolve_family(base or "", None)[0]
+        if f == family:
+            return True
+        return bool(f and family and f.startswith("qwen") and family.startswith("qwen"))
+
+    def _page(mode: str, term: str, cur) -> dict:
+        # A typed search reaches across every base model (Civitai's own query filter is strict, so pinning it to the
+        # family hides most concept matches); browsing with no words keeps the family filter so the default list fits.
+        params = [("types", "LORA"), ("nsfw", "true"), ("limit", "20"), ("sort", "Most Downloaded")]
+        if term:
+            params.append((mode, term))                    # "query" matches the title, "tag" matches the concept
+        if cur:
+            params.append(("cursor", str(cur)))
+        if not term:
+            for b in bases:
+                params.append(("baseModels", b))
+        return _api_json(f"{CIVITAI_API}/models?" + urllib.parse.urlencode(params))
+
+    def _rows(data: dict) -> list:
+        out = []
+        for m in data.get("items", []):
+            v = (m.get("modelVersions") or [{}])[0]
+            rows = _civitai_file_rows(v.get("files"))
+            if not rows:
+                continue
+            thumb = next((im.get("url") for im in (v.get("images") or []) if im.get("url")), None)
+            base = v.get("baseModel", "")
+            out.append({"source": "civitai", "source_id": f"civitai:{m.get('id')}@{v.get('id')}",
+                        "name": m.get("name", ""), "base": base, "fits": _fits(base),
+                        "size_mb": round(sum(r["size"] for r in rows) / 1024 ** 2, 1),
+                        "downloads": (m.get("stats") or {}).get("downloadCount"),
+                        "thumb": thumb, "triggers": v.get("trainedWords") or []})
+        return out
+
+    # The cursor carries the search mode across "load more" so a tag fallback keeps paging as a tag search.
+    mode, real_cursor = "query", cursor
+    if isinstance(cursor, str) and cursor.startswith("tag::"):
+        mode, real_cursor = "tag", cursor[5:]
+    data = _page(mode, query, real_cursor)
+    items = _rows(data)
+    # A typed title search that finds nothing on the first page is retried as a concept tag (loose, like the website).
+    if query and mode == "query" and not items and not real_cursor:
+        mode, data = "tag", _page("tag", query, None)
+        items = _rows(data)
+    items.sort(key=lambda it: 0 if it.get("fits") else 1)  # family-appropriate first; the add step still checks fit
+    next_cursor = (data.get("metadata") or {}).get("nextCursor")
+    if next_cursor and mode == "tag":
+        next_cursor = f"tag::{next_cursor}"
+    emit({"t": "info", "loras": items, "cursor": next_cursor})
 
 
 def job_lora_thumb(p: dict, emit, cancel):

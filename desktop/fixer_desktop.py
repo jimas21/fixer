@@ -54,7 +54,7 @@ from pathlib import Path
 ROOT = Path(os.environ.get("FIXER_HOME", r"C:\FixerDesktop"))
 MODELS = ROOT / "models"
 KEYS = ROOT / "keys.json"
-CAP_GB = float(os.environ.get("FIXER_MODEL_CAP_GB", "150"))   # 200 TEMPORARY (the owner, 11-16) during the ComfyUI move: old + new copies side by side; back to 150 once the old diffusers copies are deleted
+CAP_GB = float(os.environ.get("FIXER_MODEL_CAP_GB", "200"))   # the model folder's size limit
 PORT = int(os.environ.get("FIXER_PORT", "8765"))
 HOST = os.environ.get("FIXER_HOST", "0.0.0.0")
 def _local_config() -> dict:
@@ -295,6 +295,7 @@ def ensure_files(repo: str, files: list[tuple[str, int]], status, kind: str = "m
         used = cache.size_on_disk - here
     except Exception:
         used = 0
+    used += _tree_size(MODELS / "comfy-loras") + _tree_size(MODELS / "comfy-vae")   # LoRAs and the moved VAE count too
     if used + need > cap:
         def gb(b):
             return max(1, round(b / 1024 ** 3))
@@ -1190,6 +1191,7 @@ def job_status(p: dict, emit, cancel):
         sizes = {r.repo_id: r.size_on_disk for r in cache.repos if r.size_on_disk > 50 * 1024 ** 2}
     except Exception:
         used, repos, sizes = 0, [], {}
+    used += _tree_size(MODELS / "comfy-loras") + _tree_size(MODELS / "comfy-vae")   # LoRAs and the moved VAE count too
     for alias, real in BRAIN_ALIASES.items():          # the phone may know a chat model by its alias
         if real in sizes:
             sizes[alias] = sizes[real]
@@ -2260,6 +2262,7 @@ COMFY_PRIVATE = ROOT / "comfy-private"
 COMFY_PORT = int(os.environ.get("FIXER_COMFY_PORT", "8188"))
 COMFY_ON = os.environ.get("FIXER_COMFY", "1") == "1"       # 0 = old diffusers path for everything
 COMFY_RECIPES = {                                               # phone model id -> Create recipe
+    "Kandoo/Juggernaut-XL-Ragnarok": "juggernaut",
     "tewea/z_image_turbo_bf16_nsfw": "zimage-nsfw",
     "Tongyi-MAI/Z-Image-Turbo": "zimage",
     "lodestones/Chroma1-HD": "chroma",
@@ -2286,6 +2289,7 @@ def _comfy_paths_yaml() -> str:
     wan_te = _snapshot(WAN_TE_REPO)
     wan_x = _snapshot(WAN_EXPLICIT_REPO)
     qe, qb, qa = _snapshot(QWEN_EDIT_REPO), _snapshot(QWEN_BASE_REPO), _snapshot(QWEN_AIO_REPO)
+    jug = _snapshot("Kandoo/Juggernaut-XL-Ragnarok")
     def block(paths):
         return "|\n" + "".join(f"    {Path(x).as_posix()}\n" for x in paths if x)
     COMFY_LORAS.mkdir(parents=True, exist_ok=True)
@@ -2294,7 +2298,7 @@ def _comfy_paths_yaml() -> str:
             f"  text_encoders: {block([z / 'split_files' / 'text_encoders' if z else None, t5, wan_te / 'split_files' / 'text_encoders' if wan_te else None, qb / 'split_files' / 'text_encoders' if qb else None, q21te, q21te_bf])}"
             f"  upscale_models: {block([up])}"
             f"  vae: {block([z / 'split_files' / 'vae' if z else None, wan / 'split_files' / 'vae' if wan else None, qb / 'split_files' / 'vae' if qb else None, q21 / 'vae' if q21 else None])}"
-            f"  checkpoints: {block([qa / QWEN_AIO_DIR if qa else None])}"
+            f"  checkpoints: {block([qa / QWEN_AIO_DIR if qa else None, jug])}"
             f"  loras: {block([COMFY_LORAS, wan / 'split_files' / 'loras' if wan else None, wan_x, q21x])}")
 
 
@@ -2303,7 +2307,7 @@ def _comfy_paths_yaml() -> str:
 TIMINGS: collections.deque = collections.deque(maxlen=100)
 _TL = threading.local()                                  # the record of the job running on this thread
 _LOADER_CLASSES = frozenset({"UNETLoader", "CLIPLoader", "VAELoader", "CheckpointLoaderSimple", "LoraLoaderModelOnly",
-                             "UpscaleModelLoader"})
+                             "LoraLoader", "UpscaleModelLoader"})
 _SAMPLER_CLASSES = frozenset({"SamplerCustomAdvanced", "KSampler", "KSamplerAdvanced"})
 
 
@@ -3076,12 +3080,55 @@ def _chroma_workflow(prompt: str, negative: str, w: int, h: int, seed: int, step
     return wf
 
 
+def _sdxl_workflow(prompt: str, negative: str, w: int, h: int, seed: int, steps: int = 30, cfg: float = 5.0,
+                   sampler: str = "dpmpp_2m_sde", scheduler: str = "karras", loras: list | None = None,
+                   ckpt: str = "juggernautXL_ragnarok.safetensors") -> dict:
+    """An SDXL checkpoint (Juggernaut XL Ragnarok) the plain ComfyUI way: one CheckpointLoaderSimple, a KSampler at
+    30 steps, positive and negative text. LoRAs chain model+clip (both strengths = the LoRA's strength) between the
+    loader and the text encoders. Node ids match paint and start-from (_START_POINTS["sdxl"])."""
+    wf = {
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": ckpt}},
+        "4": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["1", 1]}},
+        "5": {"class_type": "CLIPTextEncode", "inputs": {"text": negative or "", "clip": ["1", 1]}},
+        "6": {"class_type": "EmptyLatentImage", "inputs": {"width": w, "height": h, "batch_size": 1}},
+        "8": {"class_type": "KSampler", "inputs": {"model": ["1", 0], "seed": seed, "steps": int(steps),
+                                                   "cfg": float(cfg), "sampler_name": sampler, "scheduler": scheduler,
+                                                   "positive": ["4", 0], "negative": ["5", 0],
+                                                   "latent_image": ["6", 0], "denoise": 1.0}},
+        "9": {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["1", 2]}},
+        "10": {"class_type": "SaveImageWebsocket", "inputs": {"images": ["9", 0]}},
+    }
+    model, clip = ["1", 0], ["1", 1]
+    for i, (name, strength) in enumerate(loras or []):
+        nid = f"20{i}"
+        wf[nid] = {"class_type": "LoraLoader",
+                   "inputs": {"model": model, "clip": clip, "lora_name": name,
+                              "strength_model": float(strength), "strength_clip": float(strength)}}
+        model, clip = [nid, 0], [nid, 1]
+    wf["8"]["inputs"]["model"] = model
+    wf["4"]["inputs"]["clip"] = clip
+    wf["5"]["inputs"]["clip"] = clip
+    return wf
+
+
 # ---- Create screen: recipes the phone shows as a form (controls built from ComfyUI's own option lists)
 
 SHAPES = {"square": (1024, 1024), "portrait": (832, 1216), "landscape": (1216, 832), "wallpaper": (704, 1472)}
 COMFY_LORAS = MODELS / "comfy-loras"       # LoRA files ComfyUI can use (inside the capped folder)
 
 CREATE_RECIPES = {
+    "juggernaut": {
+        "name": "Juggernaut XL Ragnarok", "kind": "image", "builder": "sdxl",
+        "note": "Photo-real people, portraits and scenes, and fine with explicit pictures. Uses 'Leave out'. 30 steps.",
+        "ckpt": "juggernautXL_ragnarok.safetensors",
+        "needs": ["Kandoo/Juggernaut-XL-Ragnarok"],
+        "file": ("Kandoo/Juggernaut-XL-Ragnarok", "juggernautXL_ragnarok.safetensors"),
+        "defaults": {"steps": 30, "cfg": 5.0, "sampler": "dpmpp_2m_sde", "scheduler": "karras", "shift": 1.0},
+        "negative": True, "default_negative": "bad eyes, cgi, airbrushed, plastic, deformed, watermark",
+        "detail_pass": False, "uses_shift": False, "lora_family": "sdxl",
+        "shapes": {"wallpaper": (768, 1344)},
+        "cfg_help": "5 suits portraits, 6 suits everything else. Too high looks harsh.",
+    },
     "zimage": {
         # Stock Z-Image Turbo: scenery, objects, everything that isn't the NSFW retrain's speciality.
         "name": "Z-Image Turbo", "kind": "image", "note": 'Fast all-rounder: places, objects, scenery and people, very photo-like. Keeps things clothed; for explicit pictures pick the NSFW version. Changes under a picture keep the rest.', "unet": "z_image_turbo_bf16.safetensors",
@@ -3103,7 +3150,7 @@ CREATE_RECIPES = {
     },
     "chroma": {
         # Strong on fine natural detail and on explicit content alike; slower (26 steps with guidance).
-        "name": "Chroma1-HD", "kind": "image", "note": "The finest natural detail (skin, hair, fabric, fur) and fine with explicit pictures. About three times slower than Z-Image. Uses 'Leave out'.", "builder": "chroma",
+        "name": "Chroma1-HD", "kind": "image", "note": "The finest natural detail (skin, hair, fabric, fur) and fine with explicit pictures. About three times slower than Z-Image. Uses 'Leave out'.", "builder": "chroma", "lora_family": "chroma",
         "needs": ["Comfy-Org/Chroma1-HD_repackaged", "comfyanonymous/flux_text_encoders", "Comfy-Org/Z-Image-Turbo"],
         "file": ("Comfy-Org/Chroma1-HD_repackaged", "split_files/diffusion_models/Chroma1-HD-fp8mixed.safetensors"),
         "defaults": {"steps": 26, "cfg": 4.5, "sampler": "euler", "scheduler": "beta", "shift": 1.0},
@@ -3114,7 +3161,7 @@ CREATE_RECIPES = {
     "qwen21": {
         # 11-17: Qwen-Image 2.1 Turbo. Opt-in until the owner's real use (the Queue screen's timings) shows it is at
         # least as good: it is NOT in AUTO_MODELS_DEFAULT. Makes and edits with the same loaded model.
-        "name": QWEN21_NAME, "kind": "image", "builder": "qwen21",
+        "name": QWEN21_NAME, "kind": "image", "builder": "qwen21", "lora_family": "qwen21",
         "note": "New. Follows long, exact descriptions and lettering well, and makes and edits photos with the same "
                 "model, so nothing reloads between them. Explicit add-on below. 8 steps.",
         "needs": [QWEN21_REPO],
@@ -3131,6 +3178,7 @@ CREATE_RECIPES = {
 _START_POINTS = {   # builder -> (blank-canvas node, vae output, node whose denoise sets the strength)
     "zimage": ("6", ["3", 0], "8"),
     "chroma": ("13", ["3", 0], "11"),
+    "sdxl": ("6", ["1", 2], "8"),
 }
 
 
@@ -3145,7 +3193,7 @@ def _start_from(wf: dict, builder: str, image: str, w: int, h: int, strength: fl
     wf[denoise_node]["inputs"]["denoise"] = max(0.05, min(1.0, float(strength)))
 
 
-PAINT_STRENGTH = {"zimage": 0.9, "chroma": 0.9, "qwen21": 1.0}   # "Auto" on the phone's Change slider
+PAINT_STRENGTH = {"zimage": 0.9, "chroma": 0.9, "qwen21": 1.0, "sdxl": 0.8}   # "Auto" on the phone's Change slider
 
 
 def _paint_crop(photo, mask_img):
@@ -3525,6 +3573,9 @@ def _recipe_workflow(r: dict, v: dict, w: int, h: int, seed: int, loras: list | 
     if r.get("builder") == "chroma":
         return _chroma_workflow(prompt, v.get("negative") or "", w, h, seed, v["steps"], v["cfg"], v["sampler"],
                                 v["scheduler"], v["shift"], loras)
+    if r.get("builder") == "sdxl":
+        return _sdxl_workflow(prompt, v.get("negative") or r.get("default_negative", ""), w, h, seed, v["steps"],
+                              v["cfg"], v["sampler"], v["scheduler"], loras, ckpt=r["ckpt"])
     detail = {"1.5x": 1.5, "2x": 2.0}.get(str(v.get("detail") or "Off"), 0.0)
     return _zimage_workflow(prompt, w, h, seed, v["steps"], v["cfg"], v["sampler"], v["scheduler"], v["shift"],
                             loras, unet=r["unet"], detail=detail, te=_zimage_text_reader())
@@ -3588,6 +3639,7 @@ RECIPE_CHOICES = {   # builder -> (samplers, schedules), recommended first
     "zimage": (["res_multistep", "euler", "dpmpp_2m", "dpmpp_2m_sde"], ["simple", "beta", "sgm_uniform"]),
     "chroma": (["euler", "res_multistep", "dpmpp_2m", "uni_pc"], ["beta", "simple", "sgm_uniform"]),
     "qwen21": (["euler"], ["simple"]),
+    "sdxl": (["dpmpp_2m_sde", "dpmpp_2m", "euler_ancestral", "dpmpp_sde"], ["karras", "exponential", "normal"]),
 }
 
 
@@ -3682,7 +3734,7 @@ def job_config(p: dict, emit, cancel):
 def _prompt_style(r: dict) -> str:
     """Which phrasing a recipe's toggles use: Chroma sentences with negatives, or the positive sentences of Z-Image
     and Qwen-Image 2.1 (both run at guidance 1, so negatives do nothing there)."""
-    return {"chroma": "chroma"}.get(r.get("builder", ""), "zimage")
+    return {"chroma": "chroma", "sdxl": "chroma"}.get(r.get("builder", ""), "zimage")
 
 
 def _toggle_library() -> list[dict]:
@@ -3724,7 +3776,7 @@ def _apply_toggles(r: dict, v: dict) -> dict:
     v = {**v, "prompt": sep.join([x for x in [prompt] + pos if x])}
     if neg and r.get("negative"):
         base = (v.get("negative") or "").strip()
-        v["negative"] = ", ".join([base or CHROMA_NEGATIVE] + neg)
+        v["negative"] = ", ".join([base or r.get("default_negative", CHROMA_NEGATIVE)] + neg)
     return v
 
 
@@ -3826,14 +3878,12 @@ def job_comfy_run(p: dict, emit, cancel):
     v = _apply_toggles(r, v)
     v["sampler"], v["scheduler"] = _menu_value(v.get("sampler")), _menu_value(v.get("scheduler"))
     status = lambda s: emit({"t": "status", "v": s})  # noqa: E731
-    if r.get("builder") == "qwen21" or str(v.get("editor") or "") == "qwen21":
-        COMFY.ensure_current(status)                   # a freshly downloaded add-on or reader shows up (one restart)
-    else:
-        COMFY.ensure(status)
+    COMFY.ensure_current(status)                        # a freshly downloaded model, add-on, reader or LoRA shows up
     _room_for_pictures()
     if _worker_alive():
         WORKER.stop()
-    w, h = SHAPES.get(v.get("shape") or "square", SHAPES["square"])
+    shapes = {**SHAPES, **r.get("shapes", {})}          # a recipe may override a shape (SDXL draws wallpaper at ~1 MP)
+    w, h = shapes.get(v.get("shape") or "square", shapes["square"])
     count = max(1, min(4, int(v.get("count") or 1)))
     seed = v.get("seed")
     seed = int(seed) if seed not in (None, "", -1) else int.from_bytes(os.urandom(4), "big")
@@ -4033,14 +4083,14 @@ def _quietly(fn):
 def job_comfy_image(p: dict, emit, cancel):
     status = lambda s: emit({"t": "status", "v": s})  # noqa: E731
     r = _picture_recipe(p) or CREATE_RECIPES["zimage-nsfw"]
-    if r.get("builder") == "qwen21":
-        COMFY.ensure_current(status)
-    else:
-        COMFY.ensure(status)
+    COMFY.ensure_current(status)                        # a freshly downloaded model, add-on, reader or LoRA shows up
     _room_for_pictures()                               # dense brain: the card goes to the picture; the MoE brain stays
     if _worker_alive():
         WORKER.stop()                                  # the diffusers helper holds graphics memory too
     w, h = _fit(int(p.get("width", 1024)), int(p.get("height", 1024)), int(p.get("longest", 1024)))
+    if r.get("builder") == "sdxl" and w * h > 1_100_000:   # SDXL is trained near 1 MP; a chat picture may ask for more
+        sc = (1_100_000 / (w * h)) ** 0.5
+        w, h = int(w * sc), int(h * sc)
     seed = int(p.get("seed") or int.from_bytes(os.urandom(4), "big")) % (2 ** 32)
     rid = _recipe_id(r)
     flag = p.get("explicit") if isinstance(p.get("explicit"), bool) else None     # the brain's own call (new phones)
@@ -4128,7 +4178,7 @@ def job_comfy_warm(p: dict, emit, cancel):
     wait for the disk. The chat model is left alone; ComfyUI then lets go of the card (models stay in RAM)."""
     recipe = COMFY_RECIPES.get(p.get("model") or "")
     if recipe and _chat_recipe(p.get("model")) and recipe not in COMFY.warmed:
-        COMFY.ensure_current() if recipe == "qwen21" else COMFY.ensure()
+        COMFY.ensure_current()
         try:
             asyncio.run(_comfy_run(_warmup_workflow(recipe), lambda obj: None, cancel))
             done = not cancel.is_set()

@@ -13,7 +13,7 @@ each request. On disk there is only:
 |---|---|
 | `C:\FixerDesktop\venv\` | Python and its libraries |
 | `C:\FixerDesktop\llama\` | llama.cpp (runs the chat model) |
-| `C:\FixerDesktop\models\` | downloaded models, capped at 200 GB (temporarily, during the ComfyUI move; 150 after) (nothing is removed automatically: the phone shows which models are here and removes them) |
+| `C:\FixerDesktop\models\` | downloaded models, capped at 200 GB (nothing is removed automatically: the phone shows which models are here and removes them) |
 | `C:\FixerDesktop\keys.json` | one random key per paired phone |
 | `C:\FixerDesktop\tray.json` | the tray's own two settings |
 | `C:\FixerDesktop\*.py` | this code |
@@ -31,7 +31,7 @@ marker, then searches every file that changed on the computer for the marker, th
 - Everything runs at below-normal priority, one request at a time. **Free graphics memory** in the tray menu
   unloads both models (they reload on the next request); **Turn off** stops the server entirely.
 
-Settings (environment variables): `FIXER_IDLE_MINUTES` (5), `FIXER_MODEL_CAP_GB` (200 for now), `FIXER_PORT` (8765),
+Settings (environment variables): `FIXER_IDLE_MINUTES` (5), `FIXER_MODEL_CAP_GB` (200), `FIXER_PORT` (8765),
 `FIXER_HOME` (`C:\FixerDesktop`), `FIXER_BRAIN_VRAM_GB` (7, budget for chat weights + vision projector),
 `FIXER_BRAIN_CTX` (16384).
 

@@ -4444,6 +4444,13 @@ def _job_loras(requested, family, extra_always_on: bool = True):
     for fn in want:                                      # the user's chosen ones, of this family or unknown
         if lib[fn].get("family") in (family, "unknown"):
             add(fn)
+            pid = lib[fn].get("pair")
+            if pid:                                      # the phone names one file of a video pair: use both
+                for other, e in lib.items():
+                    if other != fn and e.get("pair") == pid:
+                        if fn in strengths:
+                            strengths.setdefault(other, strengths[fn])
+                        add(other)
     if extra_always_on:
         for fn, e in lib.items():
             if e.get("always_on") and e.get("family") == family:
@@ -4702,7 +4709,7 @@ def job_lora_key(p: dict, emit, cancel):
 
 
 def job_lora_list(p: dict, emit, cancel):
-    emit({"t": "info", "library": _lora_entries()})
+    emit({"t": "info", "library": _lora_entries(), "civitai_key": bool(_civitai_token())})
 
 
 def job_lora_set(p: dict, emit, cancel):
@@ -4884,7 +4891,8 @@ def job_lora_add(p: dict, emit, cancel):
                                "role": role, "always_on": False}
             added.append({"file": final.name, "family": fam})
         _lora_lib_write(lib)
-        COMFY.stop()                                     # so the next job's ComfyUI sees the new file
+        if not QUEUE.busy():                             # never under a picture or video that is being drawn
+            COMFY.stop()                                 # so the next job's ComfyUI sees the new file
         emit({"t": "info", "added": added, "warning": warn_out, "library": _lora_entries()})
 
 

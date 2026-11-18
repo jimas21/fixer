@@ -1,0 +1,61 @@
+# This repo is PUBLIC. Never commit signing material, keys or model weights.
+
+# Apple signing and API material
+*.p8
+*.p12
+*.cer
+*.certSigningRequest
+*.mobileprovision
+*.provisionprofile
+*.pem
+*.key
+AuthKey_*
+.env
+.env.*
+
+# Model weights are downloaded by the app on first use, never bundled
+*.mlmodel
+*.mlpackage
+*.mlmodelc
+*.safetensors
+*.zip
+
+# Generated at build time (XcodeGen regenerates the project)
+*.xcodeproj
+*.xcworkspace
+build/
+DerivedData/
+*.xcarchive
+*.ipa
+xcuserdata/
+.DS_Store
+.build/
+
+# Local notes
+.planning/
+.claude/
+HANDOFF.md
+research/
+.ux-research.md
+.ux-synthesis.md
+.redesign-plan.md
+__pycache__/
+*.pyc
+# This home's addresses and one-off pairing links: never public
+desktop/local.json
+local.json
+away-pair-link.txt
+# Never commit pictures, videos or audio: anything made or used in Fixer stays out of git (the app icon is the
+# one exception)
+*.png
+*.jpg
+*.jpeg
+*.heic
+*.webp
+*.gif
+*.mp4
+*.mov
+*.m4v
+*.wav
+*.mp3
+!Fixer/Assets.xcassets/AppIcon.appiconset/icon-1024.png

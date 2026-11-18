@@ -1,0 +1,44 @@
+name: Apple setup
+
+# Runs only the App Store Connect setup (bundle ID, app record check, internal TestFlight group that gets every
+# build) on a Linux runner: seconds, no Mac. The TestFlight workflow runs the same script before every build.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    if: ${{ vars.BUNDLE_ID != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      BUNDLE_ID: ${{ vars.BUNDLE_ID }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Write API key to a temp file
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: bash ci/write_key.sh
+      - name: Python tools
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet "pyjwt[crypto]"
+      - name: Apple setup
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: '"$RUNNER_TEMP/venv/bin/python" ci/asc_setup.py'
+      - name: Newest builds on Apple's side
+        if: always()
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: '"$RUNNER_TEMP/venv/bin/python" ci/asc_status.py'
+      - name: Remove API key file
+        if: always()
+        run: bash ci/cleanup.sh

@@ -1,0 +1,61 @@
+# XcodeGen project definition. CI runs `xcodegen generate`; the .xcodeproj is never committed.
+# DEVELOPMENT_TEAM and PRODUCT_BUNDLE_IDENTIFIER come from repo variables on the xcodebuild command line.
+name: Fixer
+options:
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+packages:
+  MLXSwiftLM:
+    url: https://github.com/ml-explore/mlx-swift-lm
+    exactVersion: 3.32.3
+  MLXSwift:
+    url: https://github.com/ml-explore/mlx-swift
+    from: 0.32.3
+  SwiftHuggingFace:
+    url: https://github.com/huggingface/swift-huggingface
+    from: 0.9.0
+  SwiftTransformers:
+    url: https://github.com/huggingface/swift-transformers
+    from: 1.3.0
+  StableDiffusion:
+    url: https://github.com/apple/ml-stable-diffusion
+    exactVersion: 1.1.1
+  ZIPFoundation:
+    url: https://github.com/weichsel/ZIPFoundation
+    from: 0.9.19
+targets:
+  Fixer:
+    type: application
+    platform: iOS
+    sources:
+      - path: Fixer
+    dependencies:
+      - package: MLXSwiftLM
+        product: MLXVLM
+      - package: MLXSwiftLM
+        product: MLXLMCommon
+      - package: MLXSwiftLM
+        product: MLXHuggingFace
+      - package: MLXSwift
+        product: MLX
+      - package: SwiftHuggingFace
+        product: HuggingFace
+      - package: SwiftTransformers
+        product: Tokenizers
+      - package: StableDiffusion
+        product: StableDiffusion
+      - package: ZIPFoundation
+        product: ZIPFoundation
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.REPLACE.fixer   # placeholder; CI overrides from vars.BUNDLE_ID
+        CODE_SIGN_STYLE: Automatic
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+        INFOPLIST_FILE: Config/Info.plist
+        GENERATE_INFOPLIST_FILE: "NO"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SWIFT_VERSION: "5.0"
+        CODE_SIGN_ENTITLEMENTS: Config/Fixer.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon

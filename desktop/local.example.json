@@ -1,0 +1,22 @@
+{
+  "_comment": "Copy to local.json beside fixer_desktop.py (never commit it): this home's addresses.",
+  "search_url": "http://192.0.2.20:8888",
+  "away_url": "https://fixer.example.org",
+  "_tuning_comment": "Optional knobs (numbers). Brain ones apply on its next start (Free memory restarts it), comfy_reserve_gb on ComfyUI's next start (so do comfy_cache_active_gb / comfy_cache_inactive_gb: how much free memory ComfyUI keeps while a picture is made / before it drops models it has cached). Text knobs (strings), live: qwen21_explicit_lora (add-on file name), qwen21_explicit_repo (its Hugging Face repo), qwen21_te (text reader file name).",
+  "brain_threads": 7,
+  "brain_ubatch": 1024,
+  "brain_ncmoe": -1,
+  "brain_mtp": 0,
+  "brain_moe_cache_mib": 0,
+  "brain_projector_on_card": 1,
+  "comfy_reserve_gb": 6.0,
+  "comfy_cache_active_gb": 3.0,
+  "comfy_cache_inactive_gb": 6.0,
+  "qwen21_explicit_strength": 1.0,
+  "qwen21_edit_resolution": 1024,
+  "enhance_wait_s": 240,
+  "video_ram_gb": 42,
+  "picture_ram_gb": 0,
+  "keep_minutes": 30,
+  "queue_max": 30
+}

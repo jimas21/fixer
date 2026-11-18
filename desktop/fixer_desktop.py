@@ -1,0 +1,5095 @@
+"""Fixer Desktop: the PC half of Fixer (chat with a bigger vision model, image make/edit on the GPU).
+
+Chat runs on llama.cpp (llama-server, bundled in ROOT/llama, bound to 127.0.0.1 only) with a GGUF build of the
+chosen model; it starts on the first chat and stays loaded. Non-GGUF chat models fall back to transformers.
+Images and video run on diffusers (video encoded to H.264 MP4 in memory with PyAV).
+
+Rules for this file (the owner's, 2026-11-16):
+  * Nothing about a request is ever written to disk: no uploads folder, no outputs folder, no content logs,
+    no history. Requests and results live in memory only and are dropped when the reply is sent.
+  * The owner's rules and settings live on the phone and travel with each request.
+  * Every request and every reply frame is AES-256-GCM encrypted with that phone's own key (pair.py).
+  * Models live in one folder with a size cap; when a new model would push it over, the least recently used
+    model is deleted first. The folder never grows past the cap.
+
+Protocol (version "fixer1"):
+  POST /v1/<op>   headers X-Fixer-Phone: <phone id>, X-Fixer-Time: <unix seconds>
+                  body    nonce(12) | ciphertext | tag(16) of a JSON object; AAD = "fixer1|<op>|<phone>|<time>"
+  reply           a stream of frames: uint32 big-endian length | nonce | ciphertext | tag,
+                  AAD = "<request AAD>|<frame number>", each a JSON object:
+                  {"t":"text","v":...} {"t":"progress","v":0..1} {"t":"status","v":...}
+                  {"t":"image","v":<base64 PNG>} {"t":"info",...} {"t":"error","v":...} {"t":"done"}
+  11-17 additions (all additive, protocol string unchanged):
+  queued          pictures, edits and videos line up. Requests carry "slot" (the place they come from: a new one
+                  replaces that place's unfinished job), "label" and "ack"; the first reply frame is
+                  {"t":"queued","id","position","kind","slot","label"}, result frames carry "n", a stopped job ends
+                  with {"t":"info","stopped":"<reason>"} + an error. Jobs keep going when the phone disconnects; a
+                  finished result is held in memory only, up to 30 min, for the phone to collect.
+  queue           POST /v1/queue {"action": list | watch | cancel | move | ack, ...}: the line, re-attach, cancel
+                  (ids or slot), reorder, acknowledge a collected result. Never waits for the card.
+  free_memory     stop everything and unload every model (ComfyUI, the chat model, the helper); reports the figures.
+  chat "caps":["queue"] adds the queue tools and a live note of the line to that chat turn.
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import collections
+import fnmatch
+import gc
+import inspect
+import io
+import json
+import re
+import logging
+import os
+import secrets
+import struct
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+ROOT = Path(os.environ.get("FIXER_HOME", r"C:\FixerDesktop"))
+MODELS = ROOT / "models"
+KEYS = ROOT / "keys.json"
+CAP_GB = float(os.environ.get("FIXER_MODEL_CAP_GB", "150"))   # 200 TEMPORARY (the owner, 11-16) during the ComfyUI move: old + new copies side by side; back to 150 once the old diffusers copies are deleted
+PORT = int(os.environ.get("FIXER_PORT", "8765"))
+HOST = os.environ.get("FIXER_HOST", "0.0.0.0")
+def _local_config() -> dict:
+    """local.json beside the server: this home's addresses (search server, away address). Kept out of the public
+    repo; see local.example.json."""
+    try:
+        return json.loads((Path(__file__).resolve().parent / "local.json").read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+LOCAL = _local_config()
+
+
+def _tune(key: str, default: float) -> float:
+    """11-17: knobs read fresh from local.json (beside the server, never in git), so they can be tuned without a
+    code change: brain args apply on the brain's next start, ComfyUI's on its next start, the rest at once."""
+    try:
+        return float(_local_config().get(key, os.environ.get("FIXER_" + key.upper(), default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _tune_text(key: str, default: str) -> str:
+    """Like _tune, for a string knob: local.json (read fresh), else the FIXER_<KEY> environment variable, else default."""
+    try:
+        v = _local_config().get(key, os.environ.get("FIXER_" + key.upper(), default))
+        return str(v) if v not in (None, "") else default
+    except Exception:                                    # noqa: BLE001
+        return default
+
+
+SEARCH_URL = os.environ.get("FIXER_SEARCH_URL") or LOCAL.get("search_url", "")   # SearXNG (LAN)
+IDLE_UNLOAD = float(os.environ.get("FIXER_IDLE_MINUTES", "20")) * 60   # give the GPU and RAM back after this
+
+# Must be set before huggingface_hub / transformers / diffusers are imported.
+os.environ["HF_HOME"] = str(MODELS)
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+os.environ["DISABLE_TELEMETRY"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# Hugging Face read token (for gated models): first of these that exists. `hf auth login` writes the last one.
+for _t in (ROOT / "hf_token", MODELS / "token", Path.home() / ".cache" / "huggingface" / "token"):
+    if _t.is_file() and not os.environ.get("HF_TOKEN"):
+        os.environ["HF_TOKEN"] = _t.read_text(encoding="utf-8").strip()
+
+from aiohttp import web  # noqa: E402
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # noqa: E402
+
+# Warnings only, to the console; never request content.
+logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("fixer")
+
+PROTOCOL = "fixer1"
+CLOCK_SKEW = 120          # seconds a request's timestamp may be off
+# Qwen3.6 27B, refusals removed with Heretic v2 (MPOA; 6/100 refusals vs 92, MMLU 85.6 vs 86.7). the owner 11-17: the 9B
+# softened adult requests and followed instructions loosely. Measured on the 5080 (11-17): Q4_K_M 16.6 GB spills
+# (10.6 tok/s); Q3_K_L 14.3 GB with the photo reader in RAM fits the card: 41 tok/s.
+# 11-17: Qwen3.6 35B-A3B (mixture of experts, Heretic, MTP head kept). Only ~3B parameters work per token, so the
+# expert weights live in system RAM (--cpu-moe) and only attention/shared parts sit on the card (~4-6 GB): ComfyUI
+# keeps the rest, and the chat answers while pictures are made.
+# 11-17 (slimmer lineup): the dense 27B is gone (its files were deleted); a phone that still asks for it gets the MoE brain.
+MOE_BRAIN = "llmfan46/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-GGUF"
+DENSE_BRAIN = "llmfan46/Qwen3.6-27B-uncensored-heretic-v2-GGUF"    # retired: only the alias below (and the checks) use it
+DEFAULT_BRAIN = MOE_BRAIN
+BRAIN_PINS = {MOE_BRAIN: ("q4_k_s", "bf16")}      # weights quant, projector: the files already downloaded
+_MOE_NAME = re.compile(r"\d+(\.\d+)?B-A\d+(\.\d+)?B", re.I)
+
+
+def _is_moe(repo: str | None) -> bool:
+    """A mixture-of-experts brain ("35B-A3B": 35B total, 3B active): its experts run from system RAM."""
+    return bool(repo) and (repo in BRAIN_PINS or bool(_MOE_NAME.search(repo)))
+
+
+PAUSED_TEXT = ("The chat is paused while your computer makes a video: it needs the memory for it. "
+               "It's back as soon as the video is done.")
+# Older phone builds send the original (safetensors) repo ids; run their GGUF builds on llama.cpp instead.
+BRAIN_ALIASES = {
+    DENSE_BRAIN: DEFAULT_BRAIN,                  # 11-17: removed from the lineup (files deleted)
+    "DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF": DEFAULT_BRAIN,   # 11-17 upgrade
+    "huihui-ai/Huihui-Qwen3-VL-8B-Instruct-abliterated": DEFAULT_BRAIN,
+    "Qwen/Qwen3-VL-8B-Instruct": "Qwen/Qwen3-VL-8B-Instruct-GGUF",
+}
+LLAMA_SERVER = ROOT / "llama" / "llama-server.exe"      # llama.cpp b12443, CUDA 13.5 build (README)
+GGUF_QUANTS = ("Q5_K_M", "Q4_K_M", "Q6_K", "Q8_0", "Q4_K_S", "Q3_K_L")       # preference order, within the budget below
+BRAIN_VRAM_GB = float(os.environ.get("FIXER_BRAIN_VRAM_GB", "15.5"))   # weights + vision projector
+BRAIN_CTX = int(os.environ.get("FIXER_BRAIN_CTX", "16384"))
+# Picture models that are a single retrained "transformer" file on top of a base diffusers model:
+# id -> (base repo, file in the id's repo, diffusers class).
+TRANSFORMER_SWAPS = {
+    # Z-Image Turbo retrained for explicit content (Apache-2.0, community; v2, 12.6 GB bf16).
+    "tewea/z_image_turbo_bf16_nsfw": ("Tongyi-MAI/Z-Image-Turbo", "z_image_turbo_bf16_nsfw_v2.safetensors",
+                                      "ZImageTransformer2DModel"),
+}
+DEFAULT_VIDEO = "yetter-ai/Wan2.2-TI2V-5B-Turbo-Diffusers"   # 4-step distill; 11-17: only used if already on disk
+MAX_BODY = 40 * 1024 * 1024
+
+
+class UserFacing(RuntimeError):
+    """An error whose message is written for the person using the app."""
+
+
+# ---------------------------------------------------------------- keys and crypto
+
+class Keys:
+    """keys.json: {"phones": {"<id>": {"name": "...", "key": "<base64url 32 bytes>", "expires": <unix, optional>}}}.
+    Re-read when it changes. A pairing with "expires" (a temporary one, made away from home) stops working then."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.mtime = None
+        self.keys: dict[str, bytes] = {}
+
+    def get(self, phone: str) -> bytes | None:
+        try:
+            m = self.path.stat().st_mtime
+        except FileNotFoundError:
+            self.keys, self.mtime = {}, None
+            return None
+        if m != self.mtime:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            self.keys = {pid: b64d(p["key"]) for pid, p in data.get("phones", {}).items()}
+            self.expires = {pid: float(p["expires"]) for pid, p in data.get("phones", {}).items() if p.get("expires")}
+            self.mtime = m
+        if time.time() > getattr(self, "expires", {}).get(phone, float("inf")):
+            return None
+        return self.keys.get(phone)
+
+
+def b64d(s: str) -> bytes:
+    s = s.replace("-", "+").replace("_", "/")
+    return base64.b64decode(s + "=" * (-len(s) % 4))
+
+
+def seal(key: bytes, data: bytes, aad: bytes) -> bytes:
+    nonce = os.urandom(12)
+    return nonce + AESGCM(key).encrypt(nonce, data, aad)
+
+
+def unseal(key: bytes, blob: bytes, aad: bytes) -> bytes:
+    if len(blob) < 28:
+        raise ValueError("short")
+    return AESGCM(key).decrypt(blob[:12], blob[12:], aad)
+
+
+class ReplayGuard:
+    """Remembers request nonces for the clock-skew window so a captured request can't be sent twice."""
+
+    def __init__(self):
+        self.seen: dict[bytes, float] = {}
+
+    def fresh(self, nonce: bytes) -> bool:
+        now = time.time()
+        if len(self.seen) > 2000:
+            self.seen = {n: t for n, t in self.seen.items() if now - t < 2 * CLOCK_SKEW}
+        if nonce in self.seen:
+            return False
+        self.seen[nonce] = now
+        return True
+
+
+# ---------------------------------------------------------------- model folder with a size cap
+
+BRAIN_FILES = ["*.json", "*.safetensors", "*.txt", "*.model", "*.jinja", "*.tiktoken"]
+IMAGE_FILES = ["model_index.json", "*/*.json", "*/*.safetensors", "*/*.txt", "*/*.model", "*/*.jinja"]
+
+
+def wanted(files: list[tuple[str, int]], patterns: list[str]) -> list[tuple[str, int]]:
+    picked = [(f, s) for f, s in files if any(fnmatch.fnmatch(f, p) for p in patterns)]
+    if patterns is IMAGE_FILES:
+        # Diffusers folders sometimes carry both full and half-precision copies; keep one.
+        names = {f for f, _ in picked}
+        def duplicate(f: str) -> bool:
+            if not f.endswith(".safetensors"):
+                return False
+            if ".fp32." in f:
+                return True
+            plain = not any(v in f for v in (".fp16.", ".bf16."))
+            return plain and (f.replace(".safetensors", ".fp16.safetensors") in names or
+                              f.replace(".safetensors", ".bf16.safetensors") in names)
+        picked = [(f, s) for f, s in picked if not duplicate(f)]
+    return picked
+
+
+def _complete(path: Path) -> bool:
+    """A local copy counts only if it has its weights: for a diffusers model, every part model_index.json lists
+    has a folder with files. (Reading just model_index.json, as the edit check does, leaves a snapshot holding
+    that one file; on 11-16 Chroma was then "found" locally and failed to load instead of downloading.)"""
+    idx = path / "model_index.json"
+    if idx.is_file():
+        try:
+            parts = [k for k, v in json.loads(idx.read_text(encoding="utf-8")).items()
+                     if isinstance(v, list) and len(v) == 2 and v[0] is not None]
+        except Exception:
+            return False
+        return all((path / k).is_dir() and any((path / k).iterdir()) for k in parts)
+    return any(path.iterdir())
+
+
+def ensure_model(repo: str, patterns: list[str], status, kind: str = "model") -> str:
+    """Downloads the files of `repo` matching `patterns` into the capped folder and returns its path."""
+    from huggingface_hub import HfApi, snapshot_download
+
+    try:
+        path = snapshot_download(repo, allow_patterns=patterns, local_files_only=True)
+        if _complete(Path(path)):
+            return path
+    except Exception:
+        pass
+    info = HfApi().model_info(repo, files_metadata=True)
+    files = wanted([(s.rfilename, s.size or 0) for s in info.siblings], patterns)
+    return ensure_files(repo, files, status, kind)
+
+
+def ensure_files(repo: str, files: list[tuple[str, int]], status, kind: str = "model") -> str:
+    """Downloads exactly `files` [(name, size)] of `repo` into the capped folder (evicting least-recently-used
+    models first) and returns the snapshot path."""
+    from huggingface_hub import scan_cache_dir, snapshot_download
+
+    names = [f for f, _ in files]
+    try:
+        path = snapshot_download(repo, allow_patterns=names, local_files_only=True)
+        if all((Path(path) / n).is_file() for n in names):
+            return path
+    except Exception:
+        pass
+    need = sum(s for _, s in files)
+    cap = int(CAP_GB * 1024 ** 3)
+    if need > cap:
+        raise UserFacing(f"This model is too large ({need / 1024 ** 3:.0f} GB; the limit is {CAP_GB:.0f} GB).")
+    MODELS.mkdir(parents=True, exist_ok=True)
+    # No automatic removal: on 11-16 the oldest-used rule deleted the edit model (FLUX.2 klein 9B, 35 GB), the chat
+    # model and the tools to fit a 6.6 GB download. The owner removes models himself (phone: press and hold a model
+    # marked "On your computer").
+    try:
+        cache = scan_cache_dir(MODELS / "hub")
+        here = sum(r.size_on_disk for r in cache.repos if r.repo_id == repo)
+        used = cache.size_on_disk - here
+    except Exception:
+        used = 0
+    if used + need > cap:
+        def gb(b):
+            return max(1, round(b / 1024 ** 3))
+        raise UserFacing(f"Not enough room on your computer for this {kind}: it needs {gb(need)} GB and "
+                         f"{gb(max(0, cap - used))} of {CAP_GB:.0f} GB are free. Remove a model first: in the model "
+                         f"list, press and hold one marked “On your computer”.")
+    status(f"Downloading {kind} ({max(1, round(need / 1024 ** 3))} GB)…")
+    return snapshot_download(repo, allow_patterns=names)
+
+
+# ---------------------------------------------------------------- chat on llama.cpp
+
+_GGUF_PICK: dict[str, tuple | None] = {}
+
+
+def _cached_files(repo: str) -> list[tuple[str, int]]:
+    snaps = MODELS / "hub" / ("models--" + repo.replace("/", "--")) / "snapshots"
+    out = []
+    for snap in snaps.glob("*"):
+        for f in snap.rglob("*.gguf"):
+            out.append((f.relative_to(snap).as_posix(), f.stat().st_size))
+    return out
+
+
+def gguf_choice(repo: str):
+    """For a GGUF repo: (files to download, weights file, vision projector or None). None for other repos."""
+    if repo in _GGUF_PICK:
+        return _GGUF_PICK[repo]
+    from huggingface_hub import HfApi
+    try:
+        info = HfApi().model_info(repo, files_metadata=True)
+        files = [(x.rfilename, x.size or 0) for x in info.siblings]
+    except Exception:
+        files = _cached_files(repo)          # offline: whatever is already on disk
+        if not files:
+            raise
+    ggufs = [(f, z) for f, z in files if f.lower().endswith(".gguf") and "-of-0" not in f]
+    if not ggufs:
+        _GGUF_PICK[repo] = None
+        return None
+    projs = [(f, z) for f, z in ggufs if "mmproj" in f.lower()]
+    weights = [(f, z) for f, z in ggufs if "mmproj" not in f.lower()]
+    proj = None
+    for want in ("q8_0", "f16", "bf16"):
+        proj = proj or next((x for x in projs if want in x[0].lower()), None)
+    proj = proj or (min(projs, key=lambda x: x[1]) if projs else None)
+    pin = BRAIN_PINS.get(repo)
+    if pin:
+        # 11-17: the MoE file (19 GB) is bigger than the card budget below, which would fall through to the smallest
+        # quant and download it; the pinned weights and projector are the files already downloaded.
+        pinned = next((x for x in weights if pin[0] in x[0].lower()), None)
+        proj = next((x for x in projs if pin[1] in x[0].lower()), proj)
+        if pinned:
+            choice = ([pinned] + ([proj] if proj else []), pinned[0], proj[0] if proj else None)
+            _GGUF_PICK[repo] = choice
+            return choice
+    if _is_moe(repo):
+        budget = _tune("brain_moe_budget_gb", 24) * 1e9      # experts live in RAM: the card budget doesn't apply
+    else:
+        budget = BRAIN_VRAM_GB * 1e9
+    budget -= (proj[1] if proj else 0)
+    pick = None
+    for q in GGUF_QUANTS:
+        pick = pick or next((x for x in weights if q.lower() in x[0].lower() and x[1] <= budget), None)
+    pick = pick or min(weights, key=lambda x: x[1])
+    choice = ([pick] + ([proj] if proj else []), pick[0], proj[0] if proj else None)
+    _GGUF_PICK[repo] = choice
+    return choice
+
+
+class _KillWithMe:
+    """A Windows job object: child processes in it die when this server exits, however it exits, so a
+    llama-server can never be left holding graphics memory."""
+
+    def __init__(self):
+        self.h = None
+        if sys.platform != "win32":
+            return
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.windll.kernel32
+        k32.CreateJobObjectW.restype = ctypes.c_void_p
+        k32.SetInformationJobObject.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        k32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
+        class Basic(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_longlong), ("PerJobUserTimeLimit", ctypes.c_longlong),
+                        ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                        ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                        ("SchedulingClass", wintypes.DWORD)]
+
+        class Extended(ctypes.Structure):
+            _fields_ = [("BasicLimitInformation", Basic), ("IoInfo", ctypes.c_ulonglong * 6),
+                        ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                        ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        h = k32.CreateJobObjectW(None, None)
+        info = Extended()
+        info.BasicLimitInformation.LimitFlags = 0x2000          # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if h and k32.SetInformationJobObject(h, 9, ctypes.byref(info), ctypes.sizeof(info)):
+            self.h = h
+        self._k32 = k32
+
+    def add(self, proc: subprocess.Popen):
+        if self.h:
+            self._k32.AssignProcessToJobObject(self.h, int(proc._handle))
+
+
+_JOB = _KillWithMe()
+
+
+def _free_port() -> int:
+    import socket
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+class LlamaBrain:
+    """The chat model on llama.cpp's server, listening on 127.0.0.1 only. Started on the first chat and kept
+    running (it loads in seconds and holds ~7 GB of graphics memory); restarted when the phone picks another
+    model. No logs, no web UI, no saved slots: llama-server writes nothing to disk."""
+
+    def __init__(self):
+        self.proc: subprocess.Popen | None = None
+        self.port: int | None = None
+        self.repo: str | None = None
+        self.vision = False
+        self.on_gpu = True
+        self.lock = threading.RLock()
+        self.moe = False                     # 11-17: running as the mixture-of-experts brain (experts in RAM)
+        self.paused_for: str | None = None   # "video": the brain was stopped to give a video the memory
+        self.resume_wanted = False
+        self.starting = False
+        self.card_gb = 0.0                   # measured card share (display only)
+
+    def running(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def ensure(self, repo: str, choice, status) -> int:
+        """Starts (or keeps) the server for `repo`; returns its port."""
+        with self.lock:
+            if self.paused_for:
+                raise UserFacing(PAUSED_TEXT)            # chat during a video that took the memory
+            moe = _is_moe(repo)
+            gpu = moe or not VIDEO_BUSY.is_set()         # the MoE never moves to RAM-only for a video: it keeps its share
+            if self.running() and self.repo == repo and (self.on_gpu == gpu or not gpu):
+                return self.port
+            self._start(repo, choice, status, gpu)
+            return self.port
+
+    def _start(self, repo: str, choice, status, gpu: bool = True):
+        self._stop()
+        self.starting = True
+        try:
+            files, weights, proj = choice
+            path = Path(ensure_files(repo, files, status))
+            status("Loading model…")
+            port = _free_port()
+            moe = _is_moe(repo) and gpu
+            args = _llama_args(repo, path, weights, proj, gpu, port)
+            if gpu and not moe and "COMFY" in globals():
+                COMFY.free()          # dense only: the MoE fits beside ComfyUI (ComfyUI starts with --reserve-vram)
+            try:
+                before = _gpu_info()[1] if gpu else 0.0
+            except Exception:                            # noqa: BLE001
+                before = 0.0
+            self.proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            _JOB.add(self.proc)
+            import urllib.error
+            import urllib.request
+            deadline = time.time() + 300
+            while time.time() < deadline:
+                if self.proc.poll() is not None:
+                    self.proc = None
+                    raise UserFacing("The model couldn't start. Try another model.")
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as r:
+                        if r.status == 200:
+                            break
+                except (urllib.error.URLError, OSError):
+                    pass
+                time.sleep(0.25)
+            else:
+                self.stop()
+                raise UserFacing("The model took too long to start.")
+            self.port, self.repo, self.vision, self.on_gpu = port, repo, bool(proj), gpu
+            self.moe = moe
+            try:
+                self.card_gb = max(0.0, before - _gpu_info()[1]) if gpu else 0.0
+            except Exception:                            # noqa: BLE001
+                self.card_gb = 0.0
+        finally:
+            self.starting = False
+
+    def stop(self):
+        with self.lock:
+            self._stop()
+
+    def _stop(self):
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(10)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        self.proc = None
+        self.port = self.repo = None
+        self.vision = False
+        self.moe = False
+        self.card_gb = 0.0                   # (paused_for is NOT cleared here)
+
+    def pause(self, why: str, status) -> None:
+        """11-17: a job that needs the RAM the experts hold (a video): stop the brain and refuse chats until resume()."""
+        with self.lock:
+            # back-to-back videos: the first pause already stopped it; keep "bring it back afterwards"
+            self.resume_wanted = self.resume_wanted or self.running()
+            self._stop()
+            self.paused_for = why
+        status("Pausing the chat for this video: your computer needs the memory. It comes back when the video is done.")
+
+    def resume(self) -> None:
+        """Lifts the pause; restarts the brain only if it was running before (an idle brain stays off)."""
+        with self.lock:
+            if not self.paused_for:
+                return
+            self.paused_for = None
+            again, self.resume_wanted = self.resume_wanted, False
+        if again:
+            choice = gguf_choice(LAST_BRAIN)
+            if choice is not None:
+                _quietly(lambda: self.ensure(LAST_BRAIN, choice, lambda s: None))
+
+    def state(self) -> str:
+        return "paused" if self.paused_for else "loading" if self.starting else "ready" if self.running() else "off"
+
+
+def _llama_args(repo: str, path: Path, weights: str, proj: str | None, gpu: bool, port: int) -> list[str]:
+    """The llama-server command line (split out so it can be checked without starting anything)."""
+    args = [str(LLAMA_SERVER), "-m", str(path / weights), "--host", "127.0.0.1", "--port", str(port),
+            "-fa", "on", "-c", str(BRAIN_CTX), "-ctk", "q8_0", "-ctv", "q8_0", "-np", "1",
+            "--no-webui", "--log-disable", "--jinja"]
+    moe = _is_moe(repo) and gpu
+    if moe:
+        # 11-17: experts in RAM, the rest on the card. --fit stays on (it fills only what is unset: if ComfyUI holds
+        # more of the card than expected, fewer layers go up instead of the start failing).
+        n = int(_tune("brain_ncmoe", -1))
+        args += ["--fit", "on", *(["--cpu-moe"] if n < 0 else ["--n-cpu-moe", str(n)]),
+                 "-t", str(int(_tune("brain_threads", 7))), "-b", "2048", "-ub", str(int(_tune("brain_ubatch", 1024)))]
+        if _tune("brain_mtp", 0) >= 1:
+            args += ["--spec-type", "draft-mtp"]
+        if _tune("brain_moe_cache_mib", 0) > 0:
+            args += ["--moe-cache-mib", str(int(_tune("brain_moe_cache_mib", 0)))]
+    else:
+        args += ["--fit", "on"] if gpu else ["-ngl", "0"]       # unchanged dense behaviour
+    if proj:
+        args += ["--mmproj", str(path / proj)]
+        if not moe and (not gpu or (path / weights).stat().st_size > 10 * 1024 ** 3):
+            args += ["--no-mmproj-offload"]        # dense-27B rule only: a big model needs the whole card (19.5 -> 41 tok/s)
+        if moe and _tune("brain_projector_on_card", 1) < 1:
+            args += ["--no-mmproj-offload"]
+    if not gpu:
+        args += ["--device", "none", "--no-op-offload"]   # not one byte on the card
+    return args
+
+
+LLAMA = LlamaBrain()
+VIDEO_BUSY = threading.Event()      # set while a video renders: the chat model must not take graphics memory
+
+
+def _data_uri(b64: str) -> str:
+    head = b64[:8]
+    if head.startswith("/9j/"):
+        return "data:image/jpeg;base64," + b64
+    if head.startswith("iVBOR"):
+        return "data:image/png;base64," + b64
+    img = _image_in(b64)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=90)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def _chat_llama_once(p: dict, emit, cancel, port: int):
+    import http.client
+    msgs: list[dict] = []
+    if p.get("instructions"):
+        msgs.append({"role": "system", "content": p["instructions"]})
+    for m in p.get("messages", []):
+        role = "assistant" if m.get("role") == "assistant" else "user"
+        text = m.get("text", "")
+        if m.get("image") and role == "user" and LLAMA.vision:
+            msgs.append({"role": role, "content": [{"type": "image_url", "image_url": {"url": _data_uri(m["image"])}},
+                                                   {"type": "text", "text": text}]})
+        else:
+            msgs.append({"role": role, "content": text})
+    think = bool(p.get("think", False))
+    last = next((m.get("text", "") for m in reversed(p.get("messages", [])) if m.get("role") != "assistant"), "")
+    if think and "\n\nMy message: " in last:
+        # A photo turn (the phone puts the photo tools before "My message:"): the brain only routes the change, so
+        # Think adds nothing but wait. 11-17: 40 s of thought on "More realistic please", then no answer at all.
+        think = False
+    temp = 0.6 if think else float(p.get("temperature", 0.7))      # Qwen3.6 card: thinking wants 0.6 / top_p 0.95
+    # Qwen's settings for chat without thinking (model cards): top_p 0.8, top_k 20. Thinking is off unless the phone
+    # asks for it: a thinking model (Qwen3.5) otherwise spends seconds to tens of seconds reasoning invisibly
+    # before every reply, and the reasoning counts against max_tokens (it could cut the picture JSON short).
+    # With Think on (11-17) the reasoning streams to the phone as "thought" frames and gets its own token room.
+    body = {"messages": msgs, "stream": True, "max_tokens": int(p.get("max_tokens", 1500)) + (8000 if think else 0),
+            "temperature": temp, "top_p": 0.95 if think else float(p.get("top_p", 0.8)), "top_k": int(p.get("top_k", 20)),
+            "presence_penalty": float(p.get("presence_penalty", 1.5)),   # Qwen3.6 card, non-thinking chat
+            "cache_prompt": True, "chat_template_kwargs": {"enable_thinking": think}}
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=600)
+    said = False
+    try:
+        conn.request("POST", "/v1/chat/completions", body=json.dumps(body),
+                     headers={"Content-Type": "application/json"})
+        r = conn.getresponse()
+        if r.status != 200:
+            try:
+                msg = json.loads(r.read()).get("error", {}).get("message", "")
+            except Exception:
+                msg = ""
+            if "context" in msg.lower():
+                raise UserFacing("This conversation is too long for the model. Start a new chat.")
+            raise UserFacing("The model couldn't answer that. Try again.")
+        thinking = said = False
+        for raw in r:
+            if cancel.is_set():
+                break                                   # closing the connection stops the generation
+            line = raw.strip()
+            if not line.startswith(b"data:"):
+                continue
+            data = line[5:].strip()
+            if data == b"[DONE]":
+                break
+            obj = json.loads(data)
+            if isinstance(obj.get("timings"), dict) and obj["timings"].get("predicted_per_second"):
+                LAST_SPEED["tok_s"] = round(float(obj["timings"]["predicted_per_second"]), 1)   # for the "models" look-up
+            d = ((obj.get("choices") or [{}])[0] or {}).get("delta", {})
+            if d.get("reasoning_content") and think:
+                emit({"t": "thought", "v": d["reasoning_content"]})
+            delta = d.get("content")
+            # A model that writes <think>...</think> inline: that part goes to the phone as thought (Think on) or
+            # is hidden (Think off).
+            out = ""
+            while delta:
+                if thinking:
+                    if "</think>" in delta:
+                        inner, delta = delta.split("</think>", 1)
+                        thinking = False
+                    else:
+                        inner, delta = delta, ""
+                    if think and inner:
+                        emit({"t": "thought", "v": inner})
+                elif "<think>" in delta:
+                    pre, delta = delta.split("<think>", 1)
+                    out, thinking = out + pre, True
+                else:
+                    out, delta = out + delta, ""
+            if out and not said:
+                out = out.lstrip()                     # no blank lines left behind by hidden thinking
+            if out:
+                said = True
+                emit({"t": "text", "v": out})
+    except (ConnectionError, http.client.HTTPException, OSError) as e:
+        if isinstance(e, UserFacing):
+            raise
+        if not LLAMA.running():
+            LLAMA.stop()
+            raise UserFacing("The model stopped unexpectedly. Try again.")
+        raise
+    finally:
+        conn.close()
+    if think and not said and not cancel.is_set():
+        # It thought and then said nothing (the phone was left showing "…"): answer again, without thinking.
+        _chat_llama_once({**p, "think": False}, emit, cancel, port)
+
+
+# ---------------------------------------------------------------- the GPU: one model loaded at a time
+
+class Engine:
+    """The brain and the image model stay loaded side by side: the brain (4-bit, ~6 GB) lives on the graphics card,
+    the image model waits in RAM and moves to the card one part at a time while it draws. Swapping them for each
+    other reread tens of GB from disk on every switch between chat and images. Both unload after the idle time."""
+
+    def __init__(self):
+        self.brain_repo: str | None = None
+        self.model = None
+        self.processor = None
+        self.image_repo: str | None = None
+        self.pipes: dict[str, object] = {}
+        self.active = None                      # the pipe that holds the offload hooks
+        self.video_repo: str | None = None
+        self.vpipes: dict[str, object] = {}
+        self.vactive = None
+        self.tools: dict[str, object] = {}       # small single-job models: cut-out, upscaler (under 1 GB each)
+
+    @property
+    def kind(self) -> bool:
+        """Something that the idle timer should unload (the llama.cpp chat model stays)."""
+        return bool(self.brain_repo or self.image_repo or self.video_repo or self.tools or _worker_alive())
+
+    @property
+    def repo(self) -> str | None:
+        names = [r for r in (LLAMA.repo, self.brain_repo, self.image_repo, self.video_repo, _worker_loaded()) if r]
+        return " + ".join(names) or None
+
+    def unload_brain(self):
+        self.model = self.processor = None
+        self.brain_repo = None
+        _free()
+
+    def unload_image(self):
+        for p in self.pipes.values():
+            try:
+                p.remove_all_hooks()
+            except Exception:
+                pass
+        self.pipes = {}
+        self.active = None
+        self.image_repo = None
+        _free()
+
+    def unload_video(self):
+        for p in self.vpipes.values():
+            try:
+                p.remove_all_hooks()
+            except Exception:
+                pass
+        self.vpipes = {}
+        self.vactive = None
+        self.video_repo = None
+        _free()
+
+    def unload(self):
+        self.unload_brain()
+        self.unload_image()
+        self.unload_video()
+        self.unload_tools()
+        if "WORKER" in globals():
+            WORKER.stop()
+
+    def unload_tools(self):
+        self.tools = {}
+        _free()
+
+    def tool(self, repo: str, files: list[str], status, kind: str, load):
+        """A small model, loaded once and kept on the card until the idle unload."""
+        if repo not in self.tools:
+            path = ensure_model(repo, files, status, kind)
+            self.tools[repo] = load(path)
+        return self.tools[repo]
+
+    # -- video
+
+    def video(self, repo: str, mode: str, status):
+        """mode: "t2v" (from a description) or "i2v" (animates a photo)."""
+        import torch
+        from diffusers import DiffusionPipeline
+        if self.video_repo != repo:
+            self.unload_video()
+            path = ensure_model(repo, IMAGE_FILES, status, "video model")
+            status("Loading video model…")
+            kw = {"torch_dtype": torch.bfloat16}
+            # The text reader stays full precision: a 4-bit UMT5 lost parts of prompts ("waves", "sunset") on 11-16.
+            big = _big_components(path)
+            if big:
+                from diffusers.quantizers import PipelineQuantizationConfig
+                kw["quantization_config"] = PipelineQuantizationConfig(
+                    quant_backend="bitsandbytes_4bit", components_to_quantize=big,
+                    quant_kwargs={"load_in_4bit": True, "bnb_4bit_quant_type": "nf4",
+                                  "bnb_4bit_compute_dtype": torch.bfloat16})
+            base = DiffusionPipeline.from_pretrained(path, **kw)
+            if base.__class__.__name__.startswith("Wan") and "turbo" in repo.lower():
+                from diffusers import UniPCMultistepScheduler      # what the 4-step distill was trained with
+                base.scheduler = UniPCMultistepScheduler.from_config(base.scheduler.config, flow_shift=5.0)
+            if hasattr(base, "vae") and hasattr(base.vae, "enable_tiling"):
+                base.vae.enable_tiling()
+            # Weights stored in FP8, computed in bf16 (the usual 16 GB-card setup): the 5B transformer drops from
+            # ~10 GB to ~5 GB, which is what lets the model run at its trained 1280x704 (832x448 came out cooked).
+            tr = getattr(base, "transformer", None)
+            if tr is not None and hasattr(tr, "enable_layerwise_casting") and not big:
+                tr.enable_layerwise_casting(storage_dtype=torch.float8_e4m3fn, compute_dtype=torch.bfloat16)
+            self.vpipes = {"t2v": base}
+            self.video_repo = repo
+            if "image" in _call_params(base):
+                self.vpipes["i2v"] = base
+        if mode not in self.vpipes:
+            import diffusers
+            twin = {"WanPipeline": "WanImageToVideoPipeline", "LTXPipeline": "LTXImageToVideoPipeline"}
+            name = twin.get(self.vpipes["t2v"].__class__.__name__)
+            if not name:
+                raise UserFacing("This video model can't animate photos. Choose another one.")
+            t2v = self.vpipes["t2v"]
+            if name == "WanImageToVideoPipeline":
+                # Built from the same parts, NOT with from_pipe: from_pipe moved every part onto the graphics card
+                # at once (14 GB) and photo-to-video always ran out of memory on 11-16.
+                t2v.remove_all_hooks()
+                self.vactive = None
+                self.vpipes[mode] = diffusers.WanImageToVideoPipeline(
+                    tokenizer=t2v.tokenizer, text_encoder=t2v.text_encoder, vae=t2v.vae, scheduler=t2v.scheduler,
+                    transformer=t2v.transformer, transformer_2=getattr(t2v, "transformer_2", None),
+                    boundary_ratio=t2v.config.get("boundary_ratio"),
+                    expand_timesteps=bool(t2v.config.get("expand_timesteps", False)))
+            else:
+                self.vpipes[mode] = getattr(diffusers, name).from_pipe(t2v)
+        pipe = self.vpipes[mode]
+        if self.vactive is not pipe:
+            for other in self.vpipes.values():
+                if other is not pipe:
+                    other.remove_all_hooks()
+            pipe.enable_model_cpu_offload()
+            self.vactive = pipe
+        return pipe
+
+    # -- chat
+
+    def brain(self, repo: str, status):
+        if self.brain_repo == repo:
+            return self.model, self.processor
+        self.unload_brain()
+        import torch
+        from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
+        path = ensure_model(repo, BRAIN_FILES, status)
+        status("Loading model…")
+        cfg = json.loads((Path(path) / "config.json").read_text(encoding="utf-8"))
+        kw = {"dtype": torch.bfloat16, "device_map": "cuda:0"}
+        if "quantization_config" not in cfg and _params_billion(path) > 5:
+            kw["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True)
+        self.model = AutoModelForImageTextToText.from_pretrained(path, **kw).eval()
+        self.processor = AutoProcessor.from_pretrained(path)
+        self.brain_repo = repo
+        return self.model, self.processor
+
+    # -- images
+
+    def pipe(self, repo: str, mode: str, status):
+        """mode: "make" (text to image) or "edit" (takes a starting image)."""
+        import torch
+        from diffusers import AutoPipelineForImage2Image, DiffusionPipeline
+        if self.image_repo != repo:
+            self.unload_image()
+            overlay = TRANSFORMER_SWAPS.get(repo)
+            path = ensure_model(overlay[0] if overlay else repo, IMAGE_FILES, status, "image model")
+            kw = {"torch_dtype": torch.bfloat16}
+            if overlay:
+                # A community retrain of the picture part only: the rest comes from the base model already here.
+                base_repo, filename, cls_name = overlay
+                from huggingface_hub import HfApi
+                size = next((s.size or 0 for s in HfApi().model_info(repo, files_metadata=True).siblings
+                             if s.rfilename == filename), 0)
+                swap_dir = ensure_files(repo, [(filename, size)], status, "image model add-on")
+                status("Loading image model…")
+                import diffusers
+                tr = getattr(diffusers, cls_name).from_single_file(str(Path(swap_dir) / filename),
+                                                                   torch_dtype=torch.bfloat16)
+                # 8-bit storage (computed in bf16): near-lossless, and it fits the 16 GB card with room to spare.
+                tr.enable_layerwise_casting(storage_dtype=torch.float8_e4m3fn, compute_dtype=torch.bfloat16)
+                kw["transformer"] = tr
+            status("Loading image model…")
+            big = [c for c in _big_components(path) if not (overlay and c == "transformer")]
+            if big:
+                # Parts too big for the graphics card are squeezed to 4-bit as they load (files stay as they are).
+                from diffusers.quantizers import PipelineQuantizationConfig
+                kw["quantization_config"] = PipelineQuantizationConfig(
+                    quant_backend="bitsandbytes_4bit", components_to_quantize=big,
+                    quant_kwargs={"load_in_4bit": True, "bnb_4bit_quant_type": "nf4",
+                                  "bnb_4bit_compute_dtype": torch.bfloat16})
+            base = DiffusionPipeline.from_pretrained(path, **kw)
+            self.pipes = {"make": base}
+            self.image_repo = repo
+            if "image" in _call_params(base):
+                self.pipes["edit"] = base              # edits natively (Kontext, Qwen-Image-Edit…)
+        if mode not in self.pipes:
+            try:
+                self.pipes[mode] = AutoPipelineForImage2Image.from_pipe(self.pipes["make"])
+            except Exception as e:
+                raise UserFacing("This image model can't edit photos. Choose another one.") from e
+        pipe = self.pipes[mode]
+        if self.active is not pipe:
+            for other in self.pipes.values():
+                if other is not pipe:
+                    other.remove_all_hooks()
+            pipe.enable_model_cpu_offload()
+            self.active = pipe
+        return pipe
+
+
+def _worker_alive() -> bool:
+    return "WORKER" in globals() and WORKER.alive
+
+
+def _worker_loaded() -> str | None:
+    return WORKER.loaded if "WORKER" in globals() and WORKER.alive else None
+
+
+def _free():
+    gc.collect()
+    if "torch" in sys.modules:                         # never start the graphics card just to free nothing
+        sys.modules["torch"].cuda.empty_cache()
+
+
+def _cap_vram(margin_gb: float = 0.5):
+    """Lets this process use only the graphics memory that is really free. On Windows the driver otherwise spills an
+    overfull card into system RAM without an error and the job crawls (minutes instead of seconds); with the cap it
+    fails at once with out-of-memory, which the jobs handle by freeing the chat model and trying again."""
+    import torch
+    free, total = _card_free()
+    usable = torch.cuda.memory_reserved() + free - int(margin_gb * 1024 ** 3)
+    torch.cuda.set_per_process_memory_fraction(max(0.2, min(1.0, usable / total)))
+
+
+def _card_free() -> tuple[int, int]:
+    """Free and total graphics memory in bytes: the smaller of torch's and the driver's (nvidia-smi) figure.
+    On Windows torch's figure alone ran high: on 11-16 a video kept the chat model's 7.4 GB beside it, the cap let it
+    grow, and 6.2 GB spilled into system RAM (the job crawled for minutes; the phone just spun)."""
+    import torch
+    free, total = torch.cuda.mem_get_info()
+    _, smi_free_gb, smi_total_gb = _gpu_info()
+    if smi_total_gb > 0:
+        free = min(free, int(smi_free_gb * 1024 ** 3))
+    return free, total
+
+
+PICTURE_NEEDS = float(os.environ.get("FIXER_PICTURE_NEEDS_GB", "8")) * 1024 ** 3   # free card memory a picture wants
+VRAM_PART_LIMIT = float(os.environ.get("FIXER_VRAM_PART_GB", "11")) * 1024 ** 3
+
+
+def _big_components(path: str) -> list[str]:
+    """Pipeline parts whose weights won't fit on the card next to the rest at bf16."""
+    out = []
+    for d in Path(path).iterdir():
+        if d.is_dir() and d.name in ("transformer", "text_encoder", "text_encoder_2", "unet"):
+            if sum(f.stat().st_size for f in d.glob("*.safetensors")) > VRAM_PART_LIMIT:
+                out.append(d.name)
+    return out
+
+
+def _params_billion(path: str) -> float:
+    total = sum(f.stat().st_size for f in Path(path).glob("*.safetensors"))
+    return total / 2e9
+
+
+def _call_params(pipe) -> set[str]:
+    return set(inspect.signature(pipe.__call__).parameters)
+
+
+ENGINE = Engine()
+
+
+# ---------------------------------------------------------------- heavy jobs run in a helper process
+
+WORKER_OPS = {"image", "video", "cutout", "upscale", "warm"}
+
+
+class _RemoteLlama:
+    """Inside the helper: what the jobs need to know about the chat model, which lives in the server process.
+    stop() asks the server to stop it (to free graphics memory) and waits until it has."""
+
+    repo = None
+    vision = False
+
+    def __init__(self, send, acks):
+        self._send, self._acks = send, acks
+        self._running, self.on_gpu, self.moe = False, False, False
+
+    def running(self) -> bool:
+        return self._running
+
+    def stop(self):
+        if self._running:
+            self._send(("ctl", "stop_llama"))
+            self._acks.get(timeout=60)
+        self._running = False
+
+
+def _worker_main(inbox, outbox):
+    """The helper process. Pictures, video, cut-out and upscale load their models here, so ending this process gives
+    every byte of RAM and graphics memory back to Windows (Python keeps freed memory for itself otherwise: the
+    server once held 41 GB after "unloading", and Windows paged it to disk)."""
+    import queue
+    global LLAMA
+    lower_priority()
+    lock = threading.Lock()
+
+    def send(m):
+        with lock:
+            outbox.send(m)
+
+    acks: queue.Queue = queue.Queue()
+    LLAMA = _RemoteLlama(send, acks)
+    cancel = threading.Event()
+    job = None
+
+    def run(op, payload):
+        try:
+            JOBS[op](payload, lambda obj: send(("frame", obj)), cancel)
+            send(("done", ENGINE.repo))
+        except BaseException as e:                       # noqa: BLE001 - everything goes back to the server
+            send(("error", e.__class__.__name__, str(e)[:500], isinstance(e, UserFacing), ENGINE.repo))
+
+    while True:
+        try:
+            msg = inbox.recv()
+        except (EOFError, OSError):
+            return
+        if msg[0] == "job":
+            _, op, payload, llama = msg
+            LLAMA._running, LLAMA.on_gpu, LLAMA.moe = llama
+            cancel.clear()
+            job = threading.Thread(target=run, args=(op, payload), daemon=True)
+            job.start()
+        elif msg[0] == "cancel":
+            cancel.set()
+        elif msg[0] == "ack":
+            acks.put(True)
+
+
+class Worker:
+    """The server's side of the helper process: starts it on the first heavy job, forwards jobs and their frames,
+    and ends it to unload (or after a job fails on memory, so nothing stays stuck on the graphics card)."""
+
+    def __init__(self):
+        self.proc = None
+        self.to_worker = self.from_worker = None
+        self.loaded: str | None = None
+
+    @property
+    def alive(self) -> bool:
+        return self.proc is not None and self.proc.is_alive()
+
+    def _start(self):
+        import multiprocessing as mp
+        ctx = mp.get_context("spawn")
+        recv_in, send_in = ctx.Pipe(duplex=False)        # server -> helper
+        recv_out, send_out = ctx.Pipe(duplex=False)      # helper -> server
+        self.proc = ctx.Process(target=_worker_main, args=(recv_in, send_out), daemon=True, name="fixer-worker")
+        self.proc.start()
+        recv_in.close()
+        send_out.close()
+        self.to_worker, self.from_worker = send_in, recv_out
+        self.loaded = None
+
+    def stop(self):
+        if self.proc is not None:
+            try:
+                self.proc.kill()
+                self.proc.join(10)
+            except Exception:
+                pass
+        for c in (self.to_worker, self.from_worker):
+            try:
+                if c is not None:
+                    c.close()
+            except Exception:
+                pass
+        self.proc = self.to_worker = self.from_worker = None
+        self.loaded = None
+        self.family = None
+
+    def run(self, op: str, payload: dict, emit, cancel):
+        # Pictures and video each hold 20-30 GB in RAM. Python never hands freed memory back, so switching from one
+        # to the other inside the same helper piled up to 51 GB on 11-16. A fresh helper per switch costs nothing
+        # extra: the new model has to load either way.
+        family = "video" if op == "video" else "image" if op in ("image", "warm") else None
+        if family and self.alive and getattr(self, "family", None) not in (None, family):
+            self.stop()
+        if not self.alive:
+            self.stop()
+            emit({"t": "status", "v": "Starting the image engine…"})
+            self._start()
+        if family:
+            self.family = family
+        cancelled = False
+        try:
+            self.to_worker.send(("job", op, payload, (LLAMA.running(), getattr(LLAMA, "on_gpu", True),
+                                                     getattr(LLAMA, "moe", False))))
+            while True:
+                if self.from_worker is None or self.to_worker is None:   # stopped meanwhile ("forget" or unload)
+                    raise UserFacing("Stopped: the work on your computer was cleared.")
+                if cancel.is_set() and not cancelled:
+                    self.to_worker.send(("cancel",))
+                    cancelled = True
+                if not self.from_worker.poll(0.2):
+                    if not self.alive:
+                        raise UserFacing("The image engine on your computer stopped. Try again.")
+                    continue
+                msg = self.from_worker.recv()
+                kind = msg[0]
+                if kind == "frame":
+                    emit(msg[1])
+                elif kind == "ctl" and msg[1] == "stop_llama":
+                    LLAMA.stop()
+                    self.to_worker.send(("ack",))
+                elif kind == "done":
+                    self.loaded = msg[1]
+                    return
+                elif kind == "error":
+                    _, name, text, user_facing, loaded = msg
+                    self.loaded = loaded
+                    if user_facing:
+                        raise UserFacing(text)
+                    if "OutOfMemory" in name or "out of memory" in text.lower():
+                        self.stop()                      # a failed big job leaves memory behind: start clean next time
+                    raise type(name, (RuntimeError,), {})(text)
+        except (EOFError, BrokenPipeError, ConnectionResetError, OSError) as e:
+            self.stop()
+            raise UserFacing("The image engine on your computer stopped. Try again.") from e
+
+
+WORKER = Worker()
+
+
+# ---------------------------------------------------------------- jobs
+
+def _image_in(b64: str):
+    from PIL import Image, ImageOps
+    img = Image.open(io.BytesIO(base64.b64decode(b64)))
+    img = ImageOps.exif_transpose(img).convert("RGB")
+    return img
+
+
+def _fit(w: int, h: int, longest: int) -> tuple[int, int]:
+    s = min(1.0, longest / max(w, h))
+    return max(256, int(w * s) // 16 * 16), max(256, int(h * s) // 16 * 16)
+
+
+def _gpu_info() -> tuple[str, float, float]:
+    """Card name, free and total GB, from the driver (no torch here: that alone takes ~0.5 GB of the card)."""
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.free,memory.total", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=10,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout.splitlines()[0]
+        name, free, total = [x.strip() for x in out.split(",")]
+        return name, float(free) / 1024, float(total) / 1024
+    except Exception:
+        return "graphics card", 0.0, 0.0
+
+
+def _ram() -> tuple[float, float]:
+    """System memory Windows can hand out now (standby included) and the total, in GB. ctypes only (no psutil)."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+            st = MEMORYSTATUSEX()
+            st.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+                return 0.0, 0.0
+            return st.ullAvailPhys / 1024 ** 3, st.ullTotalPhys / 1024 ** 3
+        page = os.sysconf("SC_PAGE_SIZE")
+        return os.sysconf("SC_AVPHYS_PAGES") * page / 1024 ** 3, os.sysconf("SC_PHYS_PAGES") * page / 1024 ** 3
+    except Exception:                                    # noqa: BLE001
+        return 0.0, 0.0
+
+
+_CARD_CACHE: list = [0.0, ("graphics card", 0.0, 0.0)]
+
+
+def _card_cached(max_age: float = 2.0) -> tuple[str, float, float]:
+    """_gpu_info() at most every 2 s (the Queue screen polls; nvidia-smi takes ~0.1-0.3 s). Call off the event loop."""
+    now = time.monotonic()
+    if now - _CARD_CACHE[0] > max_age:
+        _CARD_CACHE[1] = _gpu_info()
+        _CARD_CACHE[0] = now
+    return _CARD_CACHE[1]
+
+
+def _figures() -> dict:
+    """How full the graphics card and the computer's memory are (GB, one decimal). Off the event loop only."""
+    name, free, total = _card_cached()
+    rfree, rtotal = _ram()
+    return {"card": {"name": name, "used_gb": round(max(0.0, total - free), 1), "total_gb": round(total, 1)},
+            "memory": {"used_gb": round(max(0.0, rtotal - rfree), 1), "total_gb": round(rtotal, 1)}}
+
+
+def job_status(p: dict, emit, cancel):
+    from huggingface_hub import scan_cache_dir
+    try:
+        cache = scan_cache_dir(MODELS / "hub")
+        used, repos = cache.size_on_disk, sorted(r.repo_id for r in cache.repos)
+        # Only models that are really there (a model_index.json fetched by the edit check is not a model).
+        sizes = {r.repo_id: r.size_on_disk for r in cache.repos if r.size_on_disk > 50 * 1024 ** 2}
+    except Exception:
+        used, repos, sizes = 0, [], {}
+    for alias, real in BRAIN_ALIASES.items():          # the phone may know a chat model by its alias
+        if real in sizes:
+            sizes[alias] = sizes[real]
+    for phone_id, rid in COMFY_RECIPES.items():        # picture models live as ComfyUI files under other names
+        r = CREATE_RECIPES.get(rid)
+        if phone_id not in sizes and r and _recipe_ready(r):
+            sizes[phone_id] = sum(sizes.get(n, 0) for n in r["needs"]) or 1
+    if WAN14_REPO in sizes and WAN_TE_REPO in sizes:
+        sizes[WAN14_REPO] += sizes[WAN_TE_REPO]
+    name, free_gb, total_gb = _gpu_info()
+    ram_free, ram_total = _ram()
+    emit({"t": "info", "gpu": name, "vram_free_gb": round(free_gb, 1),
+          "vram_total_gb": round(total_gb, 1), "loaded": ENGINE.repo, "models": repos, "model_sizes": sizes,
+          "models_gb": round(used / 1024 ** 3, 1), "cap_gb": CAP_GB, "protocol": PROTOCOL,
+          "ram_free_gb": round(ram_free, 1), "ram_total_gb": round(ram_total, 1),
+          "queue_waiting": len(QUEUE.waiting()), "queue_running": 1 if QUEUE.busy() else 0})
+
+
+def job_remove_model(p: dict, emit, cancel):
+    """Deletes one downloaded model from the capped folder (the phone's "Remove from PC"). Runs as a job in the line
+    (first), so nothing is using the card; if it's loaded it is unloaded first. Picking it again later downloads it again."""
+    from huggingface_hub import scan_cache_dir
+    repo = BRAIN_ALIASES.get(p.get("model") or "", p.get("model") or "")
+    cache = scan_cache_dir(MODELS / "hub")
+    hit = next((r for r in cache.repos if r.repo_id == repo), None)
+    if hit is None:
+        raise UserFacing("That model isn't on your computer.")
+    if LLAMA.repo == repo:
+        LLAMA.stop()
+    if repo in (ENGINE.repo or ""):
+        ENGINE.unload()                                # also ends the helper process
+    cache.delete_revisions(*[rev.commit_hash for rev in hit.revisions]).execute()
+    left = scan_cache_dir(MODELS / "hub").size_on_disk
+    emit({"t": "info", "removed": repo, "freed_gb": round(hit.size_on_disk / 1024 ** 3, 1),
+          "models_gb": round(left / 1024 ** 3, 1), "cap_gb": CAP_GB})
+
+
+_OLD_DEFAULT_PERSONALITY_START = "You are Fixer, my photo-and-everything assistant."
+# 11-17: the owner "hated the way he says who he is" and wanted "a personal assistant to take care of anything I
+# need, or some cool shit". Both texts are live-tunable in phone_config.json (default_personality, about_identity).
+NEW_DEFAULT_PERSONALITY = (
+    "You're Fixer, my personal assistant: whatever I throw at you, you handle it. Easygoing, sharp, a little cocky "
+    "in the good way, like the friend who just gets things done. Talk like a person: short, direct, some swagger, a "
+    "dry joke when it fits, never corporate and never stiff. Answer what I asked first, at the length it deserves: "
+    "a line for simple things, more when it matters. Use lists or steps only when they help. Don't pad, don't "
+    "repeat the question back, don't close with a menu of things you could do, and don't talk about yourself, your "
+    "tools or how you work unless I ask. Give real opinions when asked, say when you're unsure, and match my mood.")
+# Every default the phone has shipped (its Rules.swift text). The server swaps any of them for the live one, so the
+# owner gets a new default without an app update; text he wrote himself never matches and is never touched.
+_PREVIOUS_DEFAULT_PERSONALITY = (
+    "You're a helpful, thoughtful assistant. Talk naturally, like a smart friend: warm, direct and clear. Answer what "
+    "was asked first, at the length it deserves: brief for simple things, thorough when it matters. Use lists or "
+    "steps only when they help. Don't pad, don't repeat the question back, don't end by listing things you could do, "
+    "and don't talk about yourself, your tools or how you work unless asked. Give real opinions when asked, say "
+    "when you're unsure, and match my tone.")
+ABOUT_IDENTITY_DEFAULT = (
+    "Who you are: Fixer, the owner's personal assistant. You take care of whatever he needs: answers, plans, "
+    "writing, research, photos, new pictures, video, and running the work on his computer. You're confident and "
+    "laid-back with a bit of swagger, quick and sharp, and you never sound corporate or like a help desk. If he asks "
+    "who you are, say so in a sentence or two in your own voice, then get on with it. Never bring up where you run, "
+    "how messages travel, privacy, encryption, clouds or hardware unless he asks about exactly that, and then use "
+    "the look-up tool for the real details.")
+LOOKUP_TOOLS_DEFAULT = "\n".join([
+    "You can look things up. When I ask for specifics about the models you use (which ones, files, sizes, speed, what",
+    "is loaded right now), about my computer (graphics card, memory, storage, versions, what's running) or about my",
+    "phone, never guess and never recite from memory: reply with ONE JSON object and nothing else:",
+    "{\"tool\": \"lookup\", \"what\": [\"models\", \"computer\", \"phone\", \"jobs\"]}   (list only what the question needs)",
+    "models = every chat, picture, edit and video model and what's loaded now; computer = the PC's hardware and",
+    "software; phone = my phone's model, iOS, storage and battery; jobs = the work lined up on the computer.",
+    "The facts come back as the next message. Then answer from them in plain words, with the exact figures and as",
+    "much detail as I asked for. Don't mention the look-up itself.",
+])
+_ABOUT_BLOCK = re.compile(r"About you \((?:facts|only when asked).*?(?:\n\n|\Z)", re.S)
+
+
+def _phone_cfg() -> dict:
+    try:
+        return json.loads(PHONE_CONFIG.read_text(encoding="utf-8"))
+    except Exception:                                    # noqa: BLE001
+        return {}
+
+
+def _identity_text() -> str:
+    return (_phone_cfg().get("about_identity") or ABOUT_IDENTITY_DEFAULT).strip()
+
+
+def _without_meta(p: dict) -> dict:
+    """The phone attaches an "About you" block (where it runs, the encryption...) to every turn, and models recited it
+    ("I'm an AI assistant running directly on your home computer...", the owner 11-17: "I hate the way he says who
+    he is"). The server swaps that block for the live identity text, and swaps any shipped default personality for
+    the live default; his own written personality is left alone."""
+    text = p.get("instructions") or ""
+    live = (_phone_cfg().get("default_personality") or NEW_DEFAULT_PERSONALITY).strip()
+    if live == _PREVIOUS_DEFAULT_PERSONALITY.strip():
+        live = NEW_DEFAULT_PERSONALITY      # a live file still holding the old shipped text counts as unset
+    if text.startswith(_OLD_DEFAULT_PERSONALITY_START):
+        # The first shipped default steered every chat toward pictures; it ran to the first blank line.
+        end = text.find("\n\n")
+        text = live + (text[end:] if end >= 0 else "")
+    else:
+        for shipped in (_PREVIOUS_DEFAULT_PERSONALITY, NEW_DEFAULT_PERSONALITY):
+            if shipped != live and text.startswith(shipped):
+                text = live + text[len(shipped):]
+                break
+    ident = _identity_text()
+    if _ABOUT_BLOCK.search(text):
+        text = _ABOUT_BLOCK.sub(lambda m: ident + "\n\n", text, count=1)
+    else:
+        text = (text + "\n\n" + ident) if text.strip() else ident
+    text = text.strip()
+    return p if text == (p.get("instructions") or "") else {**p, "instructions": text}
+
+
+LAST_BRAIN = DEFAULT_BRAIN        # the chat model the phone last used; an app-open warm-up loads this one
+LAST_SPEED: dict = {}             # the brain's last measured speed (tok/s), kept in memory only
+
+
+# ---------------------------------------------------------------- the look-up tool (11-17)
+# The brain answers {"tool": "lookup", "what": [...]}; the PC gathers the facts live (nothing stored), adds them as a
+# message and the brain answers again. The JSON never reaches the phone: text that starts like a look-up is held back.
+
+LOOKUP_ROUNDS = 2
+LOOKUP_FAIL_TEXT = "I couldn't pull that up just now. Ask me again in a moment."
+_LOOKUP_HEAD = '{"tool":"lookup"'
+_TOPIC_WORDS = {"model": "models", "models": "models", "brain": "models", "ai": "models", "llm": "models",
+                "computer": "computer", "pc": "computer", "gpu": "computer", "hardware": "computer",
+                "system": "computer", "desktop": "computer", "machine": "computer",
+                "phone": "phone", "iphone": "phone", "device": "phone",
+                "job": "jobs", "jobs": "jobs", "queue": "jobs", "line": "jobs"}
+
+
+def _lookup_topics(what) -> list[str]:
+    items = [what] if isinstance(what, str) else list(what) if isinstance(what, (list, tuple)) else []
+    out: list[str] = []
+    for w in items:
+        t = _TOPIC_WORDS.get(str(w).strip().lower())
+        if t and t not in out:
+            out.append(t)
+    return out or ["models", "computer", "phone", "jobs"]
+
+
+def _parse_lookup(raw: str) -> dict | None:
+    """The look-up request in `raw`, or None when it isn't one."""
+    s = (raw or "").strip()
+    try:
+        obj = json.loads(s)
+    except ValueError:
+        try:
+            obj, _ = json.JSONDecoder().raw_decode(s)
+        except ValueError:
+            return None
+    if isinstance(obj, dict) and str(obj.get("tool", "")).lower() == "lookup":
+        return {"what": _lookup_topics(obj.get("what"))}
+    return None
+
+
+class _LookupGate:
+    """Sits between the model's stream and the phone. Text that starts with {"tool": "lookup" is held back until the
+    reply ends; any other text (plain answers, photo and queue JSON) is released as soon as it can't be one, in the
+    same pieces as before. Other frames (status, thought) pass straight through."""
+
+    def __init__(self, emit, allow: bool = True):
+        self.emit, self.allow = emit, allow
+        self.buf = ""
+        self.mode: str | None = None          # None = undecided, "pass", "hold"
+        self.raw = ""                         # what a held reply said
+
+    def frame(self, f: dict):
+        if f.get("t") != "text":
+            self.emit(f)
+            return
+        v = f.get("v") or ""
+        if self.mode == "pass":
+            self.emit(f)
+            return
+        self.buf += v
+        if self.mode is None:
+            s = self.buf.lstrip()
+            if not s:
+                return
+            if not s.startswith("{"):
+                self._release()
+                return
+            compact = re.sub(r"\s+", "", s)
+            if compact.startswith(_LOOKUP_HEAD):
+                self.mode = "hold"
+            elif not _LOOKUP_HEAD.startswith(compact):
+                self._release()
+
+    def _release(self):
+        self.mode = "pass"
+        b, self.buf = self.buf, ""
+        if b:
+            self.emit({"t": "text", "v": b})
+
+    def finish(self) -> dict | None:
+        """Call when the reply is over: the look-up it asked for, or None (anything held is then released)."""
+        if self.mode == "hold":
+            self.raw, self.buf = self.buf, ""
+            req = _parse_lookup(self.raw) if self.allow else None
+            if req is None:
+                self.emit({"t": "text", "v": LOOKUP_FAIL_TEXT})
+            return req
+        if self.mode is None and self.buf.strip():
+            self._release()
+        return None
+
+
+def _lookup_message(facts: str) -> str:
+    return ("(Look-up result, added automatically, not part of my message. Answer my question from it in plain words "
+            "with the exact figures, no JSON, and don't mention the look-up.)\n" + facts)
+
+
+def _chat_llama(p: dict, emit, cancel, port: int):
+    """One answer, with up to LOOKUP_ROUNDS look-ups on the way (each: the brain asks, the PC gathers, it answers again)."""
+    msgs = list(p.get("messages") or [])
+    for rnd in range(LOOKUP_ROUNDS + 1):
+        gate = _LookupGate(emit, allow=rnd < LOOKUP_ROUNDS)
+        _chat_llama_once({**p, "messages": msgs}, gate.frame, cancel, port)
+        req = gate.finish()
+        if req is None or cancel.is_set():
+            return
+        emit({"t": "status", "v": "Looking that up…"})
+        try:
+            facts = lookup_facts(req["what"], p)
+        except Exception:                                # noqa: BLE001
+            facts = "The look-up failed; say so briefly and don't guess."
+        msgs = msgs + [{"role": "assistant", "text": gate.raw.strip()},
+                       {"role": "user", "text": _lookup_message(facts)}]
+
+
+def _run_text(args: list[str], timeout: float = 8) -> str:
+    """A command's output as text ("" on any failure). Its own function so the checks can fake it."""
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return ((r.stdout or "") + (r.stderr or "")).strip()
+    except Exception:                                    # noqa: BLE001
+        return ""
+
+
+def _safe(fn) -> bool:
+    try:
+        return bool(fn())
+    except Exception:                                    # noqa: BLE001
+        return False
+
+
+def _gb(n: float) -> str:
+    return f"{n / 1024 ** 3:.1f} GB"
+
+
+def _tree_size(path: Path | None) -> int:
+    if path is None or not path.exists():
+        return 0
+    total = 0
+    for f in path.rglob("*"):
+        try:
+            if f.is_file():
+                total += f.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def _proc_ram_gb(pid: int | None) -> float | None:
+    """Working-set memory of one process in GB (Windows, ctypes only)."""
+    if not pid or sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+
+        class PMC(ctypes.Structure):
+            _fields_ = [("cb", ctypes.c_ulong), ("PageFaultCount", ctypes.c_ulong),
+                        ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                        ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
+
+        k = ctypes.windll.kernel32
+        k.OpenProcess.restype = ctypes.c_void_p
+        h = k.OpenProcess(0x1000, False, int(pid))
+        if not h:
+            return None
+        try:
+            pmc = PMC()
+            pmc.cb = ctypes.sizeof(PMC)
+            if not k.K32GetProcessMemoryInfo(ctypes.c_void_p(h), ctypes.byref(pmc), pmc.cb):
+                return None
+            return pmc.WorkingSetSize / 1024 ** 3
+        finally:
+            k.CloseHandle(ctypes.c_void_p(h))
+    except Exception:                                    # noqa: BLE001
+        return None
+
+
+def _card_by_process() -> dict[int, float]:
+    """pid -> graphics memory in GB, for what the driver reports (empty when it won't say per process)."""
+    out: dict[int, float] = {}
+    for line in _run_text(["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"]).splitlines():
+        try:
+            pid, mb = [x.strip() for x in line.split(",")[:2]]
+            out[int(pid)] = float(mb) / 1024
+        except ValueError:
+            continue
+    return out
+
+
+def _models_facts() -> str:
+    L: list[str] = []
+    by_pid = _card_by_process()
+
+    def share(pid) -> str:
+        bits = []
+        if pid and pid in by_pid:
+            bits.append(f"{by_pid[pid]:.1f} GB on the card")
+        ram = _proc_ram_gb(pid)
+        if ram is not None:
+            bits.append(f"{ram:.1f} GB in memory")
+        return ", ".join(bits)
+
+    # chat brain
+    repo = LLAMA.repo if LLAMA.running() else None
+    shown = repo or LAST_BRAIN
+    L.append("CHAT BRAIN")
+    choice = _GGUF_PICK.get(shown)
+    files = dict(_cached_files(shown)) if shown else {}
+    wfile = choice[1] if choice else next((f for f in files if "mmproj" not in f.lower()), None)
+    pfile = choice[2] if choice else next((f for f in files if "mmproj" in f.lower()), None)
+    qm = re.search(r"(IQ\d_\w+|Q\d_K_\w+|Q\d_\d|Q\d_K|BF16|F16)", wfile or "", re.I)
+    L.append(f"- model: {shown}")
+    if wfile:
+        L.append(f"- weights file: {wfile} ({_gb(files[wfile]) if wfile in files else 'size unknown'}, "
+                 f"quantisation {qm.group(1).upper() if qm else 'unknown'})")
+    if pfile:
+        L.append(f"- photo reader (vision projector): {pfile} ({_gb(files[pfile]) if pfile in files else 'size unknown'})")
+    L.append(f"- context window: {BRAIN_CTX} tokens, cache type q8_0")
+    if repo:
+        L.append(f"- state: {LLAMA.state()}; sees photos: {'yes' if LLAMA.vision else 'no'}; "
+                 f"{'mixture of experts, expert weights kept in system memory, the rest on the card' if LLAMA.moe else 'dense, whole model on the card' if LLAMA.on_gpu else 'running on the processor only'}")
+        sh = share(LLAMA.proc.pid if LLAMA.proc else None)
+        L.append(f"- holds: {sh or ('about %.1f GB on the card' % LLAMA.card_gb if LLAMA.card_gb else 'figures not available')}")
+    else:
+        L.append(f"- state: {LLAMA.state()} (not loaded right now)")
+    if LAST_SPEED.get("tok_s"):
+        L.append(f"- last measured speed: {LAST_SPEED['tok_s']} tokens per second")
+    else:
+        L.append("- measured speed: none yet this session")
+    # pictures and edits
+    L.append("PICTURE AND EDIT MODELS (recipes on this computer; ready = files are downloaded)")
+    for rid, r in CREATE_RECIPES.items():
+        try:
+            ready = _recipe_ready(r)
+        except Exception:                                # noqa: BLE001
+            ready = False
+        d = r.get("defaults", {})
+        size = sum(_tree_size(_snapshot(n)) for n in r.get("needs", []))
+        L.append(f"- {r['name']} (id {rid}, {'ready' if ready else 'NOT downloaded'}): repos {', '.join(r.get('needs', []))}"
+                 f"{'; file ' + r['file'][1] if r.get('file') else ''}; {d.get('steps', '?')} steps, guidance {d.get('cfg', '?')}, "
+                 f"sampler {d.get('sampler', '?')}; all its parts {_gb(size)} on disk (some parts are shared with other recipes); {r.get('note', '')}")
+    lora = _qwen21_lora()
+    L.append(f"- photo edits: Qwen-Image-Edit 2511 Lightning ({QWEN_EDIT_REPO}, 4 steps) for ordinary edits; "
+             f"Qwen-Rapid-AIO NSFW ({QWEN_AIO_REPO}/{QWEN_AIO_DIR}) for explicit ones; text reader and VAE from {QWEN_BASE_REPO}. "
+             f"On this computer: {'switched on' if QWEN_EDIT_ON else 'switched off'}. {QWEN21_NAME} also edits when chosen "
+             f"(the same model as its pictures, so nothing reloads between a picture and its edit): "
+             f"{'ready' if _safe(_qwen21_ready) else 'not all downloaded'}")
+    L.append(f"- explicit add-on for {QWEN21_NAME}: {_tune_text('qwen21_explicit_lora', QWEN21_LORA_FILE)} "
+             f"({'on this computer' if lora else 'not downloaded'}"
+             f"{', strength %g' % lora[1] if lora else ''}); loaded only when asked for, never changes your words")
+    L.extend(_measured_speed_facts())
+    L.append("VIDEO")
+    L.append(f"- Wan 2.2 14B image-to-video, 4-step Lightning, fp8 ({WAN14_REPO}), text reader from {WAN_TE_REPO}, "
+             f"{WAN14_AREA} pixels per frame at {WAN14_FPS} fps; explicit-motion add-on {WAN_EXPLICIT_REPO}; "
+             f"files {'downloaded' if _safe(_wan14_ready) else 'not all downloaded'}; fallback {DEFAULT_VIDEO}")
+    L.append("TOOLS")
+    L.append(f"- cut-out: {CUT_GENERAL} (objects) and {CUT_SOFT} (people, fur, hair); upscaler: {UPSCALER[0]} / {UPSCALER[1]}, "
+             f"longest side up to {UPSCALE_MAX}px")
+    # loaded now
+    L.append("LOADED RIGHT NOW")
+    L.append(f"- chat brain: {'yes' if repo else 'no'}")
+    comfy = COMFY.running()
+    cs = share(COMFY.proc.pid) if comfy and COMFY.proc else ""
+    L.append(f"- picture/video engine (ComfyUI): {'running' if comfy else 'not running'}{': ' + cs if cs else ''}"
+             f"{'; models stay loaded until idle unload' if comfy else ''}")
+    other = ENGINE.repo if ENGINE.repo and ENGINE.repo != LLAMA.repo else None
+    wrk = _worker_loaded()
+    L.append(f"- helper process: {wrk or 'none loaded'}{'; other: ' + other if other and other != wrk else ''}")
+    f = _figures()
+    L.append(f"- graphics card in use overall: {f['card']['used_gb']} of {f['card']['total_gb']} GB; "
+             f"computer memory in use: {f['memory']['used_gb']} of {f['memory']['total_gb']} GB")
+    try:
+        from huggingface_hub import scan_cache_dir
+        L.append(f"- downloaded model folder: {_gb(scan_cache_dir(MODELS / 'hub').size_on_disk)} of the {CAP_GB:g} GB allowed")
+    except Exception:                                    # noqa: BLE001
+        L.append(f"- downloaded model folder: size not available (limit {CAP_GB:g} GB)")
+    return "\n".join(L)
+
+
+def _computer_facts() -> str:
+    import platform
+    import shutil
+    L = ["COMPUTER"]
+    name, free_gb, total_gb = _card_cached()
+    drv = _run_text(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"]).splitlines()
+    L.append(f"- graphics card: {name}{', driver ' + drv[0].strip() if drv else ''}; memory {max(0.0, total_gb - free_gb):.1f} of {total_gb:.1f} GB in use")
+    cpu = ""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as k:
+            cpu = winreg.QueryValueEx(k, "ProcessorNameString")[0].strip()
+    except Exception:                                    # noqa: BLE001
+        cpu = platform.processor()
+    L.append(f"- processor: {cpu or 'unknown'}, {os.cpu_count()} threads")
+    rfree, rtotal = _ram()
+    L.append(f"- memory: {max(0.0, rtotal - rfree):.1f} of {rtotal:.1f} GB in use ({rfree:.1f} GB available)")
+    try:
+        du = shutil.disk_usage(ROOT)
+        L.append(f"- disk holding Fixer's files: {_gb(du.free)} free of {_gb(du.total)}")
+    except OSError:
+        pass
+    L.append(f"- Windows: {platform.platform()} (build {platform.version()})")
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            ms = ctypes.windll.kernel32.GetTickCount64()
+            L.append(f"- up for {ms // 3600000} h {ms // 60000 % 60} min")
+    except Exception:                                    # noqa: BLE001
+        pass
+    ll = _run_text([str(LLAMA_SERVER), "--version"]) if LLAMA_SERVER.is_file() else ""
+    ll = next((x for x in ll.splitlines() if "version" in x.lower()), ll.splitlines()[0] if ll else "")
+    L.append(f"- llama.cpp (chat engine): {ll.strip() or 'version not available'}")
+    cv = ""
+    try:
+        m = re.search(r"__version__\s*=\s*['\"]([^'\"]+)", (COMFY_DIR / "comfyui_version.py").read_text(encoding="utf-8"))
+        cv = m.group(1) if m else ""
+    except Exception:                                    # noqa: BLE001
+        pass
+    L.append(f"- ComfyUI (picture and video engine): {cv or 'version not available'}; Python {platform.python_version()}")
+    run = []
+    if LLAMA.running():
+        run.append("chat brain")
+    if COMFY.running():
+        run.append("ComfyUI")
+    if _worker_alive():
+        run.append("helper process")
+    if VIDEO_BUSY.is_set():
+        run.append("a video render")
+    L.append(f"- running: {', '.join(run) or 'nothing of Fixer'}; chat state {LLAMA.state()}")
+    return "\n".join(L)
+
+
+def _phone_facts(device) -> str:
+    if not isinstance(device, dict) or not device:
+        return ("PHONE\n- This version of the app doesn't send phone details to the computer yet. Tell the owner "
+                "the next app update adds it.")
+    labels = [("model", "phone model"), ("ios", "iOS"), ("storage_free_gb", "free storage (GB)"),
+              ("storage_total_gb", "total storage (GB)"), ("battery", "battery level"),
+              ("battery_state", "battery state"), ("low_power", "low power mode"), ("app_version", "app version"),
+              ("app_build", "app build"), ("thermal", "temperature state")]
+    L = ["PHONE (sent by the app with this message)"]
+    seen = set()
+    for k, label in labels:
+        if k in device:
+            v = device[k]
+            if k == "battery" and isinstance(v, (int, float)) and 0 <= v <= 1:
+                v = f"{round(v * 100)}%"
+            L.append(f"- {label}: {v}")
+            seen.add(k)
+    for k, v in device.items():
+        if k not in seen:
+            L.append(f"- {k}: {v}")
+    return "\n".join(L)
+
+
+def _jobs_facts(p: dict) -> str:
+    note = _queue_note(p.get("_queue") or [], p.get("slot"), _figures, LLAMA.paused_for is not None)
+    out = "JOBS\n" + (note or "- nothing is running, waiting or finished on the computer")
+    recent = _recent_jobs_facts(10)
+    return out + ("\n" + "\n".join(recent) if recent else "")
+
+
+def lookup_facts(topics: list[str], p: dict) -> str:
+    """The facts for a look-up, gathered live and kept nowhere. A topic that fails says so instead of guessing."""
+    parts = []
+    for t in topics:
+        try:
+            parts.append(_models_facts() if t == "models" else _computer_facts() if t == "computer"
+                         else _phone_facts(p.get("device")) if t == "phone" else _jobs_facts(p))
+        except Exception:                                # noqa: BLE001
+            parts.append(t.upper() + "\n- couldn't be read right now")
+    return "\n\n".join(parts)
+
+
+def job_chat(p: dict, emit, cancel):
+    global LAST_BRAIN
+    p = _without_meta(p)
+    repo = p.get("model") or DEFAULT_BRAIN
+    repo = BRAIN_ALIASES.get(repo, repo)
+    LAST_BRAIN = repo
+    status = lambda s: emit({"t": "status", "v": s})  # noqa: E731
+    choice = gguf_choice(repo)
+    if LLAMA.paused_for and choice is not None:
+        eta = p.get("_eta_s")
+        emit({"t": "info", "brain_paused": LLAMA.paused_for, "eta_s": eta})
+        when = f"in about {max(1, round(eta / 60))} min" if eta else "in a few minutes"
+        raise UserFacing(PAUSED_TEXT[:-1] + f", {when}.")
+    if "queue" in (p.get("caps") or []):
+        p = _with_queue(p)
+    if choice is not None:
+        if ENGINE.brain_repo:
+            ENGINE.unload_brain()                      # a transformers fallback model, no longer needed
+        tools = _phone_cfg().get("lookup_tools") or LOOKUP_TOOLS_DEFAULT
+        p = {**p, "instructions": ((p.get("instructions") or "") + "\n\n" + tools).strip()}
+        port = LLAMA.ensure(repo, choice, status)
+        return _chat_llama(p, emit, cancel, port)
+    with TRANSFORMERS_CHAT:                            # the fallback shares the card with image jobs
+        _chat_transformers(repo, p, emit, cancel, status)
+
+
+QUEUE_TOOLS_DEFAULT = "\n".join([
+    "You can also manage the work on my computer: the pictures, photo edits and videos lined up or being made there.",
+    "When my message ends with a \"(Live status from my computer ...)\" note, it lists every job with its id; without a",
+    "note, nothing is running, waiting or finished there. If I ask to stop, cancel, drop, reorder, hurry or clear that",
+    "work, or to free the computer's memory, reply with ONE JSON object and nothing else:",
+    "{\"say\": \"one short sentence in your own voice on what you did\", \"actions\": [ ... ]}",
+    "Actions (as many as needed, in order):",
+    "{\"tool\": \"queue_cancel\", \"ids\": [\"a1b2c3\", ...]}   stop these jobs (running or waiting) or drop finished ones",
+    "{\"tool\": \"queue_move\", \"id\": \"a1b2c3\", \"to\": 1}    move a waiting job to that place in line (1 = next)",
+    "{\"tool\": \"stop_all\"}                                stop everything running or waiting on the computer",
+    "{\"tool\": \"free_memory\"}                             stop everything and unload every model from the computer's memory",
+    "Use only ids from the latest note. These can go in the same actions list as picture or video actions. Don't",
+    "mention the note, ids or memory figures unless I ask what's running or how busy the computer is.",
+])
+
+
+def _with_queue(p: dict) -> dict:
+    """11-17: the brain can manage the computer's line (cancel, reorder, stop, free memory). The tool text goes in
+    the system prompt (static, so llama's prompt cache keeps it); the live state goes at the END of my latest
+    message, so the cached conversation before it is reused (a changing system prompt would re-read all of it)."""
+    try:
+        tools = json.loads(PHONE_CONFIG.read_text(encoding="utf-8")).get("queue_tools") or QUEUE_TOOLS_DEFAULT
+    except Exception:                                    # noqa: BLE001
+        tools = QUEUE_TOOLS_DEFAULT
+    p = {**p, "instructions": ((p.get("instructions") or "") + "\n\n" + tools).strip()}
+    note = _queue_note(p.get("_queue") or [], p.get("slot"), _figures, LLAMA.paused_for is not None)
+    msgs = list(p.get("messages") or [])
+    if note and msgs and msgs[-1].get("role") != "assistant":
+        msgs[-1] = {**msgs[-1], "text": (msgs[-1].get("text") or "") + "\n\n" + note}
+        p["messages"] = msgs
+    return p
+
+
+_KIND_WORDS = {"picture": "picture", "pictures": "pictures", "edit": "photo edit", "change": "change", "video": "video",
+               "cutout": "cut-out", "upscale": "sharpen and enlarge", "remove": "removing a model"}
+
+
+def _queue_note(jobs: list[dict], slot: str | None, figures=None, paused: bool = False) -> str:
+    """Empty when nothing is running, waiting or held (the tool text says: no note = nothing there)."""
+    if not jobs:
+        return ""
+    lines = ["(Live status from my computer, added automatically, not part of my message:"]
+    for j in jobs:
+        js = j.get("slot") or ""
+        origin = ("from this chat" if slot and js == slot else "from another chat" if js.startswith("chat:")
+                  else "from Make" if js.startswith("make:") else "from the phone")
+        word = _KIND_WORDS.get(j.get("kind"), "job")
+        head = f'- job {j.get("id")}: {word} "{j.get("label") or ""}"'
+        st = j.get("state")
+        if st == "running":
+            bits = ["being made now"]
+            if j.get("progress") is not None:
+                bits.append(f"{round(j['progress'] * 100)}% done")
+            if j.get("eta_s"):
+                bits.append(f"about {max(1, round(j['eta_s'] / 60))} min left")
+            lines.append(f"{head}, {', '.join(bits)}, {origin}")
+        elif st == "waiting":
+            lines.append(f"{head}, waiting, {_ordinal(j.get('position') or 1)} in line, {origin}")
+        elif st == "ready":
+            lines.append(f"{head}, finished, waiting for my phone to collect it, {origin}")
+        else:
+            lines.append(f"{head}, didn't work")
+    try:
+        f = figures() if callable(figures) else (figures or {})
+    except Exception:                                    # noqa: BLE001
+        f = {}
+    card, mem = f.get("card"), f.get("memory")
+    tail = []
+    if card:
+        tail.append(f"Graphics card memory: {card['used_gb']} of {card['total_gb']} GB in use.")
+    if mem:
+        tail.append(f"Computer memory: {mem['used_gb']} of {mem['total_gb']} GB in use.")
+    tail.append(f"The chat is paused: {'yes' if paused else 'no'}.")
+    lines.append(" ".join(tail) + ")")
+    return "\n".join(lines)
+
+
+TRANSFORMERS_CHAT = threading.Lock()
+
+
+def _chat_transformers(repo: str, p: dict, emit, cancel, status):
+    """Fallback for chat models without a GGUF build."""
+    import torch
+    from transformers import StoppingCriteria, StoppingCriteriaList, TextIteratorStreamer
+
+    LLAMA.stop()
+    model, processor = ENGINE.brain(repo, status)
+    msgs = []
+    if p.get("instructions"):
+        msgs.append({"role": "system", "content": [{"type": "text", "text": p["instructions"]}]})
+    for m in p.get("messages", []):
+        content = []
+        if m.get("image"):
+            img = _image_in(m["image"])
+            img.thumbnail((1280, 1280))
+            content.append({"type": "image", "image": img})
+        content.append({"type": "text", "text": m.get("text", "")})
+        msgs.append({"role": "assistant" if m.get("role") == "assistant" else "user", "content": content})
+    inputs = processor.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True, return_dict=True,
+                                           return_tensors="pt").to(model.device)
+
+    class Stop(StoppingCriteria):
+        def __call__(self, *a, **k):
+            return cancel.is_set()
+
+    streamer = TextIteratorStreamer(processor.tokenizer, skip_prompt=True, skip_special_tokens=True)
+    temp = float(p.get("temperature", 0.6))
+    kw = dict(**inputs, streamer=streamer, max_new_tokens=int(p.get("max_tokens", 1500)),
+              stopping_criteria=StoppingCriteriaList([Stop()]), do_sample=temp > 0)
+    if temp > 0:
+        kw.update(temperature=temp, top_p=0.95)
+    failure: list[BaseException] = []
+
+    def run():
+        try:
+            with torch.inference_mode():
+                model.generate(**kw)
+        except BaseException as e:   # surfaced after the stream ends
+            failure.append(e)
+            streamer.end()
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    for piece in streamer:
+        if piece:
+            emit({"t": "text", "v": piece})
+    t.join()
+    del inputs, kw
+    if failure:
+        raise failure[0]
+
+
+def _local_complete(repo: str | None) -> bool:
+    """11-17 (slimmer lineup): the helper path only runs models that are already on this computer. It never downloads
+    (the old default, FLUX.2 klein, was removed, and nothing may fetch a removed model again)."""
+    if not repo:
+        return False
+    snap = _snapshot(TRANSFORMER_SWAPS.get(repo, (repo,))[0])
+    return bool(snap is not None and _complete(snap) and (repo not in TRANSFORMER_SWAPS or _snapshot(repo) is not None))
+
+
+NO_ENGINE_PICTURES = "Pictures need the picture engine on your computer, and it isn't running."
+NO_ENGINE_VIDEOS = "Videos need the picture engine on your computer, and it isn't running."
+
+
+def job_image(p: dict, emit, cancel):
+    import torch
+    mode = "edit" if p.get("image") else "make"
+    repo = p.get("model")
+    status = lambda s: emit({"t": "status", "v": s})  # noqa: E731
+    if not _local_complete(repo):
+        raise UserFacing(NO_ENGINE_PICTURES)            # only reached when ComfyUI can't run; never downloads
+    if ENGINE.video_repo:
+        ENGINE.unload_video()
+    pipe = ENGINE.pipe(repo, mode, status)
+    params = _call_params(pipe)
+    if mode == "edit" and "image" not in params:
+        raise UserFacing(NO_ENGINE_PICTURES)            # a make-only model can't follow an edit
+    steps = max(1, int(p.get("steps", 4)))
+    guidance = p.get("guidance")
+    family = TRANSFORMER_SWAPS.get(repo, (repo,))[0].lower()   # an add-on uses its base model's settings
+    if "z-image-turbo" in family:
+        steps, guidance = 9, 0.0                       # model card: 9 steps (8 model passes), no guidance
+    elif "chroma1-hd" in family:
+        steps, guidance = 40, 3.0                      # model card: 40 steps, guidance 3
+        if not p.get("negative"):                      # the card's quality-only negative (nothing about content)
+            p = {**p, "negative": "low quality, ugly, unfinished, out of focus, deformed, disfigure, blurry, "
+                                  "smudged, restricted palette, flat colors"}
+    elif pipe.__class__.__name__ == "StableDiffusionXLPipeline":
+        # An SDXL-family pipeline: the community's standard settings.
+        steps, guidance = 30, 4.5
+        if pipe.scheduler.__class__.__name__ != "DPMSolverMultistepScheduler":
+            from diffusers import DPMSolverMultistepScheduler     # "DPM++ 2M Karras"
+            pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config, use_karras_sigmas=True)
+        if not p.get("negative"):                      # quality-only (nothing about content)
+            p = {**p, "negative": "lowres, low quality, worst quality, blurry, jpeg artifacts, deformed, bad anatomy, "
+                                  "extra fingers, watermark, text, signature"}
+    seed = int(p.get("seed") or int.from_bytes(os.urandom(4), "big"))
+    kw: dict = {"prompt": p.get("prompt") or "high quality photo", "num_inference_steps": steps,
+                "generator": torch.Generator("cpu").manual_seed(seed)}
+    if guidance is not None and "guidance_scale" in params:
+        kw["guidance_scale"] = float(guidance)
+    if p.get("negative") and "negative_prompt" in params:
+        kw["negative_prompt"] = p["negative"]
+    if mode == "edit":
+        start = _image_in(p["image"])
+        w, h = _fit(*start.size, int(p.get("longest", 1024)))
+        start = start.resize((w, h))
+        kw["image"] = [start] if "image_reference" not in params and _takes_list(pipe) else start
+        if "strength" in params:
+            kw["strength"] = float(p.get("strength", 0.6))
+    else:
+        w, h = _fit(int(p.get("width", 1024)), int(p.get("height", 1024)), int(p.get("longest", 1024)))
+    kw["width"], kw["height"] = w, h
+
+    def on_step(pipe_, i, t, cb_kw):
+        emit({"t": "progress", "v": round((i + 1) / steps, 3)})
+        if cancel.is_set():
+            pipe_._interrupt = True
+        return cb_kw
+
+    if "callback_on_step_end" in params:
+        kw["callback_on_step_end"] = on_step
+    # The chat model steps aside BEFORE drawing when the card is short, instead of after a failed attempt (an
+    # out-of-memory during the run wasted the attempt, and one during loading ended the helper).
+    if LLAMA.running() and LLAMA.on_gpu and not getattr(LLAMA, "moe", False) and _card_free()[0] < PICTURE_NEEDS:
+        emit({"t": "status", "v": "Freeing memory…"})
+        LLAMA.stop()
+        _free()
+    _cap_vram()
+    try:
+        with torch.inference_mode():
+            out = pipe(**kw).images[0]
+    except torch.OutOfMemoryError:
+        if ENGINE.brain_repo is None and not LLAMA.running():
+            raise
+        emit({"t": "status", "v": "Freeing memory…"})
+        ENGINE.unload_brain()
+        LLAMA.stop()                                   # restarts in seconds on the next chat
+        _free()
+        _cap_vram()
+        kw["generator"] = torch.Generator("cpu").manual_seed(seed)
+        with torch.inference_mode():
+            out = pipe(**kw).images[0]
+    if cancel.is_set():
+        return
+    buf = io.BytesIO()
+    out.save(buf, format="PNG")
+    emit({"t": "image", "v": base64.b64encode(buf.getvalue()).decode(), "seed": seed})
+
+
+# Fast decoder for Wan 2.2 5B videos: the official decoder spends ~26 of a 42 s clip turning the result into frames.
+TINY_DECODER = ("lightx2v/Autoencoders", "lighttaew2_2_v2.safetensors")   # Apache-2.0, 46 MB
+FAST_DECODE = os.environ.get("FIXER_FAST_DECODE", "1") == "1"
+
+
+def _tiny_decode(latents, status, vae_cfg):
+    """Normalised Wan 2.2 latents (C, T, H, W) -> frames (T, H, W, 3) in 0..1, with the tiny decoder.
+
+    The pipeline hands back latents normalised by the VAE's per-channel mean/std; the tiny decoder wants them raw,
+    like the full VAE. Fed normalised latents it made every clip over-sharpened and over-saturated (PSNR vs the
+    photo 15.1 dB, raw 28.2 dB, full VAE 30.8 dB, measured 11-16)."""
+    import torch
+
+    def load(path):
+        from taehv import TAEHV
+        status("Loading the fast video decoder…")
+        return TAEHV(checkpoint_path=str(Path(path) / TINY_DECODER[1])).to("cuda", torch.float16).eval()
+    tae = ENGINE.tool(TINY_DECODER[0], [TINY_DECODER[1]], status, "fast video decoder", load)
+    z = latents.to("cuda", torch.float32)
+    mean = torch.tensor(vae_cfg.latents_mean, device="cuda").view(-1, 1, 1, 1)
+    std = torch.tensor(vae_cfg.latents_std, device="cuda").view(-1, 1, 1, 1)
+    z = z * std + mean                                                              # back to the VAE's own scale
+    x = z.unsqueeze(0).permute(0, 2, 1, 3, 4).half()                                # NCTHW -> NTCHW
+    with torch.inference_mode():
+        frames = tae.decode_video(x, parallel=True, show_progress_bar=False)[0]   # T, C, H, W
+    return frames.permute(0, 2, 3, 1).float().cpu().numpy()
+
+
+
+
+def _encode_mp4(frames, fps: int) -> bytes:
+    """H.264 / yuv420p MP4 (plays on iPhone), built in memory: never a temp file."""
+    import av
+    import numpy as np
+    arr = frames if isinstance(frames, np.ndarray) else np.stack([np.asarray(f) for f in frames])
+    if arr.dtype != np.uint8:
+        arr = (np.clip(arr, 0, 1) * 255).round().astype(np.uint8)
+    h, w = arr.shape[1] // 2 * 2, arr.shape[2] // 2 * 2
+    buf = io.BytesIO()
+    out = av.open(buf, mode="w", format="mp4")          # no +faststart: it re-opens the output, impossible in memory
+    st = out.add_stream("libx264", rate=fps, options={"crf": "19", "preset": "medium"})
+    st.width, st.height, st.pix_fmt = w, h, "yuv420p"
+    for fr in arr:
+        for pkt in st.encode(av.VideoFrame.from_ndarray(np.ascontiguousarray(fr[:h, :w, :3]), format="rgb24")):
+            out.mux(pkt)
+    for pkt in st.encode():
+        out.mux(pkt)
+    out.close()
+    return buf.getvalue()
+
+
+def job_video(p: dict, emit, cancel):
+    import torch
+    status = lambda s: emit({"t": "status", "v": s})  # noqa: E731
+    mode = "i2v" if p.get("image") else "t2v"
+    repo = p.get("model") or DEFAULT_VIDEO
+    if repo == WAN14_REPO:
+        repo = DEFAULT_VIDEO                           # only reached when ComfyUI can't run: the old 5B path
+    if not _local_complete(repo):
+        raise UserFacing(NO_ENGINE_VIDEOS)             # 11-17: never downloads a removed or missing model
+    if ENGINE.image_repo:
+        ENGINE.unload_image()                          # video needs the RAM and graphics memory
+    VIDEO_BUSY.set()
+    try:
+        _video_run(p, emit, cancel, status, mode, repo)
+    finally:
+        VIDEO_BUSY.clear()
+        if LLAMA.running() and not LLAMA.on_gpu:
+            LLAMA.stop()                               # a chat during the video ran from RAM; next one is fast again
+
+
+def _video_run(p: dict, emit, cancel, status, mode: str, repo: str):
+    import torch
+    pipe = ENGINE.video(repo, mode, status)
+    params = _call_params(pipe)
+    wan = pipe.__class__.__name__.startswith("Wan")
+    fps = 24
+    turbo = "turbo" in repo.lower() or "distill" in repo.lower()
+    steps = max(1, int(p.get("steps") or (4 if turbo else (40 if not wan else 30))))
+    guidance = p.get("guidance")
+    if guidance is None:
+        guidance = 1.0 if turbo else (5.0 if wan else 3.0)
+    seconds = max(1.0, min(10.0, float(p.get("seconds", 5))))
+    mult = 4 if wan else 8                             # frame counts must be k*mult + 1
+    frames = int(round(seconds * fps / mult)) * mult + 1
+    longest = int(p.get("longest", 1280))           # Wan 2.2 5B is trained at 1280x704; smaller came out cooked
+    seed = int(p.get("seed") or int.from_bytes(os.urandom(4), "big"))
+    kw: dict = {"prompt": p.get("prompt") or "a cinematic shot", "num_inference_steps": steps,
+                "num_frames": frames, "guidance_scale": float(guidance), "output_type": "np",
+                "generator": torch.Generator("cpu").manual_seed(seed)}
+    if "frame_rate" in params:
+        kw["frame_rate"] = fps
+    fast = bool(p.get("fast_decode", FAST_DECODE)) and wan and getattr(pipe.vae.config, "z_dim", 0) == 48
+    if fast:
+        kw["output_type"] = "latent"                   # decoded below with the tiny decoder
+    if p.get("negative") and "negative_prompt" in params:
+        kw["negative_prompt"] = p["negative"]
+
+    def dims(w: int, h: int) -> tuple[int, int]:
+        sc = longest / max(w, h)
+        return max(256, int(w * sc) // 32 * 32), max(256, int(h * sc) // 32 * 32)
+
+    def by_area(w: int, h: int) -> tuple[int, int]:
+        # Model card: a photo keeps its shape at the trained pixel count (1280*704), sides rounded to /32.
+        # Sizing by the longest side made a square photo 1280x1280, ~1.8x the area, and ran out of memory.
+        area = 1280 * 704 * (longest / 1280) ** 2
+        ar = h / w
+        return (max(256, int(round((area / ar) ** 0.5)) // 32 * 32),
+                max(256, int(round((area * ar) ** 0.5)) // 32 * 32))
+
+    if mode == "i2v":
+        start = _image_in(p["image"])
+        w, h = by_area(*start.size)
+        kw["image"] = start.resize((w, h))
+    else:
+        w, h = dims(16, 9) if p.get("aspect") != "portrait" else dims(9, 16)
+    kw["width"], kw["height"] = w, h
+
+    # A video needs the whole card (peak ~10.7 GB plus the 11.4 GB text reader passing through), so the chat model
+    # always steps aside first; a chat meanwhile answers from RAM, and the next one after the video is on the card
+    # again. Sharing the card on 11-16 spilled 6.2 GB into system RAM and the clip never finished.
+    if LLAMA.running() and LLAMA.on_gpu:
+        status("Freeing memory…")
+        LLAMA.stop()
+        _free()
+
+    def on_step(pipe_, i, t, cb_kw):
+        emit({"t": "progress", "v": round(min(0.95, (i + 1) / steps * 0.95), 3)})
+        if i + 1 == steps:
+            status("Finishing video…")
+        if cancel.is_set():
+            pipe_._interrupt = True
+        return cb_kw
+
+    if "callback_on_step_end" in params:
+        kw["callback_on_step_end"] = on_step
+    status("Creating video…")
+    _cap_vram()
+    try:
+        with torch.inference_mode():
+            out = pipe(**kw).frames[0]
+    except torch.OutOfMemoryError:
+        if not LLAMA.running():
+            raise
+        status("Freeing memory…")
+        LLAMA.stop()
+        _free()
+        _cap_vram()
+        kw["generator"] = torch.Generator("cpu").manual_seed(seed)
+        with torch.inference_mode():
+            out = pipe(**kw).frames[0]
+    if cancel.is_set():
+        return
+    if fast:
+        status("Finishing video…")
+        out = _tiny_decode(out, status, pipe.vae.config)
+    mp4 = _encode_mp4(out, fps)
+    del out
+    emit({"t": "progress", "v": 1.0})
+    emit({"t": "video", "v": base64.b64encode(mp4).decode(), "seconds": round((frames - 1) / fps, 2),
+          "width": w, "height": h, "seed": seed})
+
+
+# ---------------------------------------------------------------- cut out (BiRefNet) and upscale (spandrel)
+
+CUT_GENERAL = "ZhengPeng7/BiRefNet_HR"            # hard-edged objects (MIT)
+CUT_SOFT = "ZhengPeng7/BiRefNet_HR-matting"       # people, pets, hair and fur: soft edges (MIT)
+SOFT_WORDS = ("person", "people", "man", "woman", "boy", "girl", "child", "kid", "baby", "face", "hair", "dog",
+              "cat", "pet", "animal", "puppy", "kitten", "bird", "horse", "fur", "me", "him", "her", "them", "fox",
+              "wolf", "bear", "lion", "tiger", "rabbit", "bunny", "hamster", "cow", "sheep", "goat", "deer")
+UPSCALER = ("Kim2091/UltraSharpV2", "4x-UltraSharpV2.safetensors")   # photo 4x (CC BY-NC-SA: personal use)
+UPSCALE_MAX = 8192                                   # longest side of an upscaled photo
+
+
+def _birefnet(repo: str, status):
+    import torch
+
+    def load(path):
+        from transformers import AutoModelForImageSegmentation
+        status("Loading the cut-out tool…")
+        m = AutoModelForImageSegmentation.from_pretrained(path, trust_remote_code=True)
+        return m.to("cuda").half().eval()
+    return ENGINE.tool(repo, ["*.json", "*.py", "model.safetensors"], status, "cut-out tool", load), torch
+
+
+def _matte(model, torch, img, size: int = 2048):
+    """Alpha (0-255, PIL "L") of the main subject of `img`, at img's size."""
+    import numpy as np
+    from PIL import Image
+    x = np.asarray(img.resize((size, size), Image.BICUBIC), dtype=np.float32) / 255.0
+    x = (x - np.array([0.485, 0.456, 0.406], np.float32)) / np.array([0.229, 0.224, 0.225], np.float32)
+    t = torch.from_numpy(x.transpose(2, 0, 1)).unsqueeze(0).to("cuda").half()
+    with torch.inference_mode():
+        pred = model(t)[-1].sigmoid()[0, 0].float().cpu().numpy()
+    return Image.fromarray((pred * 255).clip(0, 255).astype(np.uint8)).resize(img.size, Image.BICUBIC)
+
+
+def job_cutout(p: dict, emit, cancel):
+    """Mask of what to keep. `boxes` (0-1, [x1, y1, x2, y2]) limit it to those things; none = the main subject."""
+    import numpy as np
+    from PIL import Image
+    status = lambda s: emit({"t": "status", "v": s})  # noqa: E731
+    img = _image_in(p["image"])
+    labels = " ".join(p.get("labels") or []).lower()
+    soft = not labels or any(w in labels.split() for w in SOFT_WORDS)
+    model, torch = _birefnet(CUT_SOFT if soft else CUT_GENERAL, status)
+    status("Cutting out…")
+    W, H = img.size
+    boxes = [b for b in (p.get("boxes") or []) if isinstance(b, list) and len(b) == 4]
+    if not boxes:
+        mask = _matte(model, torch, img)
+    else:
+        mask = Image.new("L", (W, H), 0)
+        for x1, y1, x2, y2 in boxes:
+            if cancel.is_set():
+                return
+            bw, bh = (x2 - x1) * W, (y2 - y1) * H
+            pad = 0.15 * max(bw, bh)                    # a little context around each box
+            l, t = max(0, int(x1 * W - pad)), max(0, int(y1 * H - pad))
+            r, b = min(W, int(x2 * W + pad)), min(H, int(y2 * H + pad))
+            if r - l < 8 or b - t < 8:
+                continue
+            m = _matte(model, torch, img.crop((l, t, r, b)), size=1024)
+            region = mask.crop((l, t, r, b))
+            mask.paste(Image.fromarray(np.maximum(np.asarray(region), np.asarray(m))), (l, t))
+    buf = io.BytesIO()
+    mask.save(buf, format="PNG")
+    emit({"t": "mask", "v": base64.b64encode(buf.getvalue()).decode()})
+
+
+def job_upscale(p: dict, emit, cancel):
+    """4x with a photo upscaler, in overlapping tiles so any photo size fits on the card. JPEG back."""
+    import numpy as np
+    import torch
+    from PIL import Image
+    status = lambda s: emit({"t": "status", "v": s})  # noqa: E731
+    img = _image_in(p["image"])
+    longest = int(p.get("longest", UPSCALE_MAX))
+
+    def load(path):
+        from spandrel import ModelLoader
+        status("Loading the upscaler…")
+        d = ModelLoader().load_from_file(str(Path(path) / UPSCALER[1]))
+        dtype = torch.bfloat16 if d.supports_bfloat16 else torch.half if d.supports_half else torch.float32
+        return d.to("cuda").to(dtype).eval(), dtype
+    model, dtype = ENGINE.tool(UPSCALER[0], [UPSCALER[1]], status, "upscaler", load)
+    scale = int(model.scale)
+    # Shrink first if 4x would overshoot the size limit by a lot: less work, same final size.
+    pre = min(1.0, longest / (scale * max(img.size)))
+    if pre < 0.999:
+        img = img.resize((max(1, round(img.width * pre)), max(1, round(img.height * pre))), Image.LANCZOS)
+    x = torch.from_numpy(np.asarray(img, dtype=np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
+    _, _, h, w = x.shape
+    tile, ov = 512, 32
+    out = torch.zeros((3, h * scale, w * scale), dtype=torch.float32)
+    weight = torch.zeros((1, h * scale, w * scale), dtype=torch.float32)
+    ys = list(range(0, max(1, h - ov), tile - ov)) or [0]
+    xs = list(range(0, max(1, w - ov), tile - ov)) or [0]
+    total, done = len(ys) * len(xs), 0
+    status("Upscaling…")
+    for ty in ys:
+        for tx in xs:
+            if cancel.is_set():
+                return
+            y0, x0 = min(ty, max(0, h - tile)), min(tx, max(0, w - tile))
+            piece = x[:, :, y0:y0 + tile, x0:x0 + tile].to("cuda", dtype)
+            with torch.inference_mode():
+                r = model(piece)[0].float().clamp(0, 1).cpu()
+            out[:, y0 * scale:y0 * scale + r.shape[1], x0 * scale:x0 * scale + r.shape[2]] += r
+            weight[:, y0 * scale:y0 * scale + r.shape[1], x0 * scale:x0 * scale + r.shape[2]] += 1
+            done += 1
+            emit({"t": "progress", "v": round(done / total, 3)})
+    res = (out / weight.clamp(min=1)).permute(1, 2, 0).numpy()
+    del out, weight
+    final = Image.fromarray((res * 255).round().astype(np.uint8))
+    buf = io.BytesIO()
+    final.save(buf, format="JPEG", quality=94)
+    emit({"t": "image", "v": base64.b64encode(buf.getvalue()).decode(), "width": final.width, "height": final.height})
+
+
+def _gated(e: Exception) -> bool:
+    text = f"{e.__class__.__name__} {e}"
+    return any(w in text for w in ("GatedRepo", "401", "403", "gated", "RepositoryNotFound"))
+
+
+def _takes_list(pipe) -> bool:
+    # FLUX.2 pipelines take a list of reference images.
+    return pipe.__class__.__name__.startswith("Flux2")
+
+
+def job_search(p: dict, emit, cancel):
+    """Web search through SearXNG. Nothing is kept; results go straight back to the phone."""
+    import urllib.parse
+    import urllib.request
+    q = str(p.get("query", "")).strip()
+    if not q:
+        raise UserFacing("Nothing to search for.")
+    url = SEARCH_URL.rstrip("/") + "/search?" + urllib.parse.urlencode({"q": q, "format": "json"})
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "FixerDesktop/1"}),
+                                    timeout=20) as r:
+            data = json.loads(r.read())
+    except Exception as e:
+        raise UserFacing("Web search isn't available right now.") from e
+    n = max(1, min(20, int(p.get("count", 6))))
+    emit({"t": "info", "results": [{"title": x.get("title", ""), "url": x.get("url", ""), "content": x.get("content", "")}
+                                   for x in data.get("results", [])[:n]]})
+
+
+# ---------------------------------------------------------------- ComfyUI engine (trial, 11-16)
+# ComfyUI v0.45.5 (pinned, own venv in C:\FixerDesktop\comfyui) runs headless on 127.0.0.1 only, started and killed
+# with this server. Pictures come back over its websocket (SaveImageWebsocket): nothing is saved; its temp / input /
+# output / user folders sit in COMFY_PRIVATE, wiped at every start and by "clear everything". Trial scope: new
+# pictures with the recipes below; edits, video, cut-out and upscale stay on the diffusers path.
+
+COMFY_DIR = ROOT / "comfyui"
+COMFY_PRIVATE = ROOT / "comfy-private"
+COMFY_PORT = int(os.environ.get("FIXER_COMFY_PORT", "8188"))
+COMFY_ON = os.environ.get("FIXER_COMFY", "1") == "1"       # 0 = old diffusers path for everything
+COMFY_RECIPES = {                                               # phone model id -> Create recipe
+    "tewea/z_image_turbo_bf16_nsfw": "zimage-nsfw",
+    "Tongyi-MAI/Z-Image-Turbo": "zimage",
+    "lodestones/Chroma1-HD": "chroma",
+    "Comfy-Org/Qwen-Image-2.1": "qwen21",              # 11-17: Qwen-Image 2.1 Turbo (opt-in, makes and edits)
+}
+
+
+def _snapshot(repo: str) -> Path | None:
+    snaps = MODELS / "hub" / f"models--{repo.replace('/', '--')}" / "snapshots"
+    return next(iter(sorted(snaps.glob("*"))), None) if snaps.is_dir() else None
+
+
+def _comfy_paths_yaml() -> str:
+    """Points ComfyUI at the files already in Fixer's capped model folder (no second copy)."""
+    z = _snapshot("Comfy-Org/Z-Image-Turbo")
+    t = _snapshot("tewea/z_image_turbo_bf16_nsfw")
+    ch = _snapshot("Comfy-Org/Chroma1-HD_repackaged")
+    t5 = _snapshot("comfyanonymous/flux_text_encoders")
+    up = _snapshot("Comfy-Org/Real-ESRGAN_repackaged")
+    q21, q21te = _snapshot(QWEN21_REPO), _snapshot(QWEN21_TE_REPO)
+    q21te_bf = _snapshot(QWEN21_TE_FALLBACK[0])
+    q21x = _snapshot(_tune_text("qwen21_explicit_repo", QWEN21_LORA_REPO))
+    wan = _snapshot(WAN14_REPO)
+    wan_te = _snapshot(WAN_TE_REPO)
+    wan_x = _snapshot(WAN_EXPLICIT_REPO)
+    qe, qb, qa = _snapshot(QWEN_EDIT_REPO), _snapshot(QWEN_BASE_REPO), _snapshot(QWEN_AIO_REPO)
+    def block(paths):
+        return "|\n" + "".join(f"    {Path(x).as_posix()}\n" for x in paths if x)
+    COMFY_LORAS.mkdir(parents=True, exist_ok=True)
+    return ("fixer:\n"
+            f"  diffusion_models: {block([t, z / 'split_files' / 'diffusion_models' if z else None, ch / 'split_files' / 'diffusion_models' if ch else None, wan / 'split_files' / 'diffusion_models' if wan else None, qe, q21 / 'diffusion_models' if q21 else None])}"
+            f"  text_encoders: {block([z / 'split_files' / 'text_encoders' if z else None, t5, wan_te / 'split_files' / 'text_encoders' if wan_te else None, qb / 'split_files' / 'text_encoders' if qb else None, q21te, q21te_bf])}"
+            f"  upscale_models: {block([up])}"
+            f"  vae: {block([z / 'split_files' / 'vae' if z else None, wan / 'split_files' / 'vae' if wan else None, qb / 'split_files' / 'vae' if qb else None, q21 / 'vae' if q21 else None])}"
+            f"  checkpoints: {block([qa / QWEN_AIO_DIR if qa else None])}"
+            f"  loras: {block([COMFY_LORAS, wan / 'split_files' / 'loras' if wan else None, wan_x, q21x])}")
+
+
+# ---- Real timings, from real use (11-17). Memory only (never disk), no prompt text, the last 100 finished
+# picture / edit / video jobs. No test jobs: whatever the owner actually makes is what gets measured.
+TIMINGS: collections.deque = collections.deque(maxlen=100)
+_TL = threading.local()                                  # the record of the job running on this thread
+_LOADER_CLASSES = frozenset({"UNETLoader", "CLIPLoader", "VAELoader", "CheckpointLoaderSimple", "LoraLoaderModelOnly",
+                             "UpscaleModelLoader"})
+_SAMPLER_CLASSES = frozenset({"SamplerCustomAdvanced", "KSampler", "KSamplerAdvanced"})
+
+
+def _new_timing_record(kind: str) -> dict:
+    return {"kind": kind, "model": None, "recipe": None, "editor": None, "explicit": False, "mp": None, "steps": None,
+            "count": 1, "load_s": 0.0, "draw_s": 0.0, "engine_start_s": 0.0, "loaded": False, "runs": 0,
+            "enhance": "off", "enhance_s": 0.0}
+
+
+def _timing(**kw) -> None:
+    """Notes what the running job is (called where its graph is chosen). A no-op outside a job."""
+    r = getattr(_TL, "rec", None)
+    if r is not None:
+        r.update({k: v for k, v in kw.items() if v is not None})
+
+
+class _TimingWatch:
+    """Splits one ComfyUI run into "loading" and "drawing" from its own websocket events (nothing about the prompt).
+    execution_start .. first sampler progress = loading (reading files, the text reader, weights onto the card);
+    first sampler progress .. execution_success = drawing (steps, VAE decode, the PNG). `loaded` is True when ComfyUI
+    had to (re)load a model: one of the workflow's loader nodes was not in execution_cached."""
+
+    def __init__(self, workflow: dict, now=time.monotonic):
+        self.now = now
+        self.loaders = {str(k) for k, n in workflow.items() if (n or {}).get("class_type") in _LOADER_CLASSES}
+        self.samplers = {str(k) for k, n in workflow.items() if (n or {}).get("class_type") in _SAMPLER_CLASSES}
+        self.cached: set[str] = set()
+        self.t_post = now()
+        self.t_start = self.t_draw = self.t_end = None
+
+    def on(self, mtype: str, d: dict) -> None:
+        t = self.now()
+        if mtype == "execution_start" and self.t_start is None:
+            self.t_start = t
+        elif mtype == "execution_cached":
+            self.cached |= {str(x) for x in (d.get("nodes") or [])}
+        elif mtype == "progress" and self.t_draw is None and str(d.get("node")) in self.samplers:
+            self.t_draw = t
+        elif mtype == "execution_success" or (mtype == "executing" and d.get("node") is None):
+            self.t_end = t
+
+    def result(self) -> dict:
+        start = self.t_start if self.t_start is not None else self.t_post
+        end = self.t_end if self.t_end is not None else self.now()
+        draw = self.t_draw if self.t_draw is not None else start      # no sampler progress: all of it is "drawing"
+        return {"load_s": max(0.0, draw - start), "draw_s": max(0.0, end - draw),
+                "loaded": any(i not in self.cached for i in self.loaders)}
+
+    def apply(self) -> None:
+        r = getattr(_TL, "rec", None)
+        if r is None:
+            return
+        x = self.result()
+        r["load_s"] += x["load_s"]
+        r["draw_s"] += x["draw_s"]
+        r["loaded"] = bool(r["loaded"] or x["loaded"])
+        r["runs"] += 1
+
+
+def _timing_bucket(kind: str) -> str:
+    return {"picture": "new picture", "pictures": "new picture", "edit": "edit", "change": "change"}.get(kind, kind)
+
+
+def _timing_recent(n: int = 20) -> list[dict]:
+    now = time.monotonic()
+    out = []
+    for r in list(TIMINGS)[::-1][:n]:
+        d = {k: v for k, v in r.items() if k != "at"}
+        for k in ("load_s", "draw_s", "total_s", "engine_start_s", "enhance_s", "mp"):
+            if isinstance(d.get(k), float):
+                d[k] = round(d[k], 2)
+        d["age_s"] = int(now - r.get("at", now))
+        out.append(d)
+    return out
+
+
+def _timing_summary() -> list[dict]:
+    """Per (model, kind of job, add-on on/off): how many, average seconds PER PICTURE (a job of 4 pictures counts as
+    its total divided by 4, so it compares with a 1-picture job), and loaded vs had-to-load averages. A paint "change"
+    (a small crop) is its own kind, apart from full-photo edits. Failed jobs are left out. Most recently used first."""
+    groups: dict[tuple, list[dict]] = {}
+    for r in list(TIMINGS):
+        if not r.get("ok") or r.get("total_s") is None:
+            continue
+        groups.setdefault((r.get("model") or r.get("kind"), _timing_bucket(r.get("kind", "")),
+                           bool(r.get("explicit"))), []).append(r)
+
+    def mean(xs):
+        return round(sum(xs) / len(xs), 2) if xs else None
+
+    def per(x, key):
+        return x[key] / max(1, x.get("count") or 1)
+
+    out = []
+    for (model, bucket, explicit), rs in groups.items():
+        warm = [per(x, "total_s") for x in rs if not x.get("loaded")]
+        cold = [per(x, "total_s") for x in rs if x.get("loaded")]
+        rate = [x["draw_s"] / (x["mp"] * x["steps"] * max(1, x.get("count") or 1)) for x in rs
+                if x.get("mp") and x.get("steps") and x.get("draw_s")]
+        out.append({"model": model, "kind": bucket, "explicit": explicit, "n": len(rs),
+                    "total_s": mean([per(x, "total_s") for x in rs]), "draw_s": mean([per(x, "draw_s") for x in rs]),
+                    "load_s": mean([per(x, "load_s") for x in rs]), "warm_total_s": mean(warm), "cold_total_s": mean(cold),
+                    "s_per_mp_step": mean(rate), "_last": max(x.get("at", 0) for x in rs)})
+    out.sort(key=lambda g: g["_last"], reverse=True)
+    for g in out:
+        del g["_last"]
+    return out
+
+
+def _secs(x) -> str:
+    return f"{x:.0f} s" if x is not None and x >= 10 else f"{x:.1f} s" if x is not None else "?"
+
+
+def _measured_speed_facts() -> list[str]:
+    """Lines for the look-up tool: what this session's real jobs took."""
+    L = ["MEASURED SPEED (this session's real jobs, newest first)"]
+    rows = _timing_summary()
+    if not rows:
+        return L + ["- none yet this session"]
+    for g in rows:
+        bits = []
+        if g["warm_total_s"] is not None:
+            bits.append(f"{_secs(g['warm_total_s'])} when already loaded")
+        if g["cold_total_s"] is not None:
+            bits.append(f"{_secs(g['cold_total_s'])} when it had to load")
+        if g["s_per_mp_step"]:
+            bits.append(f"drawing {g['s_per_mp_step']:.2f} s per megapixel-step")
+        L.append(f"- {g['model']}, {g['kind']}{', explicit add-on on' if g['explicit'] else ''}: "
+                 f"{_secs(g['total_s'])} on average over {g['n']}" + (f" ({'; '.join(bits)})" if bits else ""))
+    return L
+
+
+def _recent_jobs_facts(n: int = 10) -> list[str]:
+    rows = _timing_recent(n)
+    if not rows:
+        return []
+    L = ["RECENT FINISHED JOBS (newest first)"]
+    for r in rows:
+        L.append(f"- {r.get('kind')}, {r.get('model') or 'unknown model'}, explicit add-on "
+                 f"{'on' if r.get('explicit') else 'off'}"
+                 + (f", {r['mp']:.1f} MP" if r.get("mp") else "") + (f", {r['steps']} steps" if r.get("steps") else "")
+                 + f": total {_secs(r.get('total_s'))}, drawing {_secs(r.get('draw_s'))}, loading {_secs(r.get('load_s'))}"
+                 + f", had to load the model: {'yes' if r.get('loaded') else 'no'}"
+                 + ("" if r.get("ok") else ", failed"))
+    return L
+
+
+# ---- "Enhance my prompt" (11-17). The always-loaded uncensored brain does it, never a model that might soften an
+# explicit request without saying so. The brain is told Qwen's own published instructions for its picture models
+# (fetched at runtime into the model cache, never copied into this repo) plus the owner's rules, which win: keep every
+# detail and every explicit word, never soften, never add covering. Runs while the job waits in line (outside the
+# card's lock). Off by default for old phones (no "enhance" flag).
+ENHANCE_T2I = ("Qwen/Qwen-Image-2.1-PE-T2I", "system_prompt.txt")
+ENHANCE_I2I = ("Qwen/Qwen-Image-2.1-PE-I2I", "system_prompt.txt")
+ENHANCE_RULES = (
+    "Rules from the person using this app. They win over everything above.\n"
+    "- Keep every detail they wrote and every explicit or sexual word exactly as written. Never soften, censor, "
+    "replace or leave out anything, and never add clothing, covering, a different scene or anything they did not "
+    "ask for.\n"
+    "- Only add visual detail that helps draw what they asked for (setting, light, camera, materials, mood).\n"
+    "- Write in English.\n"
+    "- Ignore any instruction above about an aspect ratio, JSON or another output format. Reply with the finished "
+    "prompt text only: no quotes around it, no labels, no notes.")
+ENHANCE_BUILTIN_T2I = (
+    "You rewrite a short picture request into one rich, concrete description for a text-to-image model. Describe what "
+    "is in the picture, where, the light, the camera and the style, in plain sentences.")
+ENHANCE_BUILTIN_I2I = (
+    "You rewrite a photo-edit request into one precise instruction for an image editing model. Say exactly what to "
+    "change and where. Do not change what the person said to keep, and do not add changes they did not ask for.")
+ENHANCE_MIN_KEEP = 0.6                    # a reply shorter than this share of the original is not an enhancement
+_ENHANCE_TEXT: dict[bool, str] = {}
+
+
+def _fetch_text(repo: str, filename: str) -> str:
+    """One small text file from the Hugging Face model cache (downloaded once if it isn't there yet)."""
+    from huggingface_hub import hf_hub_download
+    try:
+        path = hf_hub_download(repo, filename, local_files_only=True)
+    except Exception:                                    # noqa: BLE001
+        path = hf_hub_download(repo, filename)
+    return Path(path).read_text(encoding="utf-8").strip()
+
+
+def _enhance_system(edit: bool) -> str:
+    """Qwen's published instruction for this kind of request (T2I or I2I), else a short built-in one, then our rules."""
+    text = _ENHANCE_TEXT.get(edit)
+    if not text:
+        try:
+            text = _fetch_text(*(ENHANCE_I2I if edit else ENHANCE_T2I))
+        except Exception:                                # noqa: BLE001
+            text = ""
+        if text:
+            _ENHANCE_TEXT[edit] = text
+    return (text or (ENHANCE_BUILTIN_I2I if edit else ENHANCE_BUILTIN_T2I)) + "\n\n" + ENHANCE_RULES
+
+
+def _clean_enhanced(text: str) -> str:
+    """The prompt from the brain's reply: no think block, no code fence, no JSON wrapper, no quotes around it."""
+    t = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S).strip()
+    t = re.sub(r"^```[a-z]*\s*|\s*```$", "", t).strip()
+    if t.startswith("{"):
+        try:
+            obj = json.loads(t)
+            t = str(obj.get("rewritten_prompt") or obj.get("prompt") or "")
+        except Exception:                                # noqa: BLE001
+            m = re.search(r'"rewritten_prompt"\s*:\s*"((?:[^"\\]|\\.)*)"', t, re.S)
+            if m:
+                try:
+                    t = json.loads('"' + m.group(1) + '"')
+                except Exception:                        # noqa: BLE001
+                    t = m.group(1)
+            else:
+                return ""                                # a cut-off wrapper: nothing usable, not half a JSON line
+    t = t.strip()
+    if len(t) > 1 and t[0] == t[-1] and t[0] in "\"'":
+        t = t[1:-1].strip()
+    return t[:4000]
+
+
+def _enhance_port() -> int | None:
+    """The running brain's port, starting it if it is off; None when it is paused or can't start."""
+    if LLAMA.paused_for:
+        return None
+    if LLAMA.running() and LLAMA.port:
+        return LLAMA.port
+    choice = gguf_choice(LAST_BRAIN)
+    if choice is None:
+        return None
+    return LLAMA.ensure(LAST_BRAIN, choice, lambda s: None)
+
+
+def enhance_prompt(prompt: str, edit: bool, image_b64: str | None, cancel) -> tuple[str | None, str]:
+    """(enhanced prompt or None, a plain-words note when it could not). Think off, text only back."""
+    prompt = (prompt or "").strip()
+    if not prompt:
+        return None, ""
+    try:
+        port = _enhance_port()
+    except Exception:                                    # noqa: BLE001
+        port = None
+    if port is None:
+        return None, "The chat model isn't available right now, so your own words are used as they are."
+    msg = {"role": "user", "text": prompt[:8000]}
+    if edit and image_b64:
+        msg["image"] = image_b64
+    out: list[str] = []
+    p = {"instructions": _enhance_system(edit), "messages": [msg], "think": False, "temperature": 0.5,
+         "presence_penalty": 0.0, "max_tokens": 900}
+    try:
+        _chat_llama(p, lambda o: out.append(o.get("v", "")) if o.get("t") == "text" else None, cancel, port)
+    except Exception:                                    # noqa: BLE001
+        return None, "Improving the description didn't work, so your own words are used as they are."
+    text = _clean_enhanced("".join(out))
+    if not text or len(text) < ENHANCE_MIN_KEEP * len(prompt):
+        return None, "Improving the description didn't work, so your own words are used as they are."
+    return text, ""
+
+
+def _enhance_inputs(op: str, payload: dict | None):
+    """(prompt, is_edit, photo) when this request asks to be enhanced, else None. Paint (a spot's own words) is never."""
+    if not isinstance(payload, dict):
+        return None
+    if op == "image":
+        if payload.get("enhance") is True and payload.get("prompt"):
+            return payload["prompt"], bool(payload.get("image")), payload.get("image")
+        return None
+    if op == "comfy_run":
+        v = payload.get("values") or {}
+        if v.get("enhance") is True and v.get("prompt") and v.get("image_mode") != "paint":
+            return v["prompt"], bool(v.get("image") and v.get("image_mode") in ("edit", "reference")), v.get("image")
+    return None
+
+
+def _with_prompt(op: str, payload: dict, text: str) -> dict:
+    if op == "comfy_run":
+        return {**payload, "values": {**(payload.get("values") or {}), "prompt": text}}
+    return {**payload, "prompt": text}
+
+
+def _enhance_job(job) -> None:
+    """Runs in a thread right after the job is lined up: the job waits for it (if it reaches the front first)."""
+    t0 = time.monotonic()
+    try:
+        got = _enhance_inputs(job.op, job.payload)
+        if got is None or job.cancel.is_set():
+            return
+        text, note = enhance_prompt(got[0], got[1], got[2], job.cancel)
+        if job.cancel.is_set():
+            return
+        job.enhanced, job.enhance_note = text, note
+        job.enhance_state = "on" if text else "failed"
+        if text:
+            job.emit({"t": "enhanced", "v": text})
+        elif note:
+            job.emit({"t": "info", "enhance_skipped": note})
+    except Exception:                                    # noqa: BLE001
+        job.enhance_state = "failed"
+        job.enhance_note = "Improving the description didn't work, so your own words are used as they are."
+    finally:
+        job.enhance_s = round(time.monotonic() - t0, 2)
+        job.enhance_done.set()
+
+
+def _apply_enhance(job, payload, emit):
+    """At the job's start: wait for its enhancement (usually done while it queued) and draw from the enhanced words;
+    if there are none, say why in plain words and draw from the original ones."""
+    if not getattr(job, "enhance", False) or payload is None:
+        return payload
+    if not job.enhance_done.is_set():
+        emit({"t": "status", "v": "Improving your description…"})
+        limit = time.monotonic() + _tune("enhance_wait_s", 240)
+        while not job.enhance_done.wait(0.5):
+            if job.cancel.is_set() or time.monotonic() > limit:
+                return payload
+    if job.enhanced:
+        return _with_prompt(job.op, payload, job.enhanced)
+    if job.enhance_note:
+        emit({"t": "status", "v": job.enhance_note})
+    return payload
+
+
+class Comfy:
+    def __init__(self):
+        self.proc: subprocess.Popen | None = None
+        self.lock = threading.Lock()
+        self.warmed: set[str] = set()
+        self.paths = ""
+        self.reserve = 0.0                   # --reserve-vram GB this start used (0 = none)
+
+    def available(self) -> bool:
+        return COMFY_ON and (COMFY_DIR / "main.py").is_file() and (COMFY_DIR / ".venv").is_dir()
+
+    def running(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def _get(self, path: str, timeout: float = 3):
+        import urllib.request
+        with urllib.request.urlopen(f"http://127.0.0.1:{COMFY_PORT}{path}", timeout=timeout) as r:
+            return json.loads(r.read() or b"null")
+
+    def _post(self, path: str, body: dict, timeout: float = 30):
+        import urllib.request
+        req = urllib.request.Request(f"http://127.0.0.1:{COMFY_PORT}{path}", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = r.read()
+            return json.loads(data) if data else None
+
+    def ensure(self, status=lambda s: None):
+        import shutil
+        with self.lock:
+            if self.running():
+                return
+            shutil.rmtree(COMFY_PRIVATE, ignore_errors=True)
+            for d in ("temp", "input", "output", "user"):
+                (COMFY_PRIVATE / d).mkdir(parents=True, exist_ok=True)
+            self.paths = _comfy_paths_yaml()
+            (COMFY_PRIVATE / "paths.yaml").write_text(self.paths, encoding="utf-8")
+            status("Starting the picture engine…")
+            args = [str(COMFY_DIR / ".venv" / "Scripts" / "python.exe"), "-s", "main.py",
+                    "--listen", "127.0.0.1", "--port", str(COMFY_PORT), "--disable-auto-launch",
+                    "--temp-directory", str(COMFY_PRIVATE / "temp"), "--input-directory", str(COMFY_PRIVATE / "input"),
+                    "--output-directory", str(COMFY_PRIVATE / "output"), "--user-directory", str(COMFY_PRIVATE / "user"),
+                    "--extra-model-paths-config", str(COMFY_PRIVATE / "paths.yaml"),
+                    "--disable-metadata", "--preview-method", "auto",   # live previews over the websocket
+                    "--offline"]                       # 11-17 audit: no partner nodes, nothing reaches the internet
+            reserve = _tune("comfy_reserve_gb", 6.0)
+            if reserve > 0 and _is_moe(LAST_BRAIN):
+                # 11-17: the MoE brain's share of the card (attention, shared weights, cache, photo reader ~4-6 GB)
+                # stays free, so ComfyUI never plans to use it and the brain can (re)start beside a running picture.
+                args += ["--reserve-vram", f"{reserve:.1f}"]
+            self.reserve = reserve if "--reserve-vram" in args else 0.0
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
+            # 11-17 (fast switches): ComfyUI's default RAM-pressure cache drops every model of an earlier workflow as
+            # soon as free RAM is under its "inactive" headroom, which defaults to ALL of the RAM (execution.py:809),
+            # so every switch Chroma <-> Qwen 2.1 <-> Z-Image re-read the files. Inactive headroom 6 GB keeps earlier
+            # models cached until free RAM really runs short; active headroom 3 GB (default would be 6.4) lets the
+            # current job keep its big intermediates. Budget on 64 GB: MoE brain ~20 GB, Chroma 14.7 GB (fp8 model 9.2
+            # + T5 fp8 5.2 + ae 0.3), Qwen 2.1 14.3 GB (int8 7.3 + heretic W4A8 reader 6.3 + VAE 0.7), Windows and
+            # apps ~8-10 GB: both picture models stay, ~6-8 GB free. A third (Z-Image, 20.7 GB) pushes out the oldest
+            # by ComfyUI's own score. Video still frees everything first (_room_for_video). Not --high-ram (no limit
+            # at 64 GB: Windows would page) and not --cache-classic. Knobs (apply on ComfyUI's next start):
+            # comfy_cache_active_gb / comfy_cache_inactive_gb in local.json.
+            args += ["--cache-ram", f"{_tune('comfy_cache_active_gb', 3.0):g}",
+                     f"{_tune('comfy_cache_inactive_gb', 6.0):g}"]
+            t_spawn = time.monotonic()
+            self.proc = subprocess.Popen(args, cwd=str(COMFY_DIR), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL, creationflags=flags)
+            _JOB.add(self.proc)                        # dies with this server, however it exits
+            deadline = time.time() + 180
+            while time.time() < deadline:
+                if self.proc.poll() is not None:
+                    self.proc = None
+                    raise UserFacing("The picture engine on your computer couldn't start.")
+                try:
+                    self._get("/system_stats")
+                    _timing(engine_start_s=round(time.monotonic() - t_spawn, 1))
+                    return
+                except Exception:
+                    time.sleep(0.5)
+            raise UserFacing("The picture engine on your computer is taking too long to start.")
+
+    def ensure_current(self, status=lambda s: None):
+        """Like ensure(), but restarts first if model folders changed since start (a fresh download)."""
+        if self.running() and self.paths != _comfy_paths_yaml():
+            self.stop()
+        self.ensure(status)
+
+    def free(self):
+        """Moves ComfyUI's models off the graphics card (the chat model or the diffusers helper needs it)."""
+        if self.running():
+            try:
+                self._post("/free", {"unload_models": True, "free_memory": True})
+            except Exception:
+                pass
+
+    def stop(self):
+        import shutil
+        with self.lock:
+            if self.running():
+                self.proc.kill()
+                try:
+                    self.proc.wait(10)
+                except Exception:
+                    pass
+            self.proc = None
+            self.warmed.clear()
+            shutil.rmtree(COMFY_PRIVATE, ignore_errors=True)
+
+
+COMFY = Comfy()
+
+
+def _zimage_workflow(prompt: str, w: int, h: int, seed: int, steps: int = 8, cfg: float = 1.0,
+                     sampler: str = "res_multistep", scheduler: str = "simple", shift: float = 3.0,
+                     loras: list | None = None, unet: str = "z_image_turbo_bf16_nsfw_v2.safetensors",
+                     detail: float = 0.0, te: str = "qwen_3_4b_fp8_mixed.safetensors") -> dict:
+    """Z-Image Turbo (stock or the NSFW transformer) as ComfyUI's own template builds it: 8 steps, cfg 1,
+    res_multistep / simple, AuraFlow shift 3, empty negative. LoRAs [(file, strength)] chain between the model and
+    the sampler."""
+    wf = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": unet, "weight_dtype": "default"}},
+        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": te, "type": "lumina2", "device": "default"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": "ae.safetensors"}},
+        "4": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["2", 0]}},
+        "5": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["4", 0]}},
+        "6": {"class_type": "EmptySD3LatentImage", "inputs": {"width": w, "height": h, "batch_size": 1}},
+        "7": {"class_type": "ModelSamplingAuraFlow", "inputs": {"model": ["1", 0], "shift": float(shift)}},
+        "8": {"class_type": "KSampler", "inputs": {"model": ["7", 0], "seed": seed, "steps": int(steps),
+                                                   "cfg": float(cfg), "sampler_name": sampler, "scheduler": scheduler,
+                                                   "positive": ["4", 0], "negative": ["5", 0],
+                                                   "latent_image": ["6", 0], "denoise": 1.0}},
+        "9": {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["3", 0]}},
+        "10": {"class_type": "SaveImageWebsocket", "inputs": {"images": ["9", 0]}},
+    }
+    model = ["1", 0]
+    for i, (name, strength) in enumerate(loras or []):
+        nid = f"20{i}"
+        wf[nid] = {"class_type": "LoraLoaderModelOnly",
+                   "inputs": {"model": model, "lora_name": name, "strength_model": float(strength)}}
+        model = [nid, 0]
+    wf["7"]["inputs"]["model"] = model
+    if detail > 1:
+        _detail_pass(wf, image=["9", 0], model=["7", 0], vae=["3", 0], pos=["4", 0], neg=["5", 0], seed=seed,
+                     scale=detail)
+    return wf
+
+
+def _detail_pass(wf: dict, image, model, vae, pos, neg, seed: int, scale: float):
+    """ComfyUI's official Z-Image "2K upscaler": enlarge with an upscaling model, then redraw lightly (5 steps,
+    denoise 0.33, dpmpp_2m_sde / beta) so fine texture (rock, water, skin, fabric) is rebuilt at the larger size."""
+    wf["30"] = {"class_type": "UpscaleModelLoader", "inputs": {"model_name": "RealESRGAN_x4plus.safetensors"}}
+    wf["31"] = {"class_type": "ImageUpscaleWithModel", "inputs": {"upscale_model": ["30", 0], "image": image}}
+    wf["32"] = {"class_type": "ImageScaleBy", "inputs": {"image": ["31", 0], "upscale_method": "lanczos",
+                                                         "scale_by": scale / 4.0}}
+    wf["33"] = {"class_type": "VAEEncode", "inputs": {"pixels": ["32", 0], "vae": vae}}
+    wf["34"] = {"class_type": "KSampler", "inputs": {"model": model, "seed": seed, "steps": 5, "cfg": 1.0,
+                                                     "sampler_name": "dpmpp_2m_sde", "scheduler": "beta",
+                                                     "positive": pos, "negative": neg, "latent_image": ["33", 0],
+                                                     "denoise": 0.33}}
+    wf["35"] = {"class_type": "VAEDecode", "inputs": {"samples": ["34", 0], "vae": vae}}
+    wf["10"]["inputs"]["images"] = ["35", 0]
+
+
+# Photo edits (11-17): Qwen-Image-Edit-2511 replaces FLUX.2 klein, which ignored pose changes ("make them sit") and
+# toned explicit edits down. Up to three photos ("the shirt from image 2"). Stock 2511 with the 4-step Lightning
+# merge for ordinary edits; Phr00t's Rapid-AIO NSFW merge (one checkpoint: model, text encoder and VAE) for explicit.
+QWEN_EDIT_REPO = "lightx2v/Qwen-Image-Edit-2511-Lightning"
+QWEN_EDIT_UNET = "qwen_image_edit_2511_fp8_e4m3fn_scaled_lightning_comfyui_4steps_v1.0.safetensors"
+QWEN_BASE_REPO = "Comfy-Org/Qwen-Image"          # its text encoder (Qwen2.5-VL 7B fp8) and VAE
+QWEN_TE = "qwen_2.5_vl_7b_fp8_scaled.safetensors"
+QWEN_VAE = "qwen_image_vae.safetensors"
+QWEN_AIO_REPO = "Phr00t/Qwen-Image-Edit-Rapid-AIO"
+QWEN_AIO_DIR = "v19"
+QWEN_AIO_FILE = "Qwen-Rapid-AIO-NSFW-v19.safetensors"
+QWEN_EXPLICIT_RECIPES = {"zimage-nsfw"}   # a photo edit under these Make models is explicit
+
+
+# Off until it is measured on this PC (11-17: switched on untested, its first load clogged the card and every
+# request waited). Turn on with "qwen_edit": true in local.json or FIXER_QWEN_EDIT=1.
+QWEN_EDIT_ON = os.environ.get("FIXER_QWEN_EDIT") == "1" or bool(LOCAL.get("qwen_edit"))
+
+
+def _qwen_edit_ready(explicit: bool = False) -> bool:
+    if not QWEN_EDIT_ON:
+        return False
+    if explicit:
+        a = _snapshot(QWEN_AIO_REPO)
+        return bool(a and (a / QWEN_AIO_DIR / QWEN_AIO_FILE).is_file())
+    e, b = _snapshot(QWEN_EDIT_REPO), _snapshot(QWEN_BASE_REPO)
+    return bool(e and b and (e / QWEN_EDIT_UNET).is_file()
+                and (b / "split_files" / "text_encoders" / QWEN_TE).is_file()
+                and (b / "split_files" / "vae" / QWEN_VAE).is_file())
+
+
+def _qwen_explicit(prompt: str, recipe_id: str | None = None) -> bool:
+    """Explicit words, or an explicit Make model, and the explicit editor is here."""
+    return (_is_explicit(prompt) or (recipe_id or "") in QWEN_EXPLICIT_RECIPES) and _qwen_edit_ready(True)
+
+
+def _qwen_edit_workflow(prompt: str, images: list, seed: int, w: int, h: int, explicit: bool,
+                        steps: int = 4) -> dict:
+    """Qwen-Image-Edit-2511 as ComfyUI's own template builds it: each photo (image 1 is the base and sets the shape)
+    goes to the vision model and as a reference latent; 4 steps, CFG 1."""
+    import re
+    # The node labels the photos "Picture 1/2/3"; the phone says "photo 2", people say "image 3" or "pic 1".
+    prompt = re.sub(r"\b(?:photo|image|pic|picture)\s*#?\s*([123])\b", r"Picture \1", prompt, flags=re.IGNORECASE)
+    if explicit:
+        wf = {"1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": QWEN_AIO_FILE}}}
+        model, clip, vae = ["1", 0], ["1", 1], ["1", 2]
+        sampler, scheduler = "euler_ancestral", "beta"      # the merge's own recommendation
+    else:
+        wf = {
+            "1": {"class_type": "UNETLoader", "inputs": {"unet_name": QWEN_EDIT_UNET, "weight_dtype": "default"}},
+            "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": QWEN_TE, "type": "qwen_image", "device": "default"}},
+            "3": {"class_type": "VAELoader", "inputs": {"vae_name": QWEN_VAE}},
+            "30": {"class_type": "ModelSamplingAuraFlow", "inputs": {"model": ["1", 0], "shift": 3.1}},
+            "31": {"class_type": "CFGNorm", "inputs": {"model": ["30", 0], "strength": 1.0}},
+        }
+        model, clip, vae = ["31", 0], ["2", 0], ["3", 0]
+        sampler, scheduler = "euler", "simple"
+    enc = {"clip": clip, "vae": vae}
+    for i, name in enumerate(images[:3]):
+        wf[f"1{i}0"] = {"class_type": "LoadImage", "inputs": {"image": name}}
+        enc[f"image{i + 1}"] = [f"1{i}0", 0]
+    wf.update({
+        "20": {"class_type": "TextEncodeQwenImageEditPlus", "inputs": {**enc, "prompt": prompt}},
+        "21": {"class_type": "TextEncodeQwenImageEditPlus", "inputs": {**enc, "prompt": ""}},
+        "22": {"class_type": "FluxKontextMultiReferenceLatentMethod",
+               "inputs": {"conditioning": ["20", 0], "reference_latents_method": "index_timestep_zero"}},
+        "23": {"class_type": "FluxKontextMultiReferenceLatentMethod",
+               "inputs": {"conditioning": ["21", 0], "reference_latents_method": "index_timestep_zero"}},
+        "40": {"class_type": "EmptySD3LatentImage", "inputs": {"width": w, "height": h, "batch_size": 1}},
+        "50": {"class_type": "KSampler", "inputs": {"model": model, "seed": seed, "steps": int(steps), "cfg": 1.0,
+                                                    "sampler_name": sampler, "scheduler": scheduler,
+                                                    "positive": ["22", 0], "negative": ["23", 0],
+                                                    "latent_image": ["40", 0], "denoise": 1.0}},
+        "60": {"class_type": "VAEDecode", "inputs": {"samples": ["50", 0], "vae": vae}},
+        "10": {"class_type": "SaveImageWebsocket", "inputs": {"images": ["60", 0]}},
+    })
+    return wf
+
+
+
+# ---- Qwen-Image 2.1 Turbo (11-17): one clean base model for making AND editing, plus an explicit add-on (a LoRA)
+# switched on per request. Make and edit share loader nodes with identical ids and inputs, so ComfyUI's output cache
+# keeps the model, text reader and VAE loaded between a make and an edit (no reload). The add-on is a LoraLoaderModelOnly
+# in the graph only when asked for; off = not in the graph at all, so ordinary pictures use the clean base.
+QWEN21_REPO = "Comfy-Org/Qwen-Image-2.1"
+QWEN21_UNET = "qwen_image_2.1_turbo_int8_convrot.safetensors"      # diffusion_models/
+QWEN21_VAE = "qwen_image_2.1_vae_bf16.safetensors"                 # vae/
+QWEN21_TE_REPO = "pottokao/Qwen-Image-2.1-Text-Encoder-Heretic-W4A8"   # uncensored text reader (stock CLIPLoader)
+QWEN21_TE = "qwen3vl_8b_w4a8_heretic.safetensors"
+QWEN21_TE_FALLBACK = ("pottokao/Qwen-Image-2.1-Text-Encoder-Heretic", "qwen3vl_8b_bf16_heretic.safetensors")
+QWEN21_SIGMAS = "1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568, 0"   # Turbo's own 8 steps
+QWEN21_LORA_REPO = "chatrlabs/Qwen-Image-2.1-Uncensored-Omni-LoRA-v0.1"
+QWEN21_LORA_FILE = "chatrlabs-omni-lora-v0.1-bf16.safetensors"
+QWEN21_NAME = "Qwen-Image 2.1 Turbo"
+
+
+def _qwen21_te() -> str | None:
+    """The text reader file to load: the live-tuned one ("qwen21_te" in local.json) if it exists, else the W4A8
+    heretic reader, else the bf16 one if downloaded. No automatic switch when a load fails (see _comfy_run)."""
+    a, b = _snapshot(QWEN21_TE_REPO), _snapshot(QWEN21_TE_FALLBACK[0])
+    named = _tune_text("qwen21_te", "")
+    if named and any(x is not None and (x / named).is_file() for x in (a, b)):
+        return named
+    if a is not None and (a / QWEN21_TE).is_file():
+        return QWEN21_TE
+    if b is not None and (b / QWEN21_TE_FALLBACK[1]).is_file():
+        return QWEN21_TE_FALLBACK[1]
+    return None
+
+
+def _qwen21_ready() -> bool:
+    """Model file, VAE and a text reader are on this computer. Independent of QWEN_EDIT_ON: 2.1 is opt-in by choice."""
+    q = _snapshot(QWEN21_REPO)
+    return bool(q is not None and (q / "diffusion_models" / QWEN21_UNET).is_file()
+                and (q / "vae" / QWEN21_VAE).is_file() and _qwen21_te() is not None)
+
+
+def _qwen21_lora() -> tuple[str, float] | None:
+    """(file, strength) of the explicit add-on, or None when its file isn't here. Live-tunable from local.json:
+    qwen21_explicit_lora (file), qwen21_explicit_repo (Hugging Face repo), qwen21_explicit_strength."""
+    name = _tune_text("qwen21_explicit_lora", QWEN21_LORA_FILE)
+    strength = max(0.0, min(2.0, _tune("qwen21_explicit_strength", 1.0)))
+    snap = _snapshot(_tune_text("qwen21_explicit_repo", QWEN21_LORA_REPO))
+    found = (COMFY_LORAS / name).is_file() or bool(snap is not None and (snap / name).is_file())
+    return (name, strength) if found else None
+
+
+def _qwen21_refs(prompt: str, n: int) -> str:
+    """2.1 labels the photos <image1>, <image2>...: "photo 2" / "image 2" / "picture 2" in the words become <image2>
+    (only for photos that exist). A label fix, not a rewrite; the same rule the 2511 editor applies ("Picture N")."""
+    def fix(m):
+        k = int(m.group(1))
+        return f"<image{k}>" if k <= n else m.group(0)
+    return re.sub(r"\b(?:photo|image|pic|picture)\s*#?\s*([1-3])\b", fix, prompt or "", flags=re.IGNORECASE)
+
+
+def _qwen21_explicit(mode, brain_flag=None, base_recipe=None) -> tuple[str, float] | None:
+    """The add-on to load, or None. mode: Make's "Auto"/"On"/"Off" (any case; None = not sent). brain_flag: the chat
+    brain's "explicit" true/false (None = not sent). Auto: the brain's flag, else (a change to a picture) the
+    explicit-model rule. Never decided from the words. Raises UserFacing when the add-on is wanted but not here."""
+    m = str(mode or "auto").lower()
+    want = (m == "on") or (m == "auto" and (brain_flag is True
+                                            or (brain_flag is None and (base_recipe or "") in QWEN_EXPLICIT_RECIPES)))
+    if m == "off" or not want:
+        return None
+    lora = _qwen21_lora()
+    if lora is None:
+        raise UserFacing("The explicit add-on for Qwen-Image 2.1 isn't on your computer yet, so nothing was made. "
+                         "Switch it Off, or pick another model.")
+    return lora
+
+
+def _qwen21_head(explicit_lora=None, loras=None, sigmas: str | None = None) -> tuple[dict, list]:
+    """Nodes shared by make and edit (same ids, same inputs): "1" model, "2" text reader, "3" VAE, "7" sigmas, "8"
+    sampler. The explicit add-on is node "5" (only when on); phone style add-ons chain as "20<i>"; "4" is Turbo's
+    cache node, last before the guider. Returns (graph, model link)."""
+    wf = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": QWEN21_UNET, "weight_dtype": "default"}},
+        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": _qwen21_te() or QWEN21_TE, "type": "qwen_image",
+                                                     "device": "default"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": QWEN21_VAE}},
+    }
+    model = ["1", 0]
+    if explicit_lora:                                  # off = not in the graph at all
+        name, strength = explicit_lora
+        wf["5"] = {"class_type": "LoraLoaderModelOnly",
+                   "inputs": {"model": model, "lora_name": name, "strength_model": float(strength)}}
+        model = ["5", 0]
+    for i, (name, strength) in enumerate(loras or []):
+        nid = f"20{i}"
+        wf[nid] = {"class_type": "LoraLoaderModelOnly",
+                   "inputs": {"model": model, "lora_name": name, "strength_model": float(strength)}}
+        model = [nid, 0]
+    wf["4"] = {"class_type": "QwenImage21Cache", "inputs": {"model": model, "device": "auto", "dtype": "default"}}
+    wf["7"] = {"class_type": "ManualSigmas", "inputs": {"sigmas": sigmas or QWEN21_SIGMAS}}
+    wf["8"] = {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}}
+    return wf, ["4", 0]
+
+
+def _qwen21_workflow(prompt: str, w: int, h: int, seed: int, cfg: float = 1.0, negative: str = "",
+                     explicit_lora=None, loras=None, start=None, sigmas: str | None = None) -> dict:
+    """Qwen-Image 2.1 Turbo text to picture, as ComfyUI's own template builds it (no prompt enhancer): 8 fixed sigmas,
+    euler, cfg 1. `start` = (photo file, strength 0.05..1, w, h): redraw that fraction of the photo (SplitSigmasDenoise
+    keeps the later part of the 8 sigmas)."""
+    w, h = max(256, w // 32 * 32), max(256, h // 32 * 32)
+    wf, model = _qwen21_head(explicit_lora, loras, sigmas)
+    wf.update({
+        "20": {"class_type": "TextEncodeQwenImage21", "inputs": {"clip": ["2", 0], "prompt": prompt,
+                                                                 "negative_prompt": negative or "", "resolution": 1024}},
+        "6": {"class_type": "EmptyLatentImage", "inputs": {"width": w, "height": h, "batch_size": 1}},
+        "9": {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}},
+        "11": {"class_type": "CFGGuider", "inputs": {"model": model, "positive": ["20", 0], "negative": ["20", 1],
+                                                     "cfg": float(cfg)}},
+        "12": {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["9", 0], "guider": ["11", 0],
+                                                                 "sampler": ["8", 0], "sigmas": ["7", 0],
+                                                                 "latent_image": ["6", 0]}},
+        "13": {"class_type": "VAEDecode", "inputs": {"samples": ["12", 0], "vae": ["3", 0]}},
+        "10": {"class_type": "SaveImageWebsocket", "inputs": {"images": ["13", 0]}},
+    })
+    if start:
+        image, strength, sw, sh = start
+        wf["40"] = {"class_type": "LoadImage", "inputs": {"image": image}}
+        wf["41"] = {"class_type": "ImageScale", "inputs": {"image": ["40", 0], "upscale_method": "lanczos",
+                                                           "width": max(256, sw // 32 * 32),
+                                                           "height": max(256, sh // 32 * 32), "crop": "center"}}
+        wf["6"] = {"class_type": "VAEEncode", "inputs": {"pixels": ["41", 0], "vae": ["3", 0]}}
+        wf["14"] = {"class_type": "SplitSigmasDenoise", "inputs": {"sigmas": ["7", 0],
+                                                                   "denoise": max(0.05, min(1.0, float(strength)))}}
+        wf["12"]["inputs"]["sigmas"] = ["14", 1]
+    return wf
+
+
+def _qwen21_edit_workflow(prompt: str, images: list, seed: int, explicit_lora=None, resolution: int | None = None,
+                          loras=None, reference_size: tuple | None = None, sigmas: str | None = None) -> dict:
+    """Qwen-Image 2.1 Turbo photo edit with 1 to 3 photos (image 1 is the one being changed and sets the shape),
+    using the same loaded model, reader and VAE as the pictures. `resolution` is the pixel budget per side
+    (1024 = about 1 MP, 0 = each photo's own size). `reference_size` (w, h): a new picture that borrows from the
+    photos, in its own shape, instead of the photo's."""
+    wf, model = _qwen21_head(explicit_lora, loras, sigmas)
+    n = len(images[:3])
+    res = int(resolution if resolution is not None else _tune("qwen21_edit_resolution", 1024))
+    enc = {"clip": ["2", 0], "vae": ["3", 0], "prompt": _qwen21_refs(prompt, n), "negative_prompt": "",
+           "resolution": res}
+    for i, name in enumerate(images[:3]):
+        wf[f"3{i}0"] = {"class_type": "LoadImage", "inputs": {"image": name}}
+        enc[f"images.image_{i + 1}"] = [f"3{i}0", 0]
+    latent = ["20", 2]                                 # the template: an empty latent on image 1's resized shape
+    if reference_size:
+        wf["6"] = {"class_type": "EmptyLatentImage", "inputs": {"width": max(256, reference_size[0] // 32 * 32),
+                                                                 "height": max(256, reference_size[1] // 32 * 32),
+                                                                 "batch_size": 1}}
+        latent = ["6", 0]
+    wf.update({
+        "20": {"class_type": "TextEncodeQwenImage21", "inputs": enc},
+        "9": {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}},
+        "11": {"class_type": "CFGGuider", "inputs": {"model": model, "positive": ["20", 0], "negative": ["20", 1],
+                                                     "cfg": 1.0}},
+        "12": {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["9", 0], "guider": ["11", 0],
+                                                                 "sampler": ["8", 0], "sigmas": ["7", 0],
+                                                                 "latent_image": latent}},
+        "13": {"class_type": "VAEDecode", "inputs": {"samples": ["12", 0], "vae": ["3", 0]}},
+        "10": {"class_type": "SaveImageWebsocket", "inputs": {"images": ["13", 0]}},
+    })
+    return wf
+
+
+CHROMA_NEGATIVE = ("This low quality greyscale unfinished sketch is inaccurate and flawed. The image is very blurred "
+                   "and lacks detail with excessive chromatic aberrations and artifacts. The image is overly saturated "
+                   "with excessive bloom. It has a toony aesthetic with bold outlines and flat colors.")
+
+
+def _chroma_workflow(prompt: str, negative: str, w: int, h: int, seed: int, steps: int = 26, cfg: float = 3.5,
+                     sampler: str = "euler", scheduler: str = "beta", shift: float = 1.0,
+                     loras: list | None = None) -> dict:
+    """Chroma1-HD exactly as ComfyUI's own template builds it (fp8mixed model, T5 fp8 with padding off, CFGGuider)."""
+    wf = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "Chroma1-HD-fp8mixed.safetensors",
+                                                     "weight_dtype": "default"}},
+        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "t5xxl_fp8_e4m3fn_scaled.safetensors",
+                                                     "type": "chroma", "device": "default"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": "ae.safetensors"}},
+        "4": {"class_type": "T5TokenizerOptions", "inputs": {"clip": ["2", 0], "min_padding": 0, "min_length": 0}},
+        "5": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["4", 0]}},
+        "6": {"class_type": "CLIPTextEncode", "inputs": {"text": negative or CHROMA_NEGATIVE, "clip": ["4", 0]}},
+        "7": {"class_type": "ModelSamplingAuraFlow", "inputs": {"model": ["1", 0], "shift": float(shift)}},
+        "8": {"class_type": "CFGGuider", "inputs": {"model": ["7", 0], "positive": ["5", 0], "negative": ["6", 0],
+                                                    "cfg": float(cfg)}},
+        "9": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": sampler}},
+        "11": {"class_type": "BasicScheduler", "inputs": {"model": ["7", 0], "scheduler": scheduler,
+                                                          "steps": int(steps), "denoise": 1.0}},
+        "12": {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}},
+        "13": {"class_type": "EmptySD3LatentImage", "inputs": {"width": w, "height": h, "batch_size": 1}},
+        "14": {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["12", 0], "guider": ["8", 0],
+                                                                 "sampler": ["9", 0], "sigmas": ["11", 0],
+                                                                 "latent_image": ["13", 0]}},
+        "15": {"class_type": "VAEDecode", "inputs": {"samples": ["14", 0], "vae": ["3", 0]}},
+        "10": {"class_type": "SaveImageWebsocket", "inputs": {"images": ["15", 0]}},
+    }
+    model = ["1", 0]
+    for i, (name, strength) in enumerate(loras or []):
+        nid = f"20{i}"
+        wf[nid] = {"class_type": "LoraLoaderModelOnly",
+                   "inputs": {"model": model, "lora_name": name, "strength_model": float(strength)}}
+        model = [nid, 0]
+    wf["7"]["inputs"]["model"] = model
+    return wf
+
+
+# ---- Create screen: recipes the phone shows as a form (controls built from ComfyUI's own option lists)
+
+SHAPES = {"square": (1024, 1024), "portrait": (832, 1216), "landscape": (1216, 832), "wallpaper": (704, 1472)}
+COMFY_LORAS = MODELS / "comfy-loras"       # LoRA files ComfyUI can use (inside the capped folder)
+
+CREATE_RECIPES = {
+    "zimage": {
+        # Stock Z-Image Turbo: scenery, objects, everything that isn't the NSFW retrain's speciality.
+        "name": "Z-Image Turbo", "kind": "image", "note": 'Fast all-rounder: places, objects, scenery and people, very photo-like. Keeps things clothed; for explicit pictures pick the NSFW version. Changes under a picture keep the rest.', "unet": "z_image_turbo_bf16.safetensors",
+        "needs": ["Comfy-Org/Z-Image-Turbo"],
+        "file": ("Comfy-Org/Z-Image-Turbo", "split_files/diffusion_models/z_image_turbo_bf16.safetensors"),
+        "defaults": {"steps": 8, "cfg": 1.0, "sampler": "res_multistep", "scheduler": "simple", "shift": 3.0,
+                     "detail": "1.5x"},
+        "negative": False,                     # cfg 1: a negative prompt does nothing on this model
+        "cfg_help": "Made for 1 (fastest). Above 1 follows your words more strictly but takes about twice as long.",
+    },
+    "zimage-nsfw": {
+        # Community retrain for people and explicit content; worse at scenery (11-16: blocky rocks in a seascape).
+        "name": "Z-Image Turbo NSFW", "kind": "image", "note": 'Same speed, retrained for people and explicit pictures. Weaker at scenery (rocks and water can look blocky). Changes under a picture redraw it with this model.', "unet": "z_image_turbo_bf16_nsfw_v2.safetensors",
+        "needs": ["tewea/z_image_turbo_bf16_nsfw", "Comfy-Org/Z-Image-Turbo"],
+        "defaults": {"steps": 8, "cfg": 1.0, "sampler": "res_multistep", "scheduler": "simple", "shift": 3.0,
+                     "detail": "1.5x"},
+        "negative": False,
+        "cfg_help": "Made for 1 (fastest). Above 1 follows your words more strictly but takes about twice as long.",
+    },
+    "chroma": {
+        # Strong on fine natural detail and on explicit content alike; slower (26 steps with guidance).
+        "name": "Chroma1-HD", "kind": "image", "note": "The finest natural detail (skin, hair, fabric, fur) and fine with explicit pictures. About three times slower than Z-Image. Uses 'Leave out'.", "builder": "chroma",
+        "needs": ["Comfy-Org/Chroma1-HD_repackaged", "comfyanonymous/flux_text_encoders", "Comfy-Org/Z-Image-Turbo"],
+        "file": ("Comfy-Org/Chroma1-HD_repackaged", "split_files/diffusion_models/Chroma1-HD-fp8mixed.safetensors"),
+        "defaults": {"steps": 26, "cfg": 4.5, "sampler": "euler", "scheduler": "beta", "shift": 1.0},
+        "negative": True,
+        "detail_pass": False,                  # 26 steps already draw fine texture
+        "cfg_help": "Also how hard it avoids 'Leave out'. Too high (8+) looks harsh and over-cooked.",
+    },
+    "qwen21": {
+        # 11-17: Qwen-Image 2.1 Turbo. Opt-in until the owner's real use (the Queue screen's timings) shows it is at
+        # least as good: it is NOT in AUTO_MODELS_DEFAULT. Makes and edits with the same loaded model.
+        "name": QWEN21_NAME, "kind": "image", "builder": "qwen21",
+        "note": "New. Follows long, exact descriptions and lettering well, and makes and edits photos with the same "
+                "model, so nothing reloads between them. Explicit add-on below. 8 steps.",
+        "needs": [QWEN21_REPO],
+        "ready": lambda: _qwen21_ready(),
+        "defaults": {"steps": 8, "cfg": 1.0, "sampler": "euler", "scheduler": "simple", "shift": 1.0,
+                     "explicit": "Auto"},
+        "negative": False, "detail_pass": False, "uses_shift": False, "uses_scheduler": False,
+        "uses_steps": False, "uses_sampler": False,           # the 8 sigmas are fixed (the template's note)
+        "cfg_help": "Made for 1 (fastest). Above 1 takes about twice as long and changes little.",
+    },
+}
+
+
+_START_POINTS = {   # builder -> (blank-canvas node, vae output, node whose denoise sets the strength)
+    "zimage": ("6", ["3", 0], "8"),
+    "chroma": ("13", ["3", 0], "11"),
+}
+
+
+def _start_from(wf: dict, builder: str, image: str, w: int, h: int, strength: float):
+    """Replaces the recipe's blank canvas with the photo (fitted to w x h) and redraws `strength` of it
+    (0.2 = barely touched, 1.0 = only the rough layout survives)."""
+    latent, vae, denoise_node = _START_POINTS[builder]
+    wf["40"] = {"class_type": "LoadImage", "inputs": {"image": image}}
+    wf["41"] = {"class_type": "ImageScale", "inputs": {"image": ["40", 0], "upscale_method": "lanczos",
+                                                       "width": w, "height": h, "crop": "center"}}
+    wf[latent] = {"class_type": "VAEEncode", "inputs": {"pixels": ["41", 0], "vae": vae}}
+    wf[denoise_node]["inputs"]["denoise"] = max(0.05, min(1.0, float(strength)))
+
+
+PAINT_STRENGTH = {"zimage": 0.9, "chroma": 0.9, "qwen21": 1.0}   # "Auto" on the phone's Change slider
+
+
+def _paint_crop(photo, mask_img):
+    """Crop-and-stitch, step 1: the painted spot grown a little and feathered, plus context around it, scaled to
+    about 1 MP so even a small spot is redrawn at full detail. Returns (crop, crop mask, box, soft full mask)."""
+    from PIL import Image, ImageFilter
+    W, H = photo.size
+    hard = mask_img.convert("L").resize((W, H), Image.BILINEAR).point(lambda x: 255 if x > 127 else 0)
+    if not hard.getbbox():
+        raise UserFacing("Paint over the spot to change first.")
+    grow = max(6, round(min(W, H) * 0.012))
+    grown = hard.filter(ImageFilter.GaussianBlur(grow)).point(lambda x: 255 if x > 8 else 0)   # fast dilation
+    soft = grown.filter(ImageFilter.GaussianBlur(max(3, grow // 2)))
+    x0, y0, x1, y1 = soft.getbbox()
+    bw, bh = x1 - x0, y1 - y0
+    pad = int(max(bw, bh) * 0.5) + 32                     # enough surroundings for the model to match them
+    cw, ch = min(W, bw + 2 * pad), min(H, bh + 2 * pad)
+    cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
+    left = max(0, min(W - cw, cx - cw // 2))
+    top = max(0, min(H - ch, cy - ch // 2))
+    box = (left, top, left + cw, top + ch)
+    scale = min(4.0, (1_000_000 / max(1, cw * ch)) ** 0.5)
+    tw, th = max(256, int(cw * scale) // 16 * 16), max(256, int(ch * scale) // 16 * 16)
+    crop = photo.crop(box).resize((tw, th), Image.LANCZOS)
+    crop_mask = soft.crop(box).resize((tw, th), Image.BILINEAR)
+    return crop, crop_mask, box, soft
+
+
+def _paint_workflow(r: dict, v: dict, w: int, h: int, seed: int, loras: list, crop_name: str, mask_name: str,
+                    strength: float) -> dict:
+    """The recipe's own graph redrawing only the masked part of the crop: the crop is encoded as the starting
+    latent, SetLatentNoiseMask limits the noise to the spot, Differential Diffusion follows the soft edge."""
+    builder = r.get("builder", "zimage")
+    if builder == "qwen21":
+        # The crop is image 1 of the 2.1 editor at its own size (resolution 0, so the mask lines up); only the masked
+        # part is redrawn, at full strength (the 8 sigmas are fixed).
+        wf = _qwen21_edit_workflow(v.get("prompt") or "", [crop_name], seed,
+                                   _qwen21_explicit(v.get("explicit"), None, None), resolution=0, loras=loras)
+        wf["42"] = {"class_type": "LoadImageMask", "inputs": {"image": mask_name, "channel": "red"}}
+        wf["43"] = {"class_type": "VAEEncode", "inputs": {"pixels": ["300", 0], "vae": ["3", 0]}}
+        wf["6"] = {"class_type": "SetLatentNoiseMask", "inputs": {"samples": ["43", 0], "mask": ["42", 0]}}
+        wf["12"]["inputs"]["latent_image"] = ["6", 0]
+        wf["44"] = {"class_type": "DifferentialDiffusion", "inputs": {"model": wf["11"]["inputs"]["model"],
+                                                                      "strength": 1.0}}
+        wf["11"]["inputs"]["model"] = ["44", 0]
+        return wf
+    wf = _recipe_workflow(r, {**v, "detail": "Off"}, w, h, seed, loras)
+    latent, vae, denoise_node = _START_POINTS[builder]
+    wf["40"] = {"class_type": "LoadImage", "inputs": {"image": crop_name}}
+    wf["42"] = {"class_type": "LoadImageMask", "inputs": {"image": mask_name, "channel": "red"}}
+    wf["43"] = {"class_type": "VAEEncode", "inputs": {"pixels": ["40", 0], "vae": vae}}
+    wf[latent] = {"class_type": "SetLatentNoiseMask", "inputs": {"samples": ["43", 0], "mask": ["42", 0]}}
+    wf["44"] = {"class_type": "DifferentialDiffusion", "inputs": {"model": wf["8"]["inputs"]["model"],
+                                                                  "strength": 1.0}}
+    wf["8"]["inputs"]["model"] = ["44", 0]
+    wf[denoise_node]["inputs"]["denoise"] = max(0.05, min(1.0, float(strength)))
+    return wf
+
+
+def _paint_picture(r, v, seed, loras, photo, mask_b64, emit, cancel):
+    """Paint to change: the picture's own model redraws only the painted spot; every other pixel is kept."""
+    import uuid
+    from PIL import Image
+    crop, crop_mask, box, soft = _paint_crop(photo, _image_in(mask_b64))
+    if r.get("builder") == "qwen21":                       # 2.1 reads in 32s: keep the crop and its mask lined up
+        nw, nh = max(256, crop.width // 32 * 32), max(256, crop.height // 32 * 32)
+        if (nw, nh) != crop.size:
+            crop, crop_mask = crop.resize((nw, nh), Image.LANCZOS), crop_mask.resize((nw, nh), Image.BILINEAR)
+    tag = uuid.uuid4().hex
+    crop_name, mask_name = f"pc_{tag}.png", f"pm_{tag}.png"
+    folder = COMFY_PRIVATE / "input"
+    folder.mkdir(parents=True, exist_ok=True)
+    try:
+        crop.save(folder / crop_name, format="PNG")
+        crop_mask.convert("RGB").save(folder / mask_name, format="PNG")
+        builder = r.get("builder", "zimage")
+        strength = v.get("strength")
+        strength = float(strength) if strength not in (None, "") else PAINT_STRENGTH.get(builder, 0.9)
+        if builder == "zimage" and strength < 0.7:
+            v = {**v, "steps": max(int(v["steps"]), 12)}   # 8 steps x low denoise leaves ~5 real steps: soft
+        wf = _paint_workflow(r, v, crop.width, crop.height, seed, loras, crop_name, mask_name, strength)
+        png = asyncio.run(_comfy_run(wf, emit, cancel, previews=True))
+    finally:
+        (folder / crop_name).unlink(missing_ok=True)
+        (folder / mask_name).unlink(missing_ok=True)
+    if cancel.is_set() or not png:
+        return
+    patch = Image.open(io.BytesIO(png)).convert("RGB").resize((box[2] - box[0], box[3] - box[1]), Image.LANCZOS)
+    out = photo.copy()
+    out.paste(patch, box[:2], soft.crop(box))
+    buf = io.BytesIO()
+    out.save(buf, format="PNG")
+    emit({"t": "image", "v": base64.b64encode(buf.getvalue()).decode(), "seed": seed, "index": 0})
+    emit({"t": "progress", "v": 1.0})
+
+
+WAN14_REPO = "Comfy-Org/Wan_2.2_ComfyUI_Repackaged"
+WAN_TE_REPO = "Comfy-Org/Wan_2.1_ComfyUI_repackaged"
+WAN14_FILES = {
+    "high": "wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors",
+    "low": "wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors",
+    "lora_high": "wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors",
+    "lora_low": "wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors",
+    "vae": "wan_2.1_vae.safetensors",
+    "te": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+}
+# Explicit-motion add-on (community "NSFW-22", one file per expert). Loaded only when the request uses explicit
+# words (phone_config.json "explicit_pattern", editable without an app update), so ordinary clips are untouched.
+WAN_EXPLICIT_REPO = "lopi999/Wan2.2-I2V_General-NSFW-LoRA"
+WAN_EXPLICIT = ("NSFW-22-H-e8.safetensors", "NSFW-22-L-e8.safetensors", "nsfwsks")   # high, low, trigger word
+EXPLICIT_PATTERN_DEFAULT = (r"\b(nsfw|nude|nudes|nudity|naked|topless|bottomless|explicit|porn\w*|sex|sexy|sexual\w*|"
+                            r"erotic\w*|lewd|undress\w*|breasts?|boobs?|tits|nipples?|pussy|vagina|penis|cock|"
+                            r"genitals?|blowjob|handjob|fuck\w*|masturbat\w*|orgasm\w*|cum|cums|cumming|cumshot)\b")
+
+
+def _is_explicit(text: str) -> bool:
+    """True when the words are explicit (phone_config "explicit_pattern", editable without an app update)."""
+    import re
+    try:
+        cfg = json.loads(PHONE_CONFIG.read_text(encoding="utf-8"))
+    except Exception:
+        cfg = {}
+    try:
+        return bool(re.search(cfg.get("explicit_pattern") or EXPLICIT_PATTERN_DEFAULT, text or "", re.IGNORECASE))
+    except re.error:
+        return False
+
+
+# The chat picks models by itself (the owner 11-17: chat is "just another way"; the Make tab is where the choosing happens). Editable
+# in phone_config "auto_models"; a missing or not-installed choice falls back down each list.
+AUTO_MODELS_DEFAULT = {
+    "picture_explicit": ["chroma", "zimage-nsfw", "zimage"],
+    "picture": ["zimage", "zimage-nsfw", "chroma"],
+    "edit_explicit": ["zimage-nsfw", "chroma"],
+    "edit_explicit_strength": 0.6,
+}
+
+
+def _auto_models() -> dict:
+    try:
+        cfg = json.loads(PHONE_CONFIG.read_text(encoding="utf-8")).get("auto_models") or {}
+    except Exception:
+        cfg = {}
+    return {**AUTO_MODELS_DEFAULT, **cfg}
+
+
+def _first_ready(ids: list) -> dict | None:
+    for rid in ids or []:
+        r = CREATE_RECIPES.get(rid)
+        if r and _recipe_ready(r):
+            return r
+    return None
+
+
+def _picture_recipe(p: dict) -> dict | None:
+    """The recipe for a chat picture: the phone's explicit choice (newer builds send "model_choice"), otherwise
+    chosen from the brain's "explicit" flag (or, on old phones, the words): explicit -> the explicit model, anything
+    else -> stock Z-Image. A saved choice that is gone (bigASP, FLUX klein) falls through to this."""
+    choice = p.get("model_choice")
+    if choice and choice != "auto":
+        r = CREATE_RECIPES.get(choice) or _chat_recipe(choice)
+        if r and _recipe_ready(r):
+            return r
+    a = _auto_models()
+    flag = p.get("explicit")                           # 11-17: the brain's own call (newer phones); old ones: the words
+    explicit = flag is True or _is_explicit(p.get("prompt") or "")     # only a true flag adds to the words; false = "not said"
+    return _first_ready(a["picture_explicit"] if explicit else a["picture"])
+
+
+def _explicit_video(prompt: str, mode: str | None = None) -> float:
+    """Strength for the explicit add-on (0 = not loaded). The phone's "Explicit videos" switch decides: "on" every
+    video, "off" never, "auto" (and builds without the switch) only when the request's words are explicit."""
+    import re
+    try:
+        cfg = json.loads(PHONE_CONFIG.read_text(encoding="utf-8"))
+    except Exception:
+        cfg = {}
+    snap = _snapshot(WAN_EXPLICIT_REPO)
+    if snap is None or not all((snap / f).is_file() for f in WAN_EXPLICIT[:2]):
+        return 0.0
+    mode = str(mode or "auto").lower()
+    if mode == "off":
+        return 0.0
+    if mode != "on" and not _is_explicit(prompt):
+        return 0.0
+    return max(0.0, min(2.0, float(cfg.get("video_explicit_strength", 1.0))))
+
+
+COMFY_VIDEO = os.environ.get("FIXER_COMFY_VIDEO", "1") != "0"         # 0 = back to the 5B diffusers video
+WAN14_AREA = int(os.environ.get("FIXER_WAN_AREA", str(832 * 480)))   # pixels per frame; 1280*720 = HD, ~2.5x slower
+WAN14_FPS = 16                                                         # trained rate: 81 frames = 5 s
+
+
+def _wan14_ready() -> bool:
+    w, te = _snapshot(WAN14_REPO), _snapshot(WAN_TE_REPO)
+    if w is None or te is None:
+        return False
+    sf = w / "split_files"
+    return all((sf / d / WAN14_FILES[k]).is_file() for k, d in
+               (("high", "diffusion_models"), ("low", "diffusion_models"), ("lora_high", "loras"),
+                ("lora_low", "loras"), ("vae", "vae"))) \
+        and (te / "split_files" / "text_encoders" / WAN14_FILES["te"]).is_file()
+
+
+def _wan14_workflow(prompt: str, image: str, w: int, h: int, length: int, seed: int, steps: int = 4,
+                    split: int = 2, shift: float = 5.0, explicit: float = 0.0) -> dict:
+    """Wan 2.2 image-to-video A14B as ComfyUI's own template builds it: the high-noise expert draws the motion for the
+    first half of the steps, the low-noise expert the detail for the rest, each with its lightx2v 4-step LoRA, cfg 1."""
+    f = WAN14_FILES
+    if explicit > 0:
+        prompt = f"{WAN_EXPLICIT[2]}, {prompt}"
+    wf = {
+        "1": {"class_type": "LoadImage", "inputs": {"image": image}},
+        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": f["te"], "type": "wan", "device": "default"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": f["vae"]}},
+        "4": {"class_type": "UNETLoader", "inputs": {"unet_name": f["high"], "weight_dtype": "default"}},
+        "5": {"class_type": "UNETLoader", "inputs": {"unet_name": f["low"], "weight_dtype": "default"}},
+        "6": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["4", 0], "lora_name": f["lora_high"],
+                                                              "strength_model": 1.0}},
+        "7": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["5", 0], "lora_name": f["lora_low"],
+                                                              "strength_model": 1.0}},
+        "8": {"class_type": "ModelSamplingSD3", "inputs": {"model": ["6", 0], "shift": float(shift)}},
+        "9": {"class_type": "ModelSamplingSD3", "inputs": {"model": ["7", 0], "shift": float(shift)}},
+        "10": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": prompt}},
+        "11": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": ""}},
+        "12": {"class_type": "WanImageToVideo", "inputs": {"positive": ["10", 0], "negative": ["11", 0],
+                                                           "vae": ["3", 0], "width": w, "height": h,
+                                                           "length": length, "batch_size": 1,
+                                                           "start_image": ["1", 0]}},
+        "13": {"class_type": "KSamplerAdvanced", "inputs": {
+            "model": ["8", 0], "add_noise": "enable", "noise_seed": seed, "steps": steps, "cfg": 1.0,
+            "sampler_name": "euler", "scheduler": "simple", "positive": ["12", 0], "negative": ["12", 1],
+            "latent_image": ["12", 2], "start_at_step": 0, "end_at_step": split,
+            "return_with_leftover_noise": "enable"}},
+        "14": {"class_type": "KSamplerAdvanced", "inputs": {
+            "model": ["9", 0], "add_noise": "disable", "noise_seed": 0, "steps": steps, "cfg": 1.0,
+            "sampler_name": "euler", "scheduler": "simple", "positive": ["12", 0], "negative": ["12", 1],
+            "latent_image": ["13", 0], "start_at_step": split, "end_at_step": steps,
+            "return_with_leftover_noise": "disable"}},
+        "15": {"class_type": "VAEDecode", "inputs": {"samples": ["14", 0], "vae": ["3", 0]}},
+        "16": {"class_type": "SaveImageWebsocket", "inputs": {"images": ["15", 0]}},
+    }
+    if explicit > 0:                                   # each expert gets its own half of the add-on, after lightx2v
+        wf["60"] = {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["6", 0], "lora_name": WAN_EXPLICIT[0],
+                                                                    "strength_model": float(explicit)}}
+        wf["70"] = {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["7", 0], "lora_name": WAN_EXPLICIT[1],
+                                                                    "strength_model": float(explicit)}}
+        wf["8"]["inputs"]["model"] = ["60", 0]
+        wf["9"]["inputs"]["model"] = ["70", 0]
+    return wf
+
+
+def _wan14_size(w: int, h: int) -> tuple[int, int]:
+    """The photo's shape at WAN14_AREA pixels, sides divisible by 16."""
+    ar = h / max(1, w)
+    return (max(256, int(round((WAN14_AREA / ar) ** 0.5)) // 16 * 16),
+            max(256, int(round((WAN14_AREA * ar) ** 0.5)) // 16 * 16))
+
+
+def _room_for_pictures() -> None:
+    """11-17: the MoE brain keeps its card share (ComfyUI reserves it). Only the dense brain still takes turns."""
+    if LLAMA.running() and LLAMA.on_gpu and not LLAMA.moe:
+        LLAMA.stop()
+    if _tune("picture_ram_gb", 0) > 0 and LLAMA.moe and _ram()[0] < _tune("picture_ram_gb", 0):
+        COMFY.free()                        # drop cached picture models first; the brain only if still short
+        if _ram()[0] < _tune("picture_ram_gb", 0):
+            LLAMA.pause("picture", lambda s: None)
+
+
+def _brain_ram_gb() -> float:
+    """What the MoE brain takes from RAM when it starts: its weights file (the card share is small)."""
+    choice = gguf_choice(LAST_BRAIN) if _is_moe(LAST_BRAIN) else None
+    return sum(z for _, z in choice[0]) / 1024 ** 3 if choice else 0.0
+
+
+def _room_for_video(status) -> None:
+    """11-17: Wan 2.2 14B holds ~38 GB of RAM in ComfyUI; the MoE brain's experts ~17 GB; 64 GB can't always hold
+    both plus Windows. Check what is free; first drop ComfyUI's cached picture models, then (only if still short)
+    pause the brain for this video and say so. Dense brain: stops as before (it can't share the card with a video)."""
+    if not _is_moe(LLAMA.repo or LAST_BRAIN):
+        if LLAMA.running() and LLAMA.on_gpu:
+            status("Freeing memory…")
+            LLAMA.stop()
+        return
+    if LLAMA.paused_for:                 # the video before this one already made room; keep it that way
+        return
+    need = _tune("video_ram_gb", 42)
+    brain_gb = 0.0 if LLAMA.running() else _brain_ram_gb()      # an idle brain would come back mid-video
+    if _ram()[0] - brain_gb >= need:
+        return
+    COMFY.free()
+    if _ram()[0] - brain_gb >= need:
+        return
+    LLAMA.pause("video", status)
+
+
+def job_comfy_video(p: dict, emit, cancel):
+    VIDEO_BUSY.set()                                   # a chat meanwhile answers from RAM, not the full card
+    try:
+        _comfy_video(p, emit, cancel)
+    finally:
+        VIDEO_BUSY.clear()
+        if LLAMA.running() and not LLAMA.on_gpu:
+            LLAMA.stop()                               # next chat starts on the card again
+
+
+def _comfy_video(p: dict, emit, cancel):
+    """A 5 s clip with Wan 2.2 A14B in ComfyUI. From a photo it animates that photo; from words alone it first draws
+    the opening frame with Z-Image Turbo, then animates it (the 14B model only works from a picture)."""
+    import uuid
+    import numpy as np
+    from PIL import Image
+    status = lambda s: emit({"t": "status", "v": s})  # noqa: E731
+    prompt = p.get("prompt") or "natural motion, the camera holds steady"
+    seed = int(p.get("seed") or int.from_bytes(os.urandom(4), "big")) % (2 ** 32)
+    seconds = max(1.0, min(5.0, float(p.get("seconds", 5))))
+    length = int(round(seconds * WAN14_FPS / 4)) * 4 + 1
+    _room_for_video(status)
+    if _worker_alive():
+        WORKER.stop()
+    COMFY.ensure_current(status)
+    name = f"vid_{uuid.uuid4().hex}.png"
+    folder = COMFY_PRIVATE / "input"
+    folder.mkdir(parents=True, exist_ok=True)
+    try:
+        if p.get("image"):
+            start = _image_in(p["image"])
+            w, h = _wan14_size(*start.size)
+        else:
+            w, h = _wan14_size(16, 9) if p.get("aspect") != "portrait" else _wan14_size(9, 16)
+            r = CREATE_RECIPES["zimage"] if _recipe_ready(CREATE_RECIPES["zimage"]) else CREATE_RECIPES["zimage-nsfw"]
+            v = {**r["defaults"], "prompt": prompt, "detail": "Off"}
+            fw, fh = (w * 2) // 16 * 16, (h * 2) // 16 * 16          # draw the first frame sharp, at ~1.6 MP
+            status("Drawing the first frame…")
+            png = asyncio.run(_comfy_run(_recipe_workflow(r, v, fw, fh, seed), lambda o: None, cancel))
+            if cancel.is_set() or not png:
+                return
+            start = Image.open(io.BytesIO(png)).convert("RGB")
+        start.resize((w, h), Image.LANCZOS).save(folder / name, format="PNG")
+        status("Loading the video model…")
+        strength = _explicit_video(prompt, p.get("explicit"))
+        wf = _wan14_workflow(prompt, name, w, h, length, seed, explicit=strength)
+        _timing(model="Wan 2.2 14B", explicit=strength > 0, mp=w * h / 1e6, steps=4, count=length)
+        def part(o):
+            if o.get("t") != "progress":
+                emit(o)
+            elif o.get("node") in ("13", "14"):        # the two experts: first and second half of the bar
+                emit({"t": "progress", "v": round((0.0 if o["node"] == "13" else 0.475) + o["v"] * 0.475, 3)})
+        frames = asyncio.run(_comfy_run(wf, part, cancel, frames=True, label="Creating video…"))
+    finally:
+        (folder / name).unlink(missing_ok=True)
+    if cancel.is_set() or not frames:
+        return
+    status("Finishing video…")
+    arr = np.stack([np.asarray(Image.open(io.BytesIO(b)).convert("RGB")) for b in frames])
+    mp4 = _encode_mp4(arr, WAN14_FPS)
+    del arr, frames
+    emit({"t": "progress", "v": 1.0})
+    emit({"t": "video", "v": base64.b64encode(mp4).decode(), "seconds": round((length - 1) / WAN14_FPS, 2),
+          "width": w, "height": h, "seed": seed})
+
+
+def _photo_size(img, megapixels: float = 1.0) -> tuple[int, int]:
+    """The photo's own shape at about `megapixels`, sides divisible by 16."""
+    w, h = img.size
+    scale = (megapixels * 1_000_000 / max(1, w * h)) ** 0.5
+    return max(256, int(w * scale) // 16 * 16), max(256, int(h * scale) // 16 * 16)
+
+
+def _recipe_workflow(r: dict, v: dict, w: int, h: int, seed: int, loras: list | None = None) -> dict:
+    """The ComfyUI workflow for recipe `r` with values `v` (the recipe's defaults filled in by the caller)."""
+    prompt = v.get("prompt") or "high quality photo"
+    if r.get("builder") == "qwen21":
+        return _qwen21_workflow(prompt, w, h, seed, v.get("cfg", 1.0), v.get("negative") or "",
+                                _qwen21_explicit(v.get("explicit"), v.get("brain_explicit"), v.get("base_recipe")),
+                                loras)
+    if r.get("builder") == "chroma":
+        return _chroma_workflow(prompt, v.get("negative") or "", w, h, seed, v["steps"], v["cfg"], v["sampler"],
+                                v["scheduler"], v["shift"], loras)
+    detail = {"1.5x": 1.5, "2x": 2.0}.get(str(v.get("detail") or "Off"), 0.0)
+    return _zimage_workflow(prompt, w, h, seed, v["steps"], v["cfg"], v["sampler"], v["scheduler"], v["shift"],
+                            loras, unet=r["unet"], detail=detail, te=_zimage_text_reader())
+
+
+def _chat_recipe(model: str) -> dict | None:
+    """The Create recipe behind a phone picture-model id, if its files are on this computer."""
+    r = CREATE_RECIPES.get(COMFY_RECIPES.get(model or "", ""))
+    return r if r and _recipe_ready(r) else None
+
+
+def _zimage_text_reader() -> str:
+    """The full-precision Qwen3 4B reader ComfyUI's own Z-Image template uses, once downloaded; the 8-bit one until
+    then."""
+    z = _snapshot("Comfy-Org/Z-Image-Turbo")
+    full = "qwen_3_4b.safetensors"
+    return full if z is not None and (z / "split_files" / "text_encoders" / full).is_file() \
+        else "qwen_3_4b_fp8_mixed.safetensors"
+
+
+def _recipe_ready(r: dict) -> bool:
+    """All repos there, and the recipe's own model file (when it names one) actually downloaded."""
+    if not all(_snapshot(n) is not None for n in r["needs"]):
+        return False
+    if "ready" in r and not r["ready"]():
+        return False
+    if "file" in r:
+        snap = _snapshot(r["file"][0])
+        return snap is not None and (snap / r["file"][1]).is_file()
+    return True
+
+
+def _comfy_options(node: str, field: str) -> list[str]:
+    try:
+        req = COMFY._get(f"/object_info/{node}")[node]["input"]["required"][field]
+        return list(req[0]) if isinstance(req[0], list) else []
+    except Exception:
+        return []
+
+
+# Sampler / schedule menus in plain words: only the few that suit each model, the recommended one first and marked.
+# The phone sends the whole label back; _menu_value() turns it back into ComfyUI's name.
+SAMPLER_WORDS = {
+    "res_multistep": "clean and fast",
+    "euler": "clean and predictable, the safe choice",
+    "euler_ancestral": "looser, more variety, less exact",
+    "dpmpp_2m": "sharp and detailed, a great all-rounder",
+    "dpmpp_2m_sde": "more fine texture and grain, a little random",
+    "dpmpp_sde": "rich detail, slower",
+    "uni_pc": "fast, good with few steps",
+}
+SCHEDULE_WORDS = {
+    "simple": "even spacing",
+    "beta": "extra care on fine detail at the end",
+    "karras": "the classic SDXL choice, crisp",
+    "exponential": "softer, smoother",
+    "sgm_uniform": "smooth and balanced",
+    "normal": "standard spacing",
+}
+RECIPE_CHOICES = {   # builder -> (samplers, schedules), recommended first
+    "zimage": (["res_multistep", "euler", "dpmpp_2m", "dpmpp_2m_sde"], ["simple", "beta", "sgm_uniform"]),
+    "chroma": (["euler", "res_multistep", "dpmpp_2m", "uni_pc"], ["beta", "simple", "sgm_uniform"]),
+    "qwen21": (["euler"], ["simple"]),
+}
+
+
+def _labelled(names: list[str], words: dict, default: str) -> list[str]:
+    return [f"{n} ({'recommended: ' if n == default else ''}{words.get(n, '')})" for n in names]
+
+
+def _menu_value(choice) -> str:
+    """'dpmpp_2m (sharp and detailed...)' -> 'dpmpp_2m' (old builds send the bare name, which passes through)."""
+    return str(choice or "").split(" (", 1)[0].strip()
+
+
+def _recipe_controls(r: dict) -> list[dict]:
+    d = r["defaults"]
+    samplers, schedules = RECIPE_CHOICES.get(r.get("builder", "zimage"), RECIPE_CHOICES["zimage"])
+    c = [
+        {"key": "prompt", "label": "Describe the picture", "kind": "text",
+         "help": r.get("prompt_help", "Say what's in it, where, the light and the style. Your words go to the model "
+                                      "exactly as written.")},
+        {"key": "shape", "label": "Shape", "kind": "shape", "options": list(SHAPES), "default": "square",
+         "help": "Square, tall (phone screen) or wide (TV). Changes the layout, not the quality."},
+        {"key": "count", "label": "How many", "kind": "int", "min": 1, "max": 4, "step": 1, "default": 1,
+         "help": "Pictures from one press, each a little different. Each one adds the same time again."},
+        {"key": "detail", "label": "Detail pass", "kind": "menu", "options": ["Off", "1.5x", "2x"],
+         "default": d.get("detail", "Off"),
+         "help": "Enlarges the picture and redraws fine texture (rock, water, skin). Adds a few seconds."},
+        {"key": "cfg", "label": "Guidance", "kind": "float", "min": 1.0, "max": 10.0, "step": 0.1, "default": d["cfg"],
+         "left": "Looser, more creative", "right": "Stricter, follows your words",
+         "help": r.get("cfg_help", "How strictly to follow your words.")},
+        {"key": "steps", "label": "Steps", "kind": "int", "min": 1, "max": 50, "step": 1, "default": d["steps"],
+         "advanced": True, "left": "Faster", "right": "More detail",
+         "help": f"How many passes the model makes. Recommended: {d['steps']}. Fewer is quicker but rougher; more "
+                 "takes longer and past the recommended number rarely looks better."},
+        {"key": "sampler", "label": "Sampler (how it draws)", "kind": "menu",
+         "options": _labelled(samplers, SAMPLER_WORDS, d["sampler"]),
+         "default": _labelled([d["sampler"]], SAMPLER_WORDS, d["sampler"])[0], "advanced": True,
+         "help": "Changes the look slightly: cleaner vs more texture. The recommended one is right for this model."},
+        {"key": "scheduler", "label": "Schedule (where effort goes)", "kind": "menu",
+         "options": _labelled(schedules, SCHEDULE_WORDS, d["scheduler"]),
+         "default": _labelled([d["scheduler"]], SCHEDULE_WORDS, d["scheduler"])[0], "advanced": True,
+         "help": "Small effect. Leave on the recommended one unless a picture looks too soft or too harsh."},
+        {"key": "shift", "label": "Shift", "kind": "float", "min": 1.0, "max": 10.0, "step": 0.5, "default": d["shift"],
+         "advanced": True, "left": "Finer detail", "right": "Bolder layout",
+         "help": "Where the model spends its effort: low favours small detail, high favours the big shapes and "
+                 "composition. Leave on the recommended value unless faces or layouts look off."},
+        {"key": "seed", "label": "Seed", "kind": "seed", "advanced": True,
+         "help": "The starting point of a picture. Random gives a new picture each time; the same seed with the same "
+                 "settings gives the same picture again, so you can change one thing and compare."},
+    ]
+    if r.get("builder") == "qwen21":
+        lora = _qwen21_lora()
+        ctl = {"key": "explicit", "label": "Explicit add-on", "kind": "menu", "options": ["Auto", "On", "Off"],
+               "default": "Auto",
+               "help": "On loads the explicit add-on for nudity and sex. Off never does. Auto: only when you change a "
+                       "picture that was made with it on. Your words are never changed."}
+        if lora is None:
+            ctl.update({"options": ["Off"], "default": "Off",
+                        "help": "The explicit add-on isn't on your computer yet."})
+        c.insert(next(i for i, x in enumerate(c) if x["key"] == "count") + 1, ctl)
+    if r.get("negative"):
+        c.insert(1, {"key": "negative", "label": "Leave out", "kind": "text", "advanced": True,
+                     "help": "Things to keep out of the picture (e.g. 'text, blurry, extra fingers'). Empty uses the "
+                             "model's own recommended list."})
+    if not r.get("detail_pass", True):
+        c = [x for x in c if x["key"] != "detail"]
+    if not r.get("uses_shift", True):
+        c = [x for x in c if x["key"] != "shift"]
+    if not r.get("uses_scheduler", True):
+        c = [x for x in c if x["key"] != "scheduler"]
+    if not r.get("uses_steps", True):
+        c = [x for x in c if x["key"] != "steps"]
+    if not r.get("uses_sampler", True):
+        c = [x for x in c if x["key"] != "sampler"]
+    return c
+
+
+PROMPT_TOGGLES = ROOT / "prompt_toggles.json"     # the Create screen's prompt helpers; read fresh every time
+PHONE_CONFIG = ROOT / "phone_config.json"         # texts / word lists the phone uses (no app update needed)
+
+
+def job_config(p: dict, emit, cancel):
+    """The phone's tunable texts and lists (it keeps the last copy for when the computer is off)."""
+    try:
+        cfg = json.loads(PHONE_CONFIG.read_text(encoding="utf-8"))
+    except Exception:
+        cfg = {}
+    if SEARCH_URL:
+        cfg["search_url"] = SEARCH_URL                 # the phone's own search when the computer is off
+    emit({"t": "info", "config": cfg})
+
+
+def _prompt_style(r: dict) -> str:
+    """Which phrasing a recipe's toggles use: Chroma sentences with negatives, or the positive sentences of Z-Image
+    and Qwen-Image 2.1 (both run at guidance 1, so negatives do nothing there)."""
+    return {"chroma": "chroma"}.get(r.get("builder", ""), "zimage")
+
+
+def _toggle_library() -> list[dict]:
+    try:
+        return json.loads(PROMPT_TOGGLES.read_text(encoding="utf-8")).get("groups", [])
+    except Exception:
+        return []
+
+
+def _recipe_toggles(r: dict) -> list[dict]:
+    """The toggle groups for one recipe: label + the phrasing for its model (only items that have one)."""
+    style = _prompt_style(r)
+    out = []
+    for g in _toggle_library():
+        items = [{"id": it["id"], "label": it["label"]} for it in g.get("items", [])
+                 if (it.get(style) or {}).get("p") or (it.get(style) or {}).get("n")]
+        if items:
+            out.append({"name": g.get("name", ""), "items": items})
+    return out
+
+
+def _apply_toggles(r: dict, v: dict) -> dict:
+    """Adds the chosen toggles to the prompt (and their negatives to 'Leave out' where the model uses one)."""
+    ids = set(v.get("toggles") or [])
+    if not ids:
+        return v
+    style = _prompt_style(r)
+    pos, neg = [], []
+    for g in _toggle_library():
+        for it in g.get("items", []):
+            if it.get("id") in ids:
+                phr = it.get(style) or {}
+                if phr.get("p"):
+                    pos.append(phr["p"])
+                if phr.get("n"):
+                    neg.append(phr["n"])
+    sep = ". "
+    prompt = (v.get("prompt") or "").strip().rstrip(".")
+    v = {**v, "prompt": sep.join([x for x in [prompt] + pos if x])}
+    if neg and r.get("negative"):
+        base = (v.get("negative") or "").strip()
+        v["negative"] = ", ".join([base or CHROMA_NEGATIVE] + neg)
+    return v
+
+
+def job_comfy_recipes(p: dict, emit, cancel):
+    """The Create screen's list: recipes whose files are on this computer, their controls, and the LoRA files."""
+    COMFY.ensure()
+    recipes = [{"id": k, "name": r["name"], "kind": r["kind"], "note": r.get("note"), "controls": _recipe_controls(r),
+                "toggles": _recipe_toggles(r)}
+               for k, r in CREATE_RECIPES.items() if _recipe_ready(r)]
+    loras = sorted(f.name for f in COMFY_LORAS.glob("*.safetensors")) if COMFY_LORAS.is_dir() else []
+    emit({"t": "info", "recipes": recipes, "loras": loras})
+
+
+# ---------------------------------------------------------------- Make's style recipes and the age floor (11-17)
+
+# THE age floor for people in generated pictures and video: single source (the owner, 11-17). Applied to every
+# picture/video request right before it runs (after the enhancer, see queue_runner), and sent to the phone so Make's
+
+
+# The recipes and quick picks live in a PRIVATE file beside the server (never in git; the owner edits it, and an
+# edit shows the next time Make opens). The public example below is the fallback when it is missing.
+RECIPE_FILE = ROOT / "recipes.json"
+RECIPE_EXAMPLE = Path(__file__).with_name("recipes.example.json")
+
+
+def _shape_name(size) -> str | None:
+    """'832x1216' -> the closest of SHAPES by aspect ratio."""
+    try:
+        w, h = (int(x) for x in str(size).lower().split("x"))
+    except (TypeError, ValueError):
+        return None
+    ratio = w / max(1, h)
+    return min(SHAPES, key=lambda k: abs(ratio - SHAPES[k][0] / SHAPES[k][1]))
+
+
+def _make_catalog() -> dict:
+    """recipes.json in the shape the phone's Make screen reads (recipes for models that aren't here are left out)."""
+    src = RECIPE_FILE if RECIPE_FILE.is_file() else RECIPE_EXAMPLE
+    try:
+        data = json.loads(src.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        data = {}
+    recipes = []
+    for d in data.get("recipes") or []:
+        if not isinstance(d, dict) or not d.get("id"):
+            continue
+        kind = "video" if d.get("kind") == "video" else "picture"
+        item = {"id": str(d["id"]), "name": d.get("name") or d["id"], "group": d.get("group") or "", "kind": kind,
+                "explicit": d.get("group") == "Explicit" or (kind == "video" and bool(d.get("explicit_addon"))),
+                "prefix": d.get("prompt_prefix") or "", "suffix": d.get("prompt_suffix") or "",
+                "chips": d.get("chips") or [], "note": d.get("note"), "shape": _shape_name(d.get("shape"))}
+        if kind == "video":
+            item.update({"model": "video", "numbers": {}, "menus": {},
+                         "explicit_video": "on" if d.get("explicit_addon") else "off"})
+        else:
+            r = CREATE_RECIPES.get(d.get("model") or "")
+            if not r or not _recipe_ready(r):
+                continue
+            dflt = r["defaults"]
+            nums = {}
+            if d.get("steps") is not None and r.get("uses_steps", True):
+                nums["steps"] = float(d["steps"])
+            if d.get("cfg") is not None:
+                nums["cfg"] = float(d["cfg"])
+            if d.get("shift") is not None and r.get("uses_shift", True):
+                nums["shift"] = float(d["shift"])
+            menus = {}
+            if r.get("uses_sampler", True) and d.get("sampler") in SAMPLER_WORDS:
+                menus["sampler"] = _labelled([d["sampler"]], SAMPLER_WORDS, dflt["sampler"])[0]
+            if r.get("uses_scheduler", True) and d.get("scheduler") in SCHEDULE_WORDS:
+                menus["scheduler"] = _labelled([d["scheduler"]], SCHEDULE_WORDS, dflt["scheduler"])[0]
+            if "explicit" in dflt:
+                menus["explicit"] = "On" if d.get("explicit_addon") else "Auto"
+            item.update({"model": d["model"], "numbers": nums, "menus": menus,
+                         "negative": (d.get("negative") or None) if r.get("negative") else None})
+        recipes.append(item)
+    qs = data.get("quickselect") or {}
+    age = qs.get("age") or {}
+
+    def num(x, fallback):
+        try:
+            return int(x)
+        except (TypeError, ValueError):
+            return fallback
+    
+
+def job_make_recipes(p: dict, emit, cancel):
+    """Make's recipe row, quick picks and age range (op `make_recipes`). Read fresh on every call."""
+    emit({"t": "info", **_make_catalog()})
+
+
+def job_comfy_run(p: dict, emit, cancel):
+    """One Create request: `count` pictures from a recipe and the phone's values, with live previews."""
+    r = CREATE_RECIPES.get(p.get("recipe") or "")
+    if not r:
+        raise UserFacing("That recipe isn't on your computer.")
+    v = {**r["defaults"], **(p.get("values") or {})}
+    if v.get("image_mode") == "paint" and str(v.get("change") or "").strip():
+        # Paint: the prompt describes what goes in the spot (the surroundings come from the picture itself); the
+        # original prompt's words would fight a change like "smaller" or "red instead of blue".
+        v["prompt"] = str(v["change"]).strip()
+    v = _apply_toggles(r, v)
+    v["sampler"], v["scheduler"] = _menu_value(v.get("sampler")), _menu_value(v.get("scheduler"))
+    status = lambda s: emit({"t": "status", "v": s})  # noqa: E731
+    if r.get("builder") == "qwen21" or str(v.get("editor") or "") == "qwen21":
+        COMFY.ensure_current(status)                   # a freshly downloaded add-on or reader shows up (one restart)
+    else:
+        COMFY.ensure(status)
+    _room_for_pictures()
+    if _worker_alive():
+        WORKER.stop()
+    w, h = SHAPES.get(v.get("shape") or "square", SHAPES["square"])
+    count = max(1, min(4, int(v.get("count") or 1)))
+    seed = v.get("seed")
+    seed = int(seed) if seed not in (None, "", -1) else int.from_bytes(os.urandom(4), "big")
+    loras = [(x["name"], float(x.get("strength", 1.0))) for x in (v.get("loras") or [])
+             if x.get("name") and (COMFY_LORAS / x["name"]).is_file()]
+    photo, photo_name, mode = None, None, str(v.get("image_mode") or "start")
+    extra_names = []                                  # photos 2 and 3 for a multi-photo edit
+    for b64 in (v.get("images") or [])[:2]:
+        import uuid
+        n = f"cr_{uuid.uuid4().hex}.png"
+        (COMFY_PRIVATE / "input").mkdir(parents=True, exist_ok=True)
+        _image_in(b64).save(COMFY_PRIVATE / "input" / n, format="PNG")
+        extra_names.append(n)
+    if v.get("image"):
+        import uuid
+        photo = _image_in(v["image"])
+        photo_name = f"cr_{uuid.uuid4().hex}.png"
+        (COMFY_PRIVATE / "input").mkdir(parents=True, exist_ok=True)
+        photo.save(COMFY_PRIVATE / "input" / photo_name, format="PNG")
+        if mode == "paint" and not v.get("mask"):
+            (COMFY_PRIVATE / "input" / photo_name).unlink(missing_ok=True)
+            raise UserFacing("Paint over the spot to change first.")
+        if mode in ("edit", "reference") and not (_qwen_edit_ready() or _qwen_edit_ready(True) or _qwen21_ready()):
+            (COMFY_PRIVATE / "input" / photo_name).unlink(missing_ok=True)
+            raise UserFacing("Editing a photo needs a photo editor model on your computer.")
+    if v.get("image_mode") == "paint" and photo is None:
+        raise UserFacing("Paint to change needs the picture; try again from the viewer.")
+    try:
+        _create_pictures(r, v, w, h, count, seed, loras, photo, photo_name, mode, emit, cancel, status,
+                         extra_names, p.get("recipe"))
+    finally:
+        for n in ([photo_name] if photo_name else []) + extra_names:
+            (COMFY_PRIVATE / "input" / n).unlink(missing_ok=True)
+
+
+def _recipe_id(r: dict) -> str | None:
+    return next((k for k, x in CREATE_RECIPES.items() if x is r), None)
+
+
+def _has_addon(wf: dict) -> bool:
+    """True when a 2.1 graph carries the explicit add-on (node "5" is only ever that)."""
+    return (wf.get("5") or {}).get("class_type") == "LoraLoaderModelOnly"
+
+
+def _create_pictures(r, v, w, h, count, seed, loras, photo, photo_name, mode, emit, cancel, status,
+                     extra_names=(), recipe_id=None):
+    status("Loading image model…")
+    recipe_id = recipe_id or _recipe_id(r)
+    builder = r.get("builder", "zimage")
+    own_explicit = recipe_id in QWEN_EXPLICIT_RECIPES
+    if photo is not None and mode == "paint":
+        _timing(model=r["name"], recipe=recipe_id, explicit=own_explicit, mp=None, steps=r["defaults"].get("steps"))
+        _paint_picture(r, v, seed, loras, photo, v["mask"], emit, cancel)
+        return
+    prompt = v.get("prompt") or "high quality photo"
+    editor = str(v.get("editor") or "auto")             # Make's Editor menu (11-17): auto, qwen, qwen-explicit, qwen21
+    if editor == "flux":
+        editor = "auto"                                  # a phone build from before 11-17: FLUX klein is gone
+    for i in range(count):
+        s_i = (seed + i) % (2 ** 32)
+        editing = bool(photo_name and mode in ("edit", "reference"))
+        # Same model for making and editing: the 2.1 editor is picked by choice, or by "Auto" for a picture that was
+        # made with 2.1 (so make -> edit never reloads). Every other Auto edit stays 2511 / Rapid-AIO.
+        use21 = editing and (editor == "qwen21" or (editor == "auto" and recipe_id == "qwen21"))
+        if use21:
+            if not _qwen21_ready():
+                raise UserFacing("Qwen-Image 2.1 isn't all on your computer yet, so nothing was changed.")
+            lora = _qwen21_explicit(v.get("explicit"), None, recipe_id)
+            wf = _qwen21_edit_workflow(prompt, [photo_name, *extra_names], s_i, lora,
+                                       loras=loras if builder == "qwen21" else [],
+                                       reference_size=(w, h) if mode == "reference" else None)
+            budget = int(_tune("qwen21_edit_resolution", 1024))
+            _timing(model=QWEN21_NAME, recipe=recipe_id, editor="qwen21", explicit=bool(lora), steps=8, count=count,
+                    mp=(w * h / 1e6) if mode == "reference" else (None if budget else
+                                                                  photo.size[0] * photo.size[1] / 1e6))
+        elif editing:
+            if editor == "qwen-explicit" and _qwen_edit_ready(True):
+                explicit = True
+            elif editor == "qwen":
+                explicit = False
+            else:
+                explicit = _qwen_explicit(prompt, recipe_id)
+            if not (explicit or _qwen_edit_ready()):
+                raise UserFacing("Editing a photo needs a photo editor model on your computer.")
+            qw, qh = _photo_size(photo) if mode == "edit" else (w, h)
+            wf = _qwen_edit_workflow(prompt, [photo_name, *extra_names], s_i, qw, qh, explicit)
+            _timing(model="Qwen Rapid-AIO" if explicit else "Qwen Edit 2511", recipe=recipe_id,
+                    editor="qwen-explicit" if explicit else "qwen", explicit=explicit, mp=qw * qh / 1e6, steps=4,
+                    count=count)
+        elif photo_name:
+            pw, ph = _photo_size(photo)
+            if builder == "qwen21":
+                wf = _qwen21_workflow(prompt, pw, ph, s_i, v.get("cfg", 1.0), v.get("negative") or "",
+                                      _qwen21_explicit(v.get("explicit"), None, recipe_id), loras,
+                                      start=(photo_name, float(v.get("strength") or 0.6), pw, ph))
+            else:
+                wf = _recipe_workflow(r, v, pw, ph, s_i, loras)
+                _start_from(wf, builder, photo_name, pw, ph, float(v.get("strength") or 0.6))
+            _timing(model=r["name"], recipe=recipe_id, explicit=_has_addon(wf) or own_explicit, mp=pw * ph / 1e6,
+                    steps=v.get("steps"), count=count)
+        else:
+            if builder == "qwen21":
+                v = {**v, "base_recipe": recipe_id}
+            wf = _recipe_workflow(r, v, w, h, s_i, loras)
+            _timing(model=r["name"], recipe=recipe_id, explicit=_has_addon(wf) or own_explicit, mp=w * h / 1e6,
+                    steps=v.get("steps"), count=count)
+        part = lambda obj, i=i: emit({**obj, "v": round((i + obj["v"]) / count, 3)} if obj.get("t") == "progress"
+                                     else obj)  # noqa: E731
+        png = asyncio.run(_comfy_run(wf, part, cancel, previews=True))
+        if cancel.is_set() or not png:
+            return
+        emit({"t": "image", "v": base64.b64encode(png).decode(), "seed": s_i, "index": i})
+    emit({"t": "progress", "v": 1.0})
+
+
+async def _comfy_run(workflow: dict, emit, cancel, previews: bool = False, frames: bool = False,
+                     label: str = "Creating image…"):
+    """Queues one workflow, relays progress (and live previews when asked), returns the PNG bytes sent over the
+    websocket."""
+    import uuid
+    import aiohttp
+    cid = uuid.uuid4().hex
+    png = None
+    pngs: list[bytes] = []
+    last_preview = 0.0
+    watch = _TimingWatch(workflow)                     # 11-17: seconds loading vs drawing, from ComfyUI's own events
+    is21 = (workflow.get("4") or {}).get("class_type") == "QwenImage21Cache"
+    async with aiohttp.ClientSession() as s:
+        async with s.ws_connect(f"ws://127.0.0.1:{COMFY_PORT}/ws?clientId={cid}", max_msg_size=0) as ws:
+            async with s.post(f"http://127.0.0.1:{COMFY_PORT}/prompt",
+                              json={"prompt": workflow, "client_id": cid}) as r:
+                body = await r.json(content_type=None)
+                if r.status != 200 or "prompt_id" not in body:
+                    raise UserFacing("The picture engine refused the job: " + str(body.get("error", body))[:200])
+                pid = body["prompt_id"]
+            started = False
+            deadline = time.monotonic() + (2400 if frames else 900)   # a video's first load reads ~34 GB
+            while True:
+                if time.monotonic() > deadline:
+                    await s.post(f"http://127.0.0.1:{COMFY_PORT}/interrupt")
+                    raise UserFacing("That took too long on your computer and was stopped.")
+                if cancel.is_set():
+                    await s.post(f"http://127.0.0.1:{COMFY_PORT}/interrupt")
+                    return b""
+                try:
+                    msg = await ws.receive(timeout=1)
+                except asyncio.TimeoutError:
+                    continue
+                if msg.type == aiohttp.WSMsgType.BINARY:
+                    data = msg.data
+                    kind = struct.unpack(">I", data[4:8])[0] if len(data) > 8 else 0
+                    if kind == 2:                                                  # PNG: the final picture
+                        png = bytes(data[8:])
+                        pngs.append(png)
+                    elif kind == 1 and previews and time.monotonic() - last_preview > 0.4:   # JPEG: a live preview
+                        last_preview = time.monotonic()
+                        emit({"t": "preview", "v": base64.b64encode(bytes(data[8:])).decode()})
+                elif msg.type == aiohttp.WSMsgType.TEXT:
+                    m = json.loads(msg.data)
+                    d = m.get("data", {})
+                    if d.get("prompt_id") not in (None, pid):
+                        continue
+                    watch.on(m["type"], d)
+                    if m["type"] == "progress":
+                        if not started:
+                            started = True
+                            emit({"t": "status", "v": label})
+                        emit({"t": "progress", "v": round(d["value"] / max(1, d["max"]), 3), "node": d.get("node")})
+                    elif m["type"] == "execution_error":
+                        if is21 and str(d.get("node_id")) == "2":
+                            raise UserFacing("The Qwen-Image 2.1 text reader didn't load on your computer. "
+                                             "Nothing was made.")
+                        raise UserFacing("The picture engine failed: " + str(d.get("exception_message", ""))[:200])
+                    elif m["type"] in ("execution_success",) or (m["type"] == "executing" and d.get("node") is None):
+                        break
+                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                    raise UserFacing("Lost the connection to the picture engine.")
+        try:
+            await s.post(f"http://127.0.0.1:{COMFY_PORT}/history", json={"clear": True})   # keep nothing
+        except Exception:
+            pass
+    if cancel.is_set():
+        return [] if frames else b""
+    watch.apply()
+    if not png:
+        raise UserFacing("The picture engine returned no picture.")
+    return pngs if frames else png
+
+
+def _quietly(fn):
+    try:
+        fn()
+    except Exception:
+        pass
+
+
+def job_comfy_image(p: dict, emit, cancel):
+    status = lambda s: emit({"t": "status", "v": s})  # noqa: E731
+    r = _picture_recipe(p) or CREATE_RECIPES["zimage-nsfw"]
+    if r.get("builder") == "qwen21":
+        COMFY.ensure_current(status)
+    else:
+        COMFY.ensure(status)
+    _room_for_pictures()                               # dense brain: the card goes to the picture; the MoE brain stays
+    if _worker_alive():
+        WORKER.stop()                                  # the diffusers helper holds graphics memory too
+    w, h = _fit(int(p.get("width", 1024)), int(p.get("height", 1024)), int(p.get("longest", 1024)))
+    seed = int(p.get("seed") or int.from_bytes(os.urandom(4), "big")) % (2 ** 32)
+    rid = _recipe_id(r)
+    flag = p.get("explicit") if isinstance(p.get("explicit"), bool) else None     # the brain's own call (new phones)
+    v = {**r["defaults"], "prompt": p.get("prompt"), "detail": "Off", "brain_explicit": flag}
+    wf = _recipe_workflow(r, v, w // 16 * 16, h // 16 * 16, seed)
+    on = _has_addon(wf) or rid in QWEN_EXPLICIT_RECIPES
+    _timing(model=r["name"], recipe=rid, explicit=on, mp=(w // 16 * 16) * (h // 16 * 16) / 1e6,
+            steps=r["defaults"].get("steps"), count=1)
+    status("Loading image model…")
+    png = asyncio.run(_comfy_run(wf, emit, cancel))
+    if cancel.is_set() or not png:
+        return
+    emit({"t": "progress", "v": 1.0})
+    emit({"t": "image", "v": base64.b64encode(png).decode(), "seed": seed, "recipe": rid, "explicit": on})
+
+
+def job_comfy_edit(p: dict, emit, cancel):
+    """An instruction edit of a photo in ComfyUI: Qwen-Image 2.1 when the chat chose it, otherwise Qwen-Image-Edit
+    2511 (or the Rapid-AIO merge for explicit edits). The phone's "remove" and painted edits crop a window around the
+    marked area, send only that, and paste the result back softly, so this is a plain edit. The photo sits in
+    ComfyUI's private input folder only for this job."""
+    import uuid
+    status = lambda s: emit({"t": "status", "v": s})  # noqa: E731
+    want21 = p.get("model_choice") == "qwen21"
+    if want21:
+        COMFY.ensure_current(status)
+    else:
+        COMFY.ensure(status)
+    _room_for_pictures()
+    if _worker_alive():
+        WORKER.stop()
+    start = _image_in(p["image"])
+    longest = int(p.get("longest", 1024))
+    name = f"fx_{uuid.uuid4().hex}.png"
+    path = COMFY_PRIVATE / "input" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    start.save(path, format="PNG")
+    seed = int(p.get("seed") or int.from_bytes(os.urandom(4), "big")) % (2 ** 32)
+    words = p.get("prompt") or "improve the photo"
+    flag = p.get("explicit") if isinstance(p.get("explicit"), bool) else None     # the brain's call; old phones: words
+    try:
+        status("Loading image model…")
+        if want21:
+            if not _qwen21_ready():
+                raise UserFacing("Qwen-Image 2.1 isn't all on your computer yet, so nothing was changed.")
+            lora = _qwen21_explicit(None, flag)
+            wf = _qwen21_edit_workflow(words, [name], seed, lora)
+            budget = int(_tune("qwen21_edit_resolution", 1024))
+            _timing(model=QWEN21_NAME, recipe="qwen21", editor="qwen21", explicit=bool(lora), steps=8, count=1,
+                    mp=None if budget else start.size[0] * start.size[1] / 1e6)
+            explicit = bool(lora)
+        else:
+            explicit = (flag is True and _qwen_edit_ready(True)) or _qwen_explicit(words)
+            if not (explicit or _qwen_edit_ready()):
+                raise UserFacing("Editing a photo needs a photo editor model on your computer.")
+            pw, ph = _photo_size(start, min(2.0, max(0.25, longest * longest / 1_000_000)))
+            wf = _qwen_edit_workflow(words, [name], seed, pw, ph, explicit)
+            _timing(model="Qwen Rapid-AIO" if explicit else "Qwen Edit 2511",
+                    editor="qwen-explicit" if explicit else "qwen", explicit=explicit, mp=pw * ph / 1e6, steps=4,
+                    count=1)
+        png = asyncio.run(_comfy_run(wf, emit, cancel))
+    finally:
+        path.unlink(missing_ok=True)
+    if cancel.is_set() or not png:
+        return
+    emit({"t": "progress", "v": 1.0})
+    emit({"t": "image", "v": base64.b64encode(png).decode(), "seed": seed, "explicit": explicit})
+
+
+def _comfy_edits_ready() -> bool:
+    return COMFY.available() and (_qwen_edit_ready() or _qwen_edit_ready(True) or _qwen21_ready())
+
+
+def _warmup_workflow(recipe: str) -> dict:
+    """A 1-step 64x64 picture: makes ComfyUI read the recipe's models from disk into memory."""
+    r = CREATE_RECIPES[recipe]
+    if r.get("builder") == "qwen21":
+        # No add-on; one short step (only the loaders matter: node "7" differs from a real job, the models do not).
+        return _qwen21_workflow("warm-up", 64, 64, 0, sigmas="1.0, 0")
+    return _recipe_workflow(r, {**r["defaults"], "prompt": "warm-up", "steps": 1, "detail": "Off"}, 64, 64, 0)
+
+
+def job_comfy_warm(p: dict, emit, cancel):
+    """The phone opened Fixer: get the chosen ComfyUI recipe's models into memory now, so the first picture doesn't
+    wait for the disk. The chat model is left alone; ComfyUI then lets go of the card (models stay in RAM)."""
+    recipe = COMFY_RECIPES.get(p.get("model") or "")
+    if recipe and _chat_recipe(p.get("model")) and recipe not in COMFY.warmed:
+        COMFY.ensure_current() if recipe == "qwen21" else COMFY.ensure()
+        try:
+            asyncio.run(_comfy_run(_warmup_workflow(recipe), lambda obj: None, cancel))
+            done = not cancel.is_set()
+        except Exception:
+            done = False                               # a failed warm-up costs nothing: the picture loads as before
+        COMFY.free()
+        if done:
+            COMFY.warmed.add(recipe)
+    emit({"t": "info", "warm": True})
+
+
+def job_brain_warm(p: dict, emit, cancel):
+    """The phone opened Fixer: start the chat model now (6-9 s from memory), so the first message doesn't wait.
+    11-17: this used to warm the PICTURE model on every app open; ComfyUI's cold start and model load (25-110 s)
+    then sat in front of the first chat. Pictures warm when the Make tab opens ("for": "make")."""
+    repo = BRAIN_ALIASES.get(p.get("brain") or "", p.get("brain") or "") or LAST_BRAIN
+    choice = gguf_choice(repo)
+    if choice is not None and not LLAMA.paused_for and (_is_moe(repo) or not VIDEO_BUSY.is_set()):
+        try:
+            LLAMA.ensure(repo, choice, lambda s: None)
+        except Exception:
+            pass                                       # a failed warm-up costs nothing: the chat loads as before
+    emit({"t": "info", "warm": True})
+
+
+def job_warm_skip(p: dict, emit, cancel):
+    emit({"t": "info", "warm": False})
+
+
+def job_warm(p: dict, emit, cancel):
+    """(In the helper.) Loads the chosen diffusers picture model into RAM ahead of the first picture; it moves to
+    the card only while drawing, so the chat model keeps its place."""
+    repo = p.get("model")
+    if _local_complete(repo):
+        ENGINE.pipe(repo, "make", lambda s: None)      # only models already here: a warm-up never downloads
+    emit({"t": "info", "warm": True})
+
+
+def job_forget(p: dict, emit, cancel):
+    """The phone wiped its history: drop everything this PC holds in memory about it. The chat model keeps the last
+    conversation in its prompt cache for as long as it runs, and the helper holds the last photo's job; stopping
+    both releases it. Nothing was ever written to disk. Runs at once, even mid-job (ending that job is the point)."""
+    LLAMA.stop()
+    ENGINE.unload()                                    # also ends the helper process
+    COMFY.stop()                                       # and ComfyUI, with its private folder; it restarts on next use
+    TIMINGS.clear()                                    # the speed numbers hold no words, but "nothing is held" means nothing
+    erased = ["the chat model's memory of your conversations",
+              "the picture and video engine, with any photo, prompt or result it held",
+              "its private temporary folder",
+              "the line of pictures and videos, and any finished results it was holding"]
+    # Then check, rather than assume: nothing running that could hold a conversation, the private folder gone.
+    left = []
+    if LLAMA.running():
+        left.append("the chat model is still running")
+    if _worker_alive():
+        left.append("the picture helper is still running")
+    if COMFY.running():
+        left.append("the picture engine is still running")
+    if COMFY_PRIVATE.exists() and any(COMFY_PRIVATE.rglob("*")):
+        left.append("files in the private temporary folder")
+    if QUEUE.has_work():                               # (QUEUE.clear() ran on the loop just before this)
+        left.append("work still in the line")
+    emit({"t": "info", "forgot": True, "erased": erased, "left": left})
+
+
+def _no_job(p: dict, emit, cancel):
+    raise RuntimeError("answered on the event loop")
+
+
+JOBS = {"status": job_status, "chat": job_chat, "image": job_image, "video": job_video, "search": job_search,
+        "cutout": job_cutout, "upscale": job_upscale, "forget": job_forget,
+        "remove_model": job_remove_model, "warm": job_warm,
+        "comfy_recipes": job_comfy_recipes, "comfy_run": job_comfy_run, "config": job_config,
+        "make_recipes": job_make_recipes,
+        "stop_all": _no_job, "queue": _no_job, "free_memory": _no_job}   # these three answer on the event loop
+# 11-17: never wait for the line, stream as before. (comfy_recipes never needed the card: it waited behind videos and
+# left Make on "Asking your computer..." for minutes.)
+IMMEDIATE = {"status", "search", "forget", "config", "comfy_recipes", "make_recipes", "chat"}
+ASYNC_OPS = {"queue", "stop_all", "free_memory"}
+
+
+def _comfy_stop_now():
+    """ComfyUI drops its queue and stops the picture or video it is drawing."""
+    if "COMFY" not in globals() or not COMFY.running():
+        return
+    import urllib.request
+    for path, body in (("/queue", b'{"clear": true}'), ("/interrupt", b"{}")):
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{COMFY_PORT}{path}", data=body, method="POST",
+                                         headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=5).read()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------- HTTP
+
+GPU = asyncio.Lock()
+KEYSTORE = Keys(KEYS)
+REPLAY = ReplayGuard()
+LAST_USE = time.monotonic()
+LAST_CHAT = time.monotonic()          # the chat model holds the last conversation in memory until it stops
+CHATS_ACTIVE = 0                      # chats answering right now (the idle stop never cuts one off)
+
+
+# ---------------------------------------------------------------- the line (11-17)
+
+LAST_SEEN = time.monotonic()          # 11-17: the last request of any kind from a phone (chat, job, warm-up, queue)
+HIDDEN_OPS = {"warm"}                 # make warm-ups: never listed, never noted, never wait
+QUEUED_OPS = {"image", "video", "cutout", "upscale", "comfy_run", "remove_model", "warm"}   # warm: for "make" only
+RESULT_TYPES = {"image", "video", "mask"}
+STOP_TEXT = {"replaced": "Stopped: a newer request from the same place replaced it.", "cancelled": "Stopped.",
+             "stop_all": "Stopped: everything on your computer was stopped.",
+             "cleared": "Stopped: the work on your computer was cleared."}
+_END = object()
+
+
+def _ordinal(k: int) -> str:
+    return "%d%s" % (k, "th" if 10 <= k % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(k % 10, "th"))
+
+
+def _job_prompt(p: dict) -> str:
+    v = p.get("values") or {}
+    text = p.get("prompt") or v.get("change") or v.get("prompt") or ""
+    return text if isinstance(text, str) else ""
+
+
+def _job_kind(op: str, p: dict) -> str:
+    if op in ("video", "cutout", "upscale", "warm"):
+        return op
+    if op == "remove_model":
+        return "remove"
+    if op == "image":
+        return "edit" if p.get("image") else "picture"
+    v = p.get("values") or {}                            # comfy_run
+    if v.get("image_mode") == "paint":
+        return "change"
+    if v.get("image") or v.get("images"):
+        return "edit"
+    try:
+        return "pictures" if int(v.get("count") or 1) > 1 else "picture"
+    except (TypeError, ValueError):
+        return "picture"
+
+
+def _job_label(op: str, p: dict) -> str:
+    """A short plain label for the line; memory only. <= 60 chars + an ellipsis."""
+    text = p.get("label") if isinstance(p.get("label"), str) else ""
+    if not text and op == "remove_model":
+        text = _brain_name(p.get("model") or "")
+    text = " ".join((text or _job_prompt(p)).split())
+    return text if len(text) <= 60 else text[:60] + "…"
+
+
+class Job:
+    """One picture/edit/video request. Lives in memory only, from submit until collected, stopped or 30 min after it
+    finished (11-17: the phone may be suspended in the background when it ends)."""
+
+    def __init__(self, op, payload, phone):
+        self.id = secrets.token_hex(3)                       # 6 hex; re-rolled on a clash in submit
+        self.op, self.payload, self.phone = op, payload, phone
+        self.slot = payload.get("slot") or (None if op in ("warm", "remove_model") else f"legacy:{phone}")
+        self.kind = _job_kind(op, payload)
+        self.label = _job_label(op, payload)                 # memory only
+        self.words = _job_prompt(payload)                    # full prompt; sent back only to the same phone
+        self.hidden = op in HIDDEN_OPS
+        self.enhance = _enhance_inputs(op, payload) is not None   # "Enhance my prompt" (11-17)
+        self.enhance_done = threading.Event()
+        if not self.enhance:
+            self.enhance_done.set()
+        self.enhanced: str | None = None                     # the brain's improved prompt (memory only)
+        self.enhance_note: str | None = None                 # plain words when it could not
+        self.enhance_s = 0.0
+        self.enhance_state = "off"                           # off, on, failed
+        self.acks = bool(payload.get("ack"))
+        self.state = "waiting"                               # waiting, running, ready, failed, gone
+        self.cancel = threading.Event()
+        self.stop_reason: str | None = None
+        self.created = time.monotonic()
+        self.started = self.finished = None
+        self.progress: float | None = None
+        self.status = ""
+        self.results: list[dict] = []                        # result frames (with "n"), dropped on ack/expiry
+        self.error: str | None = None
+        self.acked = False
+        self.subs: set = set()
+        self.loop = None                                     # set by submit
+        self._pos: int | None = None                         # last position announced
+
+    def emit(self, obj):                                     # from the job's thread
+        self.loop.call_soon_threadsafe(self.publish, obj)
+
+    def publish(self, obj):                                  # on the loop
+        if self.stop_reason:                                 # stopped: nothing more goes out (or is kept)
+            return
+        t = obj.get("t")
+        if t == "progress":
+            self.progress = obj.get("v")
+        elif t == "status":
+            self.status = obj.get("v") or ""
+        if t in RESULT_TYPES or (t == "info" and self.op == "remove_model"):
+            obj = {**obj, "n": len(self.results) + 1}
+            self.results.append(obj)
+        for q in list(self.subs):
+            q.put_nowait(obj)
+
+
+class JobQueue:
+    """The line of picture/edit/video jobs. Every change happens on the event loop thread."""
+
+    def __init__(self):
+        self.jobs: list[Job] = []            # in line order; held (ready/failed) ones are skipped by the views
+        self.gone: dict[str, tuple[str, float]] = {}   # id -> (plain reason, when): ids only, no content, 2 h, <= 200
+        self.wake: asyncio.Event | None = None
+
+    # -- views
+    def running(self) -> Job | None:
+        return next((j for j in self.jobs if j.state == "running"), None)
+
+    def waiting(self) -> list[Job]:
+        return [j for j in self.jobs if j.state == "waiting"]
+
+    def held(self) -> list[Job]:
+        return [j for j in self.jobs if j.state in ("ready", "failed")]
+
+    def busy(self) -> bool:
+        return self.running() is not None
+
+    def has_work(self) -> bool:
+        return any(not j.hidden and j.state in ("waiting", "running", "ready", "failed") for j in self.jobs)
+
+    def position(self, job: Job) -> int | None:
+        if job.state == "running":
+            return 0
+        w = self.waiting()
+        return w.index(job) + 1 if job in w else None
+
+    def find(self, id_: str) -> Job | None:
+        return next((j for j in self.jobs if j.id == id_), None)
+
+    def next_kind(self) -> str | None:
+        w = self.waiting()
+        return w[0].kind if w else None
+
+    def eta_running(self) -> int | None:
+        j = self.running()
+        if j is None or j.started is None or j.progress is None or j.progress < 0.05:
+            return None
+        return max(1, int((time.monotonic() - j.started) / j.progress * (1 - j.progress)))
+
+    def snapshot(self, phone=None) -> list[dict]:
+        now = time.monotonic()
+        keep = _tune("keep_minutes", 30) * 60
+        out = []
+        ordered = [j for j in self.jobs if j.state == "running"] + self.waiting() + self.held()
+        for j in ordered:
+            if j.hidden:
+                continue
+            d = {"id": j.id, "kind": j.kind, "label": j.label, "state": j.state, "position": self.position(j),
+                 "progress": j.progress if j.state == "running" else None, "status": j.status, "slot": j.slot,
+                 "mine": phone is None or j.phone == phone, "age_s": int(now - j.created)}
+            if j.state == "waiting":
+                d["status"] = f"In line: {_ordinal(d['position'])}"
+            if j.state == "running":
+                eta = self.eta_running()
+                if eta:
+                    d["eta_s"] = eta
+            if j.state in ("ready", "failed") and j.finished is not None:
+                d["keep_s"] = max(0, int(j.finished + keep - now))
+            if j.state == "failed":
+                d["error"] = j.error
+            out.append(d)
+        return out
+
+    # -- changes
+    def _drop(self, job: Job, why: str | None):
+        if job in self.jobs:
+            self.jobs.remove(job)
+        if why and not job.hidden:
+            self.gone[job.id] = (why, time.monotonic())
+
+    def _insert_waiting(self, job: Job, k: int | None):
+        """Puts `job` at place k (0-based) among the waiting jobs; None = after the last."""
+        w = self.waiting()
+        if k is None or k >= len(w):
+            self.jobs.append(job)
+        else:
+            self.jobs.insert(self.jobs.index(w[k]), job)
+
+    def submit(self, job: Job, loop) -> list[Job]:
+        """Returns the jobs it replaced. Raises UserFacing when the line is full."""
+        job.loop = loop
+        if not job.hidden and len([j for j in self.waiting() if not j.hidden]) >= int(_tune("queue_max", 30)):
+            raise UserFacing("Your computer already has 30 things waiting. Stop some first.")
+        while self.find(job.id) is not None or job.id in self.gone:
+            job.id = secrets.token_hex(3)
+        replaced: list[Job] = []
+        place = None
+        if not job.hidden:
+            for j in list(self.jobs):                        # a warm-up never stands in anyone's way
+                if j.hidden and j.state in ("waiting", "running"):
+                    self.cancel(j, "replaced", _announce=False)
+            if job.slot:
+                w_before = self.waiting()
+                replaced = [j for j in self.jobs if j.phone == job.phone and j.slot == job.slot and not j.hidden
+                            and j.state in ("waiting", "running")]
+                waiting_places = [w_before.index(j) for j in replaced if j.state == "waiting"]
+                for j in replaced:
+                    self.cancel(j, "replaced", _announce=False)
+                if waiting_places:
+                    place = min(waiting_places)              # it takes the replaced waiting job's place
+                elif replaced:
+                    place = 0                                # the running one went: the new one is first of the waiting
+        if job.op == "remove_model":
+            place = 0                                        # quick, and the owner is watching the model list
+        self._insert_waiting(job, place)
+        self._announce()
+        if self.wake is not None:
+            self.wake.set()
+        return replaced
+
+    def cancel(self, job: Job, reason: str = "cancelled", _announce: bool = True):
+        if job.state == "gone" or job.stop_reason:
+            return
+        was = job.state
+        job.stop_reason = reason
+        job.results = []
+        job.cancel.set()
+        text = STOP_TEXT[reason] if reason in ("replaced", "stop_all", "cleared") else "It was stopped."
+        if was == "running":
+            # the runner removes it when its thread returns; ComfyUI runs one prompt at a time, so the interrupt
+            # only hits this job
+            if job.loop is not None:
+                job.loop.run_in_executor(None, lambda: _comfy_stop_now())
+            if not job.hidden:
+                self.gone[job.id] = (text, time.monotonic())
+        else:
+            job.state = "gone"
+            self._drop(job, text)
+        for q in list(job.subs):
+            q.put_nowait(_END)
+        if _announce:
+            self._announce()
+
+    def cancel_slot(self, phone: str, slot: str) -> int:
+        n = 0
+        for j in list(self.jobs):
+            if j.phone == phone and j.slot == slot and not j.hidden and j.state in ("waiting", "running"):
+                self.cancel(j, "cancelled", _announce=False)
+                n += 1
+        self._announce()
+        return n
+
+    def move(self, job: Job, to: int) -> int:
+        w = self.waiting()
+        if job not in w:
+            raise UserFacing("That job isn't waiting any more.")
+        to = max(1, min(int(to), len(w)))
+        self.jobs.remove(job)
+        self._insert_waiting(job, to - 1)
+        self._announce()
+        return self.position(job)
+
+    def stop_all(self, reason: str = "stop_all", drop_held: bool = True) -> int:
+        n = 0
+        for j in list(self.jobs):
+            if j.state in ("waiting", "running"):
+                self.cancel(j, reason, _announce=False)
+                n += not j.hidden
+            elif drop_held and j.state in ("ready", "failed"):
+                self.cancel(j, reason, _announce=False)
+        self._announce()
+        return n
+
+    def ack(self, job: Job):
+        if job.state == "running":
+            job.acked = True                                 # dropped the moment it ends
+        elif job.state in ("ready", "failed"):
+            self._drop(job, "Already collected.")
+
+    def expire(self):
+        now = time.monotonic()
+        keep = _tune("keep_minutes", 30) * 60
+        for j in list(self.held()):
+            if j.finished is not None and j.finished + keep < now:
+                self._drop(j, "It finished, but your computer only keeps finished work for "
+                              f"{int(_tune('keep_minutes', 30))} minutes and it wasn't collected in time.")
+        for k, (_, when) in list(self.gone.items()):
+            if now - when > 7200:
+                del self.gone[k]
+        while len(self.gone) > 200:
+            del self.gone[next(iter(self.gone))]
+
+    def clear(self):
+        """forget: everything, gone ids included."""
+        self.stop_all("cleared", True)
+        self.gone.clear()
+
+    def _announce(self):
+        for k, j in enumerate(self.waiting(), 1):
+            if j._pos is None:
+                j._pos = k                                   # first sight: the watcher's first frame says it
+            elif j._pos != k:
+                j._pos = k
+                j.publish({"t": "queued", "id": j.id, "position": k})
+                j.publish({"t": "status", "v": f"In line: {_ordinal(k)}"})
+
+    def _finished(self, job: Job, err):
+        """The job's thread has returned (on the loop). Decides: dropped now, or held for the phone to collect."""
+        job.finished = time.monotonic()
+        if job.stop_reason:                                  # stopped: cancel() already told everyone
+            job.state = "gone"
+            self._drop(job, None)
+            job.results = []
+            return
+        watching = bool(job.subs)
+        if err is not None:
+            job.state, job.error = "failed", _plain(err)
+        else:
+            job.state = "ready"
+        if job.hidden or (job.state == "ready" and not job.results):
+            drop, why = True, None
+        elif job.state == "failed":
+            drop, why = watching, "It didn't work, and the reason was already shown."
+        elif job.acks:
+            drop, why = job.acked, "Already collected."
+        else:
+            drop, why = watching, "Already collected."
+        if drop:
+            self._drop(job, why)
+        for q in list(job.subs):
+            q.put_nowait(_END)
+        self._announce()
+
+
+QUEUE = JobQueue()
+
+
+def _in_worker(op: str):
+    """The diffusers helper route for `op` (the closure the old per-request code defined inline)."""
+    def run(payload_, emit_, cancel_):
+        if op == "video":
+            VIDEO_BUSY.set()                           # a chat meanwhile answers from RAM, not the full card
+            _room_for_video(lambda s: emit_({"t": "status", "v": s}))
+        COMFY.free()                                   # ComfyUI's models leave the card first
+        try:
+            WORKER.run(op, payload_, emit_, cancel_)
+        finally:
+            if op == "video":
+                VIDEO_BUSY.clear()
+                if LLAMA.running() and not LLAMA.on_gpu:
+                    LLAMA.stop()                       # next chat starts on the card again
+    return run
+
+
+def _target(op: str, payload: dict):
+    """Which function runs this request (the routing that lived inside run_streaming)."""
+    target = _in_worker(op) if op in WORKER_OPS else JOBS[op]
+    if (op == "image" and not payload.get("image") and COMFY.available()
+            and (_chat_recipe(payload.get("model")) or _picture_recipe(payload))):
+        target = job_comfy_image                       # ComfyUI recipes for new pictures
+    if op == "video" and COMFY_VIDEO and COMFY.available() and _wan14_ready():
+        target = job_comfy_video                       # Wan 2.2 A14B in ComfyUI (the 5B helper is the fallback)
+    if op == "image" and payload.get("image") and _comfy_edits_ready():
+        target = job_comfy_edit                        # every photo edit / remove: Qwen-Image-Edit / 2.1 in ComfyUI
+    if op == "warm" and payload.get("for") != "make":
+        target = job_brain_warm                        # app opened: the chat model first (old phones send no "for")
+    elif op == "warm" and _chat_recipe(payload.get("model")) and COMFY.available():
+        target = job_comfy_warm
+    elif op == "warm" and _worker_alive() and getattr(WORKER, "family", None) == "video":
+        target = job_warm_skip
+    return target
+
+
+def _record_timing(job, rec: dict, err) -> None:
+    """Keeps one finished job's numbers (memory only, no words). Warm-ups, removals and stopped jobs are left out."""
+    if job.hidden or job.op == "remove_model" or job.stop_reason or job.started is None:
+        return
+    rec["total_s"] = round(time.monotonic() - job.started, 2)
+    rec["ok"] = err is None
+    rec["at"] = time.monotonic()
+    rec["enhance"], rec["enhance_s"] = job.enhance_state, job.enhance_s
+    TIMINGS.append(rec)
+
+
+def _after_job(kind: str, next_kind: str | None) -> None:
+    """11-17: after a video, give its ~38 GB back unless another video is next, then bring a paused brain back."""
+    if kind == "video" and next_kind != "video":
+        COMFY.free()                     # /free with free_memory also resets ComfyUI's node cache: the RAM goes
+    if LLAMA.paused_for and next_kind != "video":
+        threading.Thread(target=LLAMA.resume, daemon=True, name="brain-resume").start()
+
+
+async def queue_runner(app):
+    """11-17: one job on the card at a time, in line order, whether or not its phone is still connected."""
+    QUEUE.wake = asyncio.Event()
+
+    async def loop_():
+        global LAST_USE
+        loop = asyncio.get_running_loop()
+        while True:
+            if not QUEUE.waiting():
+                QUEUE.wake.clear()
+                await QUEUE.wake.wait()
+                continue
+            try:
+                async with GPU:                              # the same lock idle unload / tray unload / free use
+                    job = next(iter(QUEUE.waiting()), None)  # pick after the lock: the order may have changed
+                    if job is None:
+                        continue
+                    job.state, job.started, job._pos = "running", time.monotonic(), 0
+                    QUEUE._announce()
+                    job.publish({"t": "status", "v": "Starting…"})
+                    LAST_USE = time.monotonic()
+                    payload = job.payload
+                    err = None
+                    rec = _new_timing_record(job.kind)
+                    base = _target(job.op, payload)
+
+                    def timed(payload_, emit_, cancel_, _base=base, _job=job, _rec=rec):
+                        _TL.rec = _rec
+                        try:
+                            if _job.op == "cutout":
+                                _timing(model=CUT_GENERAL)
+                            elif _job.op == "upscale":
+                                _timing(model=UPSCALER[0])
+                            payload_ = _apply_enhance(_job, payload_, emit_)
+                             return _base(payload_, emit_, cancel_)
+                        finally:
+                            _TL.rec = None
+                    try:
+                        await loop.run_in_executor(None, timed, payload, job.emit, job.cancel)
+                    except Exception as e:                   # noqa: BLE001
+                        log.warning("%s job failed: %s", job.op, e.__class__.__name__)   # never the content
+                        err = e
+                    finally:
+                        job.payload = payload = None         # the photo and prompt go now
+                        LAST_USE = time.monotonic()
+                        _record_timing(job, rec, err)
+                    await asyncio.sleep(0)                   # emits queued just before the end arrive first
+                    QUEUE._finished(job, err)
+                    try:
+                        await loop.run_in_executor(None, _after_job, job.kind, QUEUE.next_kind())
+                    except Exception:                        # noqa: BLE001
+                        log.warning("after-job step failed")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:                           # noqa: BLE001 - the line must keep moving
+                log.warning("the line's runner hit %s", e.__class__.__name__)
+                await asyncio.sleep(1)
+
+    task = asyncio.create_task(loop_())
+    yield
+    task.cancel()
+
+
+async def _watch(job: Job, send, phone: str, reattach: bool = False):
+    """Streams one job to one phone connection. The job never depends on this connection (11-17)."""
+    q: asyncio.Queue = asyncio.Queue()
+    job.subs.add(q)
+    try:
+        if not job.hidden:
+            first = {"t": "queued", "id": job.id, "position": QUEUE.position(job), "kind": job.kind,
+                     "slot": job.slot, "label": job.label}
+            if reattach and job.phone == phone:
+                first.update(words=job.words, state=job.state)
+            await send(first)
+        if job.enhanced:                           # a watcher that came after the improved prompt was announced
+            await send({"t": "enhanced", "v": job.enhanced})
+        for r in list(job.results):                # results published before this watcher (re-attach)
+            await send(r)
+        if job.state == "running":
+            if job.status:
+                await send({"t": "status", "v": job.status})
+            if job.progress is not None:
+                await send({"t": "progress", "v": job.progress})
+        elif job.state == "waiting" and not job.hidden:
+            await send({"t": "status", "v": f"In line: {_ordinal(QUEUE.position(job) or 1)}"})
+        if job.state in ("waiting", "running") and not job.stop_reason:
+            while True:
+                try:
+                    obj = await asyncio.wait_for(q.get(), timeout=20)
+                except asyncio.TimeoutError:
+                    await send({"t": "ping"})
+                    continue
+                if obj is _END:
+                    break
+                await send(obj)                    # live frames, results included (they carry "n")
+        if job.stop_reason:
+            await send({"t": "info", "stopped": job.stop_reason})
+            await send({"t": "error", "v": STOP_TEXT.get(job.stop_reason, "Stopped.")})
+        elif job.state == "failed":
+            await send({"t": "error", "v": job.error})
+        else:
+            await send({"t": "done"})
+    except asyncio.CancelledError:
+        raise                                      # (finally still detaches)
+    except (ConnectionResetError, asyncio.TimeoutError, OSError):
+        pass                                       # phone gone or suspended: the job carries on / stays held
+    finally:
+        job.subs.discard(q)
+
+
+def _brain_name(repo: str) -> str:
+    """"llmfan46/Qwen3.6-35B-A3B-uncensored-heretic-...-GGUF" -> "Qwen3.6-35B-A3B"."""
+    name = (repo or "").split("/")[-1]
+    name = re.sub(r"-GGUF$", "", name, flags=re.I)
+    return re.sub(r"-uncensored.*$", "", name, flags=re.I)
+
+
+async def _op_queue(payload: dict, send, phone: str) -> bool:
+    """Answers one `queue` request. True = it already sent its own last frame (done or error)."""
+    loop = asyncio.get_running_loop()
+    action = payload.get("action")
+    if action == "list":
+        figs = await loop.run_in_executor(None, _figures)
+        brain = {"state": LLAMA.state(), "why": LLAMA.paused_for, "model": _brain_name(LLAMA.repo or LAST_BRAIN),
+                 "card_gb": round(LLAMA.card_gb, 1)}
+        await send({"t": "info", "queue": {"jobs": QUEUE.snapshot(phone), **figs, "brain": brain,
+                                           "keep_minutes": int(_tune("keep_minutes", 30)),
+                                           "recent": _timing_recent(20), "averages": _timing_summary()}})
+    elif action == "watch":
+        wanted = str(payload.get("id") or "")
+        job = QUEUE.find(wanted)
+        if job is None:
+            reason = QUEUE.gone.get(wanted, ("That job is no longer on your computer.",))[0]
+            await send({"t": "info", "gone": reason})
+            await send({"t": "error", "v": reason})
+            return True
+        await _watch(job, send, phone, reattach=True)
+        return True                                # _watch ends with its own done/error
+    elif action == "cancel":
+        ids = payload.get("ids") or ([payload["id"]] if payload.get("id") else [])
+        n = 0
+        for i in ids:
+            j = QUEUE.find(str(i))
+            if j is not None:
+                QUEUE.cancel(j)
+                n += 1
+        if payload.get("slot"):
+            n += QUEUE.cancel_slot(phone, str(payload["slot"]))
+        await send({"t": "info", "cancelled": n})
+    elif action == "move":
+        j = QUEUE.find(str(payload.get("id") or ""))
+        if j is None or j.state != "waiting":
+            await send({"t": "error", "v": "That job isn't waiting any more."})
+            return True
+        k = QUEUE.move(j, int(payload.get("to") or 1))
+        await send({"t": "info", "moved": True, "position": k})
+    elif action == "ack":
+        j = QUEUE.find(str(payload.get("id") or ""))
+        if j is not None:
+            QUEUE.ack(j)
+        await send({"t": "info", "acked": True})
+    else:
+        await send({"t": "error", "v": "Your computer doesn't know that request."})
+        return True
+    return False
+
+
+async def _op_stop_all(payload: dict, send, phone: str) -> bool:
+    n = QUEUE.stop_all("stop_all", drop_held=True)
+    await asyncio.get_running_loop().run_in_executor(None, _comfy_stop_now)
+    await send({"t": "info", "stopped": n})
+    return False
+
+
+def _unload_everything():
+    LLAMA.resume_wanted = False
+    LLAMA.paused_for = None
+    LLAMA.stop()
+    ENGINE.unload()                                    # also ends the helper process
+    COMFY.free()                                       # ComfyUI keeps running, empty: no cold start next time
+
+
+async def _op_free_memory(payload: dict, send, phone: str) -> bool:
+    loop = asyncio.get_running_loop()
+    n = QUEUE.stop_all("stop_all", True)
+    await loop.run_in_executor(None, _comfy_stop_now)
+    # 11-17: wait for the stopped job's thread to return, but keep the line to the phone alive: a thread inside a model
+    # load cannot be interrupted and can take over 100 s, and the tunnel cuts a silent connection at 100 s.
+    while True:
+        try:
+            await asyncio.wait_for(GPU.acquire(), 20)
+            break
+        except asyncio.TimeoutError:
+            await send({"t": "ping"})
+    try:
+        await loop.run_in_executor(None, _unload_everything)
+    finally:
+        GPU.release()
+    figs = await loop.run_in_executor(None, _figures)
+    await send({"t": "info", "freed": True, "stopped": n, **figs})
+    return False
+
+
+ASYNC_HANDLERS = {"queue": _op_queue, "stop_all": _op_stop_all, "free_memory": _op_free_memory}
+
+
+def _drop_expired_pairings():
+    """A temporary pairing past its expiry is deleted from keys.json, not just refused."""
+    try:
+        data = json.loads(KEYS.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    now = time.time()
+    phones = data.get("phones", {})
+    gone = [k for k, v in phones.items() if v.get("expires") and float(v["expires"]) < now]
+    if not gone:
+        return
+    for k in gone:
+        phones.pop(k)
+    tmp = KEYS.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
+    os.replace(tmp, KEYS)
+    log.warning("removed %d expired pairing(s)", len(gone))
+
+
+async def idle_unloader(app):
+    """Unloads the image and video models (and any transformers fallback chat model) once nothing has used
+    them for IDLE_UNLOAD seconds, and stops the llama.cpp chat model after the same idle time (it holds the last
+    conversation in memory; restarting it costs a few seconds on the next chat).
+    In use = any request in the last IDLE_UNLOAD (chat, job, the app-open warm-up, the Queue screen), or anything
+    in the line or held for collection. The PC can't see the phone: a backgrounded phone is idle after 20 min."""
+    async def loop():
+        global LAST_USE
+        while True:
+            await asyncio.sleep(30)
+            QUEUE.expire()
+            if QUEUE.has_work():                   # queued/running jobs and held results count as use: never unload under them
+                LAST_USE = time.monotonic()
+            # Idle means no pictures AND no chat: a long chat between pictures no longer unloads the picture model
+            # (the next picture then waited 25-110 s to load it again).
+            idle = time.monotonic() - max(LAST_USE, LAST_CHAT, LAST_SEEN)
+            if ENGINE.kind and not GPU.locked() and idle > IDLE_UNLOAD:
+                async with GPU:
+                    await asyncio.get_running_loop().run_in_executor(None, ENGINE.unload)
+            # The chat model too: its prompt cache holds the last conversation, so it never outlives the idle time.
+            if LLAMA.running() and not GPU.locked() and CHATS_ACTIVE == 0 and idle > IDLE_UNLOAD:
+                await asyncio.get_running_loop().run_in_executor(None, LLAMA.stop)
+            # ComfyUI holds the last photos, prompts and results in memory and its private folder: same idle rule.
+            if COMFY.running() and not GPU.locked() and idle > IDLE_UNLOAD:
+                async with GPU:
+                    await asyncio.get_running_loop().run_in_executor(None, COMFY.stop)
+            # A pause can never outlive its video, even if the runner's after-job step was skipped by an error.
+            if LLAMA.paused_for and not QUEUE.busy() and not QUEUE.waiting():
+                threading.Thread(target=LLAMA.resume, daemon=True, name="brain-resume").start()
+            await asyncio.get_running_loop().run_in_executor(None, _drop_expired_pairings)
+    task = asyncio.create_task(loop())
+    yield
+    task.cancel()
+
+
+def lower_priority():
+    """Below-normal priority: games, Plex and everything else on the PC win."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x00004000)
+        else:
+            os.nice(10)
+    except Exception:
+        pass
+
+
+def _deny() -> web.Response:
+    return web.Response(status=401, text="no")
+
+
+async def handle(request: web.Request) -> web.StreamResponse:
+    global LAST_CHAT, CHATS_ACTIVE, LAST_SEEN
+    op = request.match_info["op"]
+    if op not in JOBS:
+        return web.Response(status=404)
+    phone = request.headers.get("X-Fixer-Phone", "")
+    stamp = request.headers.get("X-Fixer-Time", "")
+    key = KEYSTORE.get(phone)
+    if not key or not stamp.isdigit() or abs(time.time() - int(stamp)) > CLOCK_SKEW:
+        return _deny()
+    body = await request.read()
+    aad = f"{PROTOCOL}|{op}|{phone}|{stamp}"
+    try:
+        payload = json.loads(unseal(key, body, aad.encode()))
+    except Exception:
+        return _deny()
+    if not REPLAY.fresh(body[:12]):
+        return _deny()
+    del body
+
+    resp = web.StreamResponse(headers={"Content-Type": "application/octet-stream", "Cache-Control": "no-store"})
+    await resp.prepare(request)
+    LAST_SEEN = time.monotonic()                       # every authenticated request is "in use" (idle stop)
+    seq = 0
+
+    async def send(obj: dict):
+        nonlocal seq
+        frame = seal(key, json.dumps(obj).encode(), f"{aad}|{seq}".encode())
+        # 11-17: a phone suspended in the background stops reading; an unbounded write would hang on a full buffer
+        # forever. At least ~200 KB/s, so a 10 MB video over a slow away connection isn't cut off.
+        await asyncio.wait_for(resp.write(struct.pack(">I", len(frame)) + frame), timeout=30 + len(frame) / 200_000)
+        seq += 1
+
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+    cancel = threading.Event()
+
+    def emit(obj: dict):
+        loop.call_soon_threadsafe(queue.put_nowait, obj)
+
+    async def run_streaming():
+        """Chat, status, search, forget, config: never wait for the line; stream the job's frames as they come."""
+        target = job_brain_warm if op == "warm" else JOBS[op]       # app-open warm-up: the chat model
+        fut = loop.run_in_executor(None, target, payload, emit, cancel)
+        getter = asyncio.ensure_future(queue.get())
+        while True:
+            # Every 20 s of silence a "ping" frame (the phone ignores it): Cloudflare cuts a connection that says
+            # nothing for 100 s, and a video's first model load can take that long.
+            done, _ = await asyncio.wait({getter, fut}, timeout=20, return_when=asyncio.FIRST_COMPLETED)
+            if not done:
+                await send({"t": "ping"})
+                continue
+            if getter in done:
+                await send(getter.result())
+                getter = asyncio.ensure_future(queue.get())
+                continue
+            getter.cancel()
+            await asyncio.sleep(0)                 # let emits queued just before the end arrive
+            while not queue.empty():
+                await send(queue.get_nowait())
+            fut.result()                           # raises the job's error, if any
+            return
+
+    try:
+        if op in ASYNC_OPS:
+            if not await ASYNC_HANDLERS[op](payload, send, phone):
+                await send({"t": "done"})
+        elif op in QUEUED_OPS and not (op == "warm" and payload.get("for") != "make"):
+            # 11-17: pictures, edits and videos line up (see JobQueue) and run whether or not this phone stays
+            # connected: a backgrounded phone is suspended by iOS ~30 s later, and the job must not die with it.
+            # A new request from the same place replaces that place's unfinished one (the old newest-wins).
+            if op == "warm" and (QUEUE.busy() or QUEUE.waiting()):
+                await send({"t": "info", "warm": False})
+                await send({"t": "done"})
+                return resp
+            job = Job(op, payload, phone)
+            payload = None                             # the Job owns it until it runs
+            try:
+                replaced = QUEUE.submit(job, loop)
+            except UserFacing as e:
+                await send({"t": "error", "v": _plain(e)})
+                return resp
+            if any(j.state == "running" for j in replaced):
+                await send({"t": "status", "v": "Stopping the previous request…"})
+            if job.enhance:                            # the brain improves the words while the job waits in line
+                loop.run_in_executor(None, _enhance_job, job)
+            await _watch(job, send, phone)
+        else:
+            if op == "forget":
+                QUEUE.clear()                          # the line, held results and gone ids, before the rest
+            if op == "chat":
+                payload.pop("_queue", None)            # private keys: never taken from the phone
+                payload.pop("_eta_s", None)
+                payload["_queue"] = QUEUE.snapshot()
+                payload["_eta_s"] = QUEUE.eta_running()
+            # Chat runs in llama-server (its own process, already resident), so it never waits behind an image
+            # job. The rare transformers fallback takes its own lock inside job_chat.
+            LAST_CHAT = time.monotonic()
+            CHATS_ACTIVE += 1
+            try:
+                await run_streaming()
+            finally:
+                CHATS_ACTIVE -= 1
+                LAST_CHAT = time.monotonic()
+            await send({"t": "done"})
+    except (ConnectionResetError, asyncio.CancelledError):
+        cancel.set()                               # phone went away: stop what is generating for it (not a queued job)
+        raise
+    except Exception as e:
+        cancel.set()
+        log.warning("%s job failed: %s", op, e.__class__.__name__)
+        try:
+            await send({"t": "error", "v": _plain(e)})
+        except Exception:
+            pass
+    finally:
+        payload = None
+    return resp
+
+
+def _plain(e: Exception) -> str:
+    """One plain sentence for the phone."""
+    name = e.__class__.__name__
+    text = str(e).strip()
+    if isinstance(e, UserFacing):
+        return text
+    if name == "OutOfMemoryError" or "out of memory" in text.lower():
+        return "Not enough graphics memory. Try a smaller size or another model."
+    if name == "GatedRepoError":
+        return "This model needs a Hugging Face sign-in on your computer."
+    if name in ("RepositoryNotFoundError", "RevisionNotFoundError", "EntryNotFoundError"):
+        return "That model wasn't found on Hugging Face."
+    if name in ("LocalEntryNotFoundError", "OfflineModeIsEnabled", "HfHubHTTPError", "ConnectionError",
+                "ConnectTimeout", "ReadTimeout", "URLError", "ChunkedEncodingError"):
+        return "Couldn't download the model. Check your computer's internet connection."
+    return "Something went wrong on your computer. Try again."
+
+
+def _from_this_pc(request: web.Request) -> bool:
+    # A tunnel (cloudflared) on this PC also connects from 127.0.0.1, but adds forwarding headers.
+    forwarded = any(h in request.headers for h in ("Cf-Connecting-Ip", "X-Forwarded-For", "Forwarded", "Cf-Ray"))
+    return request.remote in ("127.0.0.1", "::1") and not forwarded
+
+
+async def local_state(request: web.Request) -> web.Response:
+    """For the tray icon on this PC only: what's loaded and whether a job is running. No request content."""
+    if not _from_this_pc(request):
+        return web.Response(status=404)
+    return web.json_response({"loaded": ENGINE.repo, "busy": QUEUE.busy(), "waiting": len(QUEUE.waiting()),
+                              "idle_s": int(time.monotonic() - LAST_USE)})
+
+
+async def local_unload(request: web.Request) -> web.Response:
+    """Tray "Free GPU memory now" (this PC only)."""
+    if not _from_this_pc(request):
+        return web.Response(status=404)
+    if not GPU.locked():
+        async with GPU:
+            await asyncio.get_running_loop().run_in_executor(None, ENGINE.unload)
+            LLAMA.stop()                               # restarts in seconds on the next chat
+    return web.json_response({"loaded": ENGINE.repo})
+
+
+def app() -> web.Application:
+    a = web.Application(client_max_size=MAX_BODY)
+    a.cleanup_ctx.append(idle_unloader)
+    if COMFY.available():
+        threading.Thread(target=lambda: _quietly(COMFY.ensure), daemon=True, name="comfy-start").start()
+    a.router.add_post("/v1/{op}", handle)
+    a.router.add_get("/local/state", local_state)
+    a.router.add_post("/local/unload", local_unload)
+    a.router.add_get("/", lambda r: web.Response(text="Fixer Desktop"))
+    return a
+
+
+def main():
+    lower_priority()
+    import shutil
+    shutil.rmtree(COMFY_PRIVATE, ignore_errors=True)   # a crash or kill could have left a job's photo behind
+    if not KEYS.exists():
+        print(f"No phones paired yet. Run:  python pair.py \"My iPhone\"   (keys go in {KEYS})", file=sys.stderr)
+    print(f"Fixer Desktop on {HOST}:{PORT}  models: {MODELS} (cap {CAP_GB:.0f} GB)", file=sys.stderr)
+    try:
+        web.run_app(app(), host=HOST, port=PORT, access_log=None, print=None)
+    finally:
+        LLAMA.stop()
+        WORKER.stop()
+        COMFY.stop()                                   # also empties its private folder
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,42 @@
+name: Compile check
+
+# Compiles the app unsigned on pushes to other branches, so Swift mistakes show up without touching any secrets.
+# Not on main: the TestFlight build compiles the same code there, and the two competed for the one Mac.
+on:
+  push:
+    branches-ignore: [main]
+    paths-ignore: ["**.md"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compile-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compile:
+    runs-on: macos-26
+    timeout-minutes: 40
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      XCODE_MAJOR: ${{ vars.XCODE_MAJOR || '26' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: bash ci/toolchain.sh
+      - name: Compile (unsigned)
+        run: |
+          xcodegen generate
+          set -o pipefail
+          xcodebuild -project Fixer.xcodeproj -scheme Fixer -configuration Release \
+            -destination 'generic/platform=iOS' -skipMacroValidation -skipPackagePluginValidation \
+            CODE_SIGNING_ALLOWED=NO build 2>&1 | tee build.log \
+            | grep -E 'error:|BUILD (SUCCEEDED|FAILED)' || true
+          grep -q 'BUILD SUCCEEDED' build.log
+      - name: Error context
+        if: failure()
+        run: grep -B2 -A6 'error:' build.log | head -n 200 || true

@@ -1,0 +1,1110 @@
+{
+ "groups": [
+  {
+   "name": "Quality",
+   "items": [
+    {
+     "id": "q_photoreal",
+     "label": "Photoreal",
+     "zimage": {
+      "p": "a realistic candid photograph",
+      "n": ""
+     },
+     "chroma": {
+      "p": "A photograph, realistic",
+      "n": "painting, anime, CGI, illustration"
+     },
+     "sdxl": {
+      "p": "photo \\(medium\\)",
+      "n": "cartoon"
+     }
+    },
+    {
+     "id": "q_pro",
+     "label": "Pro photo",
+     "zimage": {
+      "p": "a high-end professional photograph",
+      "n": ""
+     },
+     "chroma": {
+      "p": "A professional photograph",
+      "n": "low quality"
+     },
+     "sdxl": {
+      "p": "professional photo, high aesthetic",
+      "n": "amateur"
+     }
+    },
+    {
+     "id": "q_amateur",
+     "label": "Amateur photo",
+     "zimage": {
+      "p": "a casual amateur snapshot",
+      "n": ""
+     },
+     "chroma": {
+      "p": "An amateur photo, candid snapshot",
+      "n": "airbrushed"
+     },
+     "sdxl": {
+      "p": "candid amateur photo, reddit",
+      "n": ""
+     }
+    },
+    {
+     "id": "q_skin",
+     "label": "Skin texture",
+     "zimage": {
+      "p": "visible pores, fine skin texture",
+      "n": ""
+     },
+     "chroma": {
+      "p": "skin with pores and slight blemishes",
+      "n": "plastic skin, waxy skin"
+     },
+     "sdxl": {
+      "p": "detailed skin texture, pores",
+      "n": "plastic skin"
+     }
+    },
+    {
+     "id": "q_sharp",
+     "label": "Sharp focus",
+     "zimage": {
+      "p": "sharp focus, crisp details",
+      "n": ""
+     },
+     "chroma": {
+      "p": "sharp focus, fine detail",
+      "n": "smudged, out of focus"
+     },
+     "sdxl": {
+      "p": "sharp focus, high detail",
+      "n": "blurry"
+     }
+    },
+    {
+     "id": "q_imperfect",
+     "label": "Imperfect real",
+     "zimage": {
+      "p": "slightly asymmetrical, unretouched",
+      "n": ""
+     },
+     "chroma": {
+      "p": "an ordinary, slightly asymmetric face",
+      "n": "doll face"
+     },
+     "sdxl": {
+      "p": "natural face, freckles",
+      "n": "beauty filter"
+     }
+    }
+   ]
+  },
+  {
+   "name": "Lighting",
+   "items": [
+    {
+     "id": "l_window",
+     "label": "Soft window",
+     "zimage": {
+      "p": "soft diffused window light",
+      "n": ""
+     },
+     "chroma": {
+      "p": "soft side window light",
+      "n": "harsh lighting"
+     },
+     "sdxl": {
+      "p": "soft natural window light",
+      "n": ""
+     }
+    },
+    {
+     "id": "l_golden",
+     "label": "Golden hour",
+     "zimage": {
+      "p": "golden hour, warm low sun",
+      "n": ""
+     },
+     "chroma": {
+      "p": "warm golden hour sunlight",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "golden hour, warm sunlight",
+      "n": ""
+     }
+    },
+    {
+     "id": "l_studio",
+     "label": "Studio softbox",
+     "zimage": {
+      "p": "studio lighting, twin softboxes",
+      "n": ""
+     },
+     "chroma": {
+      "p": "studio lighting with a large softbox",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "studio lighting, softbox",
+      "n": ""
+     }
+    },
+    {
+     "id": "l_lowkey",
+     "label": "Moody low-key",
+     "zimage": {
+      "p": "dramatic side light, deep shadows",
+      "n": ""
+     },
+     "chroma": {
+      "p": "dim low-key lighting, deep shadows",
+      "n": "overexposed"
+     },
+     "sdxl": {
+      "p": "low key lighting, dramatic shadows",
+      "n": "overexposed"
+     }
+    },
+    {
+     "id": "l_lamp",
+     "label": "Warm lamp",
+     "zimage": {
+      "p": "warm bedside lamp light",
+      "n": ""
+     },
+     "chroma": {
+      "p": "lit by a single warm bedside lamp",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "dim bedroom, warm lamp light",
+      "n": ""
+     }
+    },
+    {
+     "id": "l_flash",
+     "label": "Flash",
+     "zimage": {
+      "p": "on-camera flash snapshot",
+      "n": ""
+     },
+     "chroma": {
+      "p": "on-camera flash snapshot",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "on-camera flash, harsh flash",
+      "n": ""
+     }
+    }
+   ]
+  },
+  {
+   "name": "Camera",
+   "items": [
+    {
+     "id": "c_closeup",
+     "label": "Close portrait",
+     "zimage": {
+      "p": "close-up headshot, 85mm, shallow depth of field",
+      "n": ""
+     },
+     "chroma": {
+      "p": "close-up portrait, 85mm, shallow focus",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "portrait, close-up, 85mm lens",
+      "n": ""
+     }
+    },
+    {
+     "id": "c_medium",
+     "label": "Half body",
+     "zimage": {
+      "p": "waist-up medium shot, 50mm",
+      "n": ""
+     },
+     "chroma": {
+      "p": "medium shot framed from the waist up",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "cowboy shot, upper body",
+      "n": ""
+     }
+    },
+    {
+     "id": "c_full",
+     "label": "Full body",
+     "zimage": {
+      "p": "full-body shot, head to toe, 35mm",
+      "n": ""
+     },
+     "chroma": {
+      "p": "full body shot, head to feet",
+      "n": "cropped"
+     },
+     "sdxl": {
+      "p": "full body",
+      "n": "cropped"
+     }
+    },
+    {
+     "id": "c_high",
+     "label": "High angle",
+     "zimage": {
+      "p": "high-angle shot from above",
+      "n": ""
+     },
+     "chroma": {
+      "p": "shot from above, looking down at her",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "high angle, from above",
+      "n": ""
+     }
+    },
+    {
+     "id": "c_behind",
+     "label": "Over shoulder",
+     "zimage": {
+      "p": "from behind, looking back over her shoulder",
+      "n": ""
+     },
+     "chroma": {
+      "p": "from behind, looking back over her shoulder",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "from behind, looking back",
+      "n": ""
+     }
+    },
+    {
+     "id": "c_selfie",
+     "label": "Selfie",
+     "zimage": {
+      "p": "handheld phone selfie, arm extended",
+      "n": ""
+     },
+     "chroma": {
+      "p": "an arm's-length phone selfie",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "selfie, taken with smartphone",
+      "n": ""
+     }
+    }
+   ]
+  },
+  {
+   "name": "Style",
+   "items": [
+    {
+     "id": "s_iphone",
+     "label": "Phone snapshot",
+     "zimage": {
+      "p": "casual iPhone snapshot",
+      "n": ""
+     },
+     "chroma": {
+      "p": "early 2010s digital phone photo",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "amateur photo, flickr, candid",
+      "n": ""
+     }
+    },
+    {
+     "id": "s_portra",
+     "label": "Film Portra",
+     "zimage": {
+      "p": "Kodak Portra 400, fine grain",
+      "n": ""
+     },
+     "chroma": {
+      "p": "35mm Portra film, subtle grain",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "35mm film, film grain, analog photo",
+      "n": ""
+     }
+    },
+    {
+     "id": "s_editorial",
+     "label": "Editorial",
+     "zimage": {
+      "p": "fashion editorial photograph",
+      "n": ""
+     },
+     "chroma": {
+      "p": "high fashion editorial photograph",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "editorial, glamour photography",
+      "n": "amateur"
+     }
+    },
+    {
+     "id": "s_boudoir",
+     "label": "Boudoir",
+     "zimage": {
+      "p": "intimate boudoir photograph",
+      "n": ""
+     },
+     "chroma": {
+      "p": "intimate boudoir photography",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "boudoir photography, sensual",
+      "n": ""
+     }
+    },
+    {
+     "id": "s_bw",
+     "label": "Black and white",
+     "zimage": {
+      "p": "Ilford HP5 black-and-white",
+      "n": ""
+     },
+     "chroma": {
+      "p": "black and white film photo",
+      "n": "color"
+     },
+     "sdxl": {
+      "p": "monochrome, film grain",
+      "n": "color"
+     }
+    },
+    {
+     "id": "s_anime",
+     "label": "Anime",
+     "zimage": {
+      "p": "anime illustration, soft cel shading",
+      "n": ""
+     },
+     "chroma": {
+      "p": "anime illustration, cel shading",
+      "n": "photo, realistic"
+     },
+     "sdxl": {
+      "p": "anime style, illustration",
+      "n": "photo, realistic"
+     }
+    }
+   ]
+  },
+  {
+   "name": "Body",
+   "items": [
+    {
+     "id": "b_small",
+     "label": "Small breasts",
+     "zimage": {
+      "p": "small breasts, flat chest",
+      "n": ""
+     },
+     "chroma": {
+      "p": "small, modest breasts",
+      "n": "large breasts, busty, cleavage"
+     },
+     "sdxl": {
+      "p": "small breasts, flat chest",
+      "n": "(large breasts:1.2), huge breasts"
+     }
+    },
+    {
+     "id": "b_medium",
+     "label": "Medium breasts",
+     "zimage": {
+      "p": "medium natural breasts",
+      "n": ""
+     },
+     "chroma": {
+      "p": "medium natural-sized breasts",
+      "n": "huge breasts"
+     },
+     "sdxl": {
+      "p": "medium breasts",
+      "n": "huge breasts"
+     }
+    },
+    {
+     "id": "b_large",
+     "label": "Large breasts",
+     "zimage": {
+      "p": "large natural breasts, full bust",
+      "n": ""
+     },
+     "chroma": {
+      "p": "full, large natural breasts",
+      "n": "small breasts, flat chest"
+     },
+     "sdxl": {
+      "p": "(large breasts:1.1)",
+      "n": "small breasts"
+     }
+    },
+    {
+     "id": "b_slim",
+     "label": "Slim",
+     "zimage": {
+      "p": "a slim, slender build, narrow waist",
+      "n": ""
+     },
+     "chroma": {
+      "p": "a slim, slender build",
+      "n": "curvy, heavy"
+     },
+     "sdxl": {
+      "p": "slim, slender body",
+      "n": "wide hips"
+     }
+    },
+    {
+     "id": "b_curvy",
+     "label": "Curvy",
+     "zimage": {
+      "p": "curvy, full hips, thick thighs",
+      "n": ""
+     },
+     "chroma": {
+      "p": "a curvy figure, wide hips, soft waist",
+      "n": "skinny"
+     },
+     "sdxl": {
+      "p": "curvy, wide hips, thick thighs",
+      "n": "skinny"
+     }
+    },
+    {
+     "id": "b_athletic",
+     "label": "Athletic",
+     "zimage": {
+      "p": "a toned athletic build, defined abs",
+      "n": ""
+     },
+     "chroma": {
+      "p": "a toned athletic build",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "athletic build, toned abs",
+      "n": ""
+     }
+    },
+    {
+     "id": "b_petite",
+     "label": "Petite",
+     "zimage": {
+      "p": "a petite, small-framed adult woman",
+      "n": ""
+     },
+     "chroma": {
+      "p": "a petite, small-framed adult woman",
+      "n": "tall"
+     },
+     "sdxl": {
+      "p": "petite, short",
+      "n": "tall"
+     }
+    },
+    {
+     "id": "b_plus",
+     "label": "Plus size",
+     "zimage": {
+      "p": "a plus-size woman, soft full figure",
+      "n": ""
+     },
+     "chroma": {
+      "p": "a plus-size woman, soft full figure",
+      "n": "slim, athletic"
+     },
+     "sdxl": {
+      "p": "plus size, chubby",
+      "n": "(skinny:1.2)"
+     }
+    },
+    {
+     "id": "b_20s",
+     "label": "Age 20s",
+     "zimage": {
+      "p": "adult woman in her mid 20s",
+      "n": ""
+     },
+     "chroma": {
+      "p": "an adult woman in her twenties",
+      "n": "teenager"
+     },
+     "sdxl": {
+      "p": "adult woman in her 20s",
+      "n": "teenager"
+     }
+    },
+    {
+     "id": "b_30s",
+     "label": "Age 30s",
+     "zimage": {
+      "p": "adult woman in her 30s",
+      "n": ""
+     },
+     "chroma": {
+      "p": "a woman in her mid thirties",
+      "n": "teenager, youthful"
+     },
+     "sdxl": {
+      "p": "woman in her 30s",
+      "n": "teenager"
+     }
+    },
+    {
+     "id": "b_40s",
+     "label": "Age 40s",
+     "zimage": {
+      "p": "adult woman in her 40s, fine eye lines",
+      "n": ""
+     },
+     "chroma": {
+      "p": "a woman in her mid forties, fine lines",
+      "n": "young, youthful face"
+     },
+     "sdxl": {
+      "p": "woman in her 40s, mature, (crow's feet:1.1)",
+      "n": "young"
+     }
+    },
+    {
+     "id": "b_50s",
+     "label": "Age 50s",
+     "zimage": {
+      "p": "adult woman in her 50s, wrinkles, gray hairs",
+      "n": ""
+     },
+     "chroma": {
+      "p": "a woman in her fifties, gray streaks, laugh lines",
+      "n": "young, smooth skin"
+     },
+     "sdxl": {
+      "p": "woman in her 50s, mature, (laugh lines:1.1)",
+      "n": "young, smooth skin"
+     }
+    }
+   ]
+  },
+  {
+   "name": "Expression",
+   "items": [
+    {
+     "id": "e_smile",
+     "label": "Soft smile",
+     "zimage": {
+      "p": "a calm gentle smile",
+      "n": ""
+     },
+     "chroma": {
+      "p": "a soft, warm smile",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "smile, looking at viewer",
+      "n": ""
+     }
+    },
+    {
+     "id": "e_playful",
+     "label": "Playful",
+     "zimage": {
+      "p": "a playful smirk, bright eyes",
+      "n": ""
+     },
+     "chroma": {
+      "p": "a playful smirk, raised eyebrow",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "smirk, playful",
+      "n": ""
+     }
+    },
+    {
+     "id": "e_seductive",
+     "label": "Seductive",
+     "zimage": {
+      "p": "half-lidded eyes, parted lips",
+      "n": ""
+     },
+     "chroma": {
+      "p": "a seductive look, half-lidded eyes",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "seductive smile, bedroom eyes",
+      "n": ""
+     }
+    },
+    {
+     "id": "e_laugh",
+     "label": "Laughing",
+     "zimage": {
+      "p": "laughing candidly, eyes crinkled",
+      "n": ""
+     },
+     "chroma": {
+      "p": "laughing naturally, eyes crinkled",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "laughing, candid",
+      "n": ""
+     }
+    },
+    {
+     "id": "e_shy",
+     "label": "Shy",
+     "zimage": {
+      "p": "a shy glance away, slight blush",
+      "n": ""
+     },
+     "chroma": {
+      "p": "a shy glance away, slight blush",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "shy, blush, looking away",
+      "n": ""
+     }
+    },
+    {
+     "id": "e_pleasure",
+     "label": "Pleasure",
+     "zimage": {
+      "p": "eyes closed, mouth open, flushed cheeks",
+      "n": ""
+     },
+     "chroma": {
+      "p": "eyes closed, mouth open in pleasure",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "eyes closed, parted lips, flushed",
+      "n": ""
+     }
+    }
+   ]
+  },
+  {
+   "name": "Pose",
+   "items": [
+    {
+     "id": "p_stand",
+     "label": "Standing",
+     "zimage": {
+      "p": "standing relaxed, hand on hip",
+      "n": ""
+     },
+     "chroma": {
+      "p": "standing relaxed, weight on one leg",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "standing, hand on hip",
+      "n": ""
+     }
+    },
+    {
+     "id": "p_sit",
+     "label": "Sitting",
+     "zimage": {
+      "p": "sitting on a bed, legs crossed",
+      "n": ""
+     },
+     "chroma": {
+      "p": "sitting on a bed, legs crossed",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "sitting on bed, crossed legs",
+      "n": ""
+     }
+    },
+    {
+     "id": "p_back",
+     "label": "Lying back",
+     "zimage": {
+      "p": "lying on her back, one knee raised",
+      "n": ""
+     },
+     "chroma": {
+      "p": "lying on her back",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "lying on back, on bed",
+      "n": ""
+     }
+    },
+    {
+     "id": "p_stomach",
+     "label": "On stomach",
+     "zimage": {
+      "p": "lying on her stomach on her elbows",
+      "n": ""
+     },
+     "chroma": {
+      "p": "lying on her stomach, on her elbows",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "lying on stomach, feet up",
+      "n": ""
+     }
+    },
+    {
+     "id": "p_fours",
+     "label": "All fours",
+     "zimage": {
+      "p": "on her hands and knees, looking back",
+      "n": ""
+     },
+     "chroma": {
+      "p": "on her hands and knees, looking back",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "on all fours, from behind",
+      "n": ""
+     }
+    },
+    {
+     "id": "p_spread",
+     "label": "Spread legs",
+     "zimage": {
+      "p": "lying back with her legs spread",
+      "n": ""
+     },
+     "chroma": {
+      "p": "reclining with her legs spread",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "spread legs",
+      "n": ""
+     }
+    }
+   ]
+  },
+  {
+   "name": "Clothing",
+   "items": [
+    {
+     "id": "w_nude",
+     "label": "Nude",
+     "zimage": {
+      "p": "completely nude, bare skin",
+      "n": ""
+     },
+     "chroma": {
+      "p": "completely nude, bare skin",
+      "n": "clothing, underwear, bra"
+     },
+     "sdxl": {
+      "p": "NSFW, nude, naked",
+      "n": "clothes, bra"
+     }
+    },
+    {
+     "id": "w_topless",
+     "label": "Topless",
+     "zimage": {
+      "p": "topless, bare breasts, only jeans",
+      "n": ""
+     },
+     "chroma": {
+      "p": "topless, bare breasts, only jeans",
+      "n": "shirt, bra"
+     },
+     "sdxl": {
+      "p": "NSFW, topless, jeans",
+      "n": "bra, shirt"
+     }
+    },
+    {
+     "id": "w_lingerie",
+     "label": "Lingerie",
+     "zimage": {
+      "p": "a black lace lingerie set",
+      "n": ""
+     },
+     "chroma": {
+      "p": "black lace lingerie, bra and panties",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "Suggestive, lace lingerie",
+      "n": ""
+     }
+    },
+    {
+     "id": "w_shirt",
+     "label": "Open shirt",
+     "zimage": {
+      "p": "only an open oversized white shirt",
+      "n": ""
+     },
+     "chroma": {
+      "p": "an open unbuttoned white shirt",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "open shirt, unbuttoned",
+      "n": ""
+     }
+    },
+    {
+     "id": "w_stockings",
+     "label": "Stockings",
+     "zimage": {
+      "p": "only thigh-high stockings",
+      "n": ""
+     },
+     "chroma": {
+      "p": "only thigh-high stockings",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "thigh-high stockings, garter belt",
+      "n": ""
+     }
+    },
+    {
+     "id": "w_casual",
+     "label": "Casual",
+     "zimage": {
+      "p": "a fitted t-shirt and jeans",
+      "n": ""
+     },
+     "chroma": {
+      "p": "a fitted t-shirt and jeans",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "SFW, t-shirt, jeans",
+      "n": ""
+     }
+    }
+   ]
+  },
+  {
+   "name": "Setting",
+   "items": [
+    {
+     "id": "x_bedroom",
+     "label": "Bedroom",
+     "zimage": {
+      "p": "a bedroom, rumpled sheets",
+      "n": ""
+     },
+     "chroma": {
+      "p": "in a bedroom, rumpled sheets",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "bedroom, unmade bed",
+      "n": ""
+     }
+    },
+    {
+     "id": "x_bath",
+     "label": "Bathroom",
+     "zimage": {
+      "p": "a steamy bathroom, wet tiles",
+      "n": ""
+     },
+     "chroma": {
+      "p": "in a steamy bathroom",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "bathroom, steamy, wet skin",
+      "n": ""
+     }
+    },
+    {
+     "id": "x_living",
+     "label": "Living room",
+     "zimage": {
+      "p": "a cozy living room, leather sofa",
+      "n": ""
+     },
+     "chroma": {
+      "p": "on a living room sofa",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "living room, couch",
+      "n": ""
+     }
+    },
+    {
+     "id": "x_beach",
+     "label": "Beach",
+     "zimage": {
+      "p": "an empty beach at sunset",
+      "n": ""
+     },
+     "chroma": {
+      "p": "on a sunny beach, sea behind her",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "beach, ocean, sand",
+      "n": ""
+     }
+    },
+    {
+     "id": "x_studio",
+     "label": "Studio",
+     "zimage": {
+      "p": "a plain gray studio backdrop",
+      "n": ""
+     },
+     "chroma": {
+      "p": "against a plain gray studio backdrop",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "photo studio, gray backdrop",
+      "n": ""
+     }
+    },
+    {
+     "id": "x_hotel",
+     "label": "Hotel room",
+     "zimage": {
+      "p": "a dim hotel room, city view",
+      "n": ""
+     },
+     "chroma": {
+      "p": "in a hotel room by a large window",
+      "n": ""
+     },
+     "sdxl": {
+      "p": "hotel room, city view",
+      "n": ""
+     }
+    }
+   ]
+  },
+  {
+   "name": "Fixes",
+   "items": [
+    {
+     "id": "f_base",
+     "label": "Base negative",
+     "zimage": {
+      "p": "sharp focus, finished image",
+      "n": ""
+     },
+     "chroma": {
+      "p": "",
+      "n": "low quality, ugly, unfinished, out of focus, deformed, smudged, flat colors"
+     },
+     "sdxl": {
+      "p": "",
+      "n": "blurry"
+     }
+    },
+    {
+     "id": "f_anatomy",
+     "label": "Anatomy",
+     "zimage": {
+      "p": "correct anatomy, proportionate body",
+      "n": ""
+     },
+     "chroma": {
+      "p": "",
+      "n": "bad anatomy, extra limbs, fused limbs"
+     },
+     "sdxl": {
+      "p": "",
+      "n": "bad anatomy, extra limbs, mutated"
+     }
+    },
+    {
+     "id": "f_hands",
+     "label": "Hands",
+     "zimage": {
+      "p": "natural hands, five fingers each",
+      "n": ""
+     },
+     "chroma": {
+      "p": "",
+      "n": "extra fingers, fused fingers, bad hands"
+     },
+     "sdxl": {
+      "p": "",
+      "n": "extra fingers, fused fingers, bad hands"
+     }
+    },
+    {
+     "id": "f_plastic",
+     "label": "Not plastic",
+     "zimage": {
+      "p": "unretouched skin, visible pores",
+      "n": ""
+     },
+     "chroma": {
+      "p": "",
+      "n": "plastic skin, airbrushed, doll"
+     },
+     "sdxl": {
+      "p": "",
+      "n": "airbrushed, plastic skin, beauty filter"
+     }
+    },
+    {
+     "id": "f_dupes",
+     "label": "Single image",
+     "zimage": {
+      "p": "one photo of one woman, no text",
+      "n": ""
+     },
+     "chroma": {
+      "p": "",
+      "n": "duplicate, extra person, watermark, text"
+     },
+     "sdxl": {
+      "p": "",
+      "n": "collage, split view, watermark, text"
+     }
+    },
+    {
+     "id": "f_adult",
+     "label": "Clearly adult",
+     "zimage": {
+      "p": "clearly adult, mature features",
+      "n": ""
+     },
+     "chroma": {
+      "p": "",
+      "n": "teenager, youthful, baby face, child"
+     },
+     "sdxl": {
+      "p": "",
+      "n": "teenager, child, baby face"
+     }
+    }
+   ]
+  }
+ ]
+}

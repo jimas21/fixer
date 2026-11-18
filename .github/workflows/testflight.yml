@@ -1,0 +1,115 @@
+name: TestFlight
+
+# Builds on a cloud Mac and uploads to TestFlight on every push to main (and by hand from the Actions tab).
+# Pull requests never run this, because it holds signing secrets.
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One build at a time; never cancel a run that may be mid-upload.
+concurrency:
+  group: testflight-v4   # renamed again 11-17: a run queued with no runner for 1h+ held v3 (never cancel queued runs; rename instead)
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Archive and upload
+    # Skipped until the repo variables exist. preflight.sh then checks every variable and secret.
+    if: ${{ vars.TEAM_ID != '' && vars.BUNDLE_ID != '' }}
+    # Mac image from the repo variable MAC_RUNNER (default macos-26). macos-15 also carries Xcode 26 and is
+    # the fallback when GitHub's macos-26 queue is long; ci/toolchain.sh selects the newest Xcode 26 either way.
+    runs-on: ${{ vars.MAC_RUNNER || 'macos-26' }}
+    timeout-minutes: 60
+    env:
+      BUNDLE_ID: ${{ vars.BUNDLE_ID }}
+      TEAM_ID: ${{ vars.TEAM_ID }}
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      XCODE_MAJOR: ${{ vars.XCODE_MAJOR || '26' }}
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - name: Check out
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Preflight (settings present and well-formed)
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: bash ci/preflight.sh
+
+      - name: Toolchain
+        run: bash ci/toolchain.sh
+
+      - name: Write API key to a temp file
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: bash ci/write_key.sh
+
+      - name: Python tools (Apple setup)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet "pyjwt[crypto]"
+
+      # Before the long build: registers the bundle ID, checks the App Store Connect app exists, and makes sure the
+      # app has an internal TestFlight group that gets every build (ported from pokerogue-ios).
+      - name: Apple setup
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: '"$RUNNER_TEMP/venv/bin/python" ci/asc_setup.py'
+
+      # Compiled packages (MLX, swift-transformers, ...) are kept between builds: without this every build
+      # recompiles them from scratch (~10 min). Always restores the newest cache; Xcode rebuilds only what changed.
+      - name: Restore compiled packages
+        id: dd
+        uses: actions/cache/restore@v4
+        with:
+          path: build/DerivedData
+          key: dd-v2-${{ github.run_id }}
+          restore-keys: |
+            dd-v2-
+            dd-v1-
+
+      - name: Generate project and archive
+        id: archive
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: bash ci/archive.sh
+
+      - name: Save compiled packages
+        if: always() && steps.archive.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: build/DerivedData
+          key: dd-v2-${{ github.run_id }}
+
+      - name: Export and upload to TestFlight
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: bash ci/export_upload.sh
+
+      - name: Summary
+        if: success()
+        run: |
+          {
+            echo "### Uploaded to TestFlight"
+            echo ""
+            echo "- Build number: \`${GITHUB_RUN_NUMBER}\`"
+            echo "- Commit: \`${GITHUB_SHA::7}\`"
+            echo ""
+            echo "The build appears in TestFlight after Apple finishes processing it."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove API key file
+        if: always()
+        run: bash ci/cleanup.sh

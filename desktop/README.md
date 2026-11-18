@@ -85,7 +85,35 @@ every switch (see the comment in `Comfy.ensure`).
 
 ## Running
 
-The tray icon (`tray.py`, started from the Startup folder) is the on/off switch. By hand:
+The tray icon (`tray.py`, started from the Startup folder) is the on/off switch. Only one tray can run. The tray owns
+the server: **Turn off** and **Quit** ask the server to stop itself (`POST /local/quit`: every job stopped, the chat
+model, the helper and ComfyUI ended, `comfy-private` wiped), force it only if it will not, then sweep anything of this
+install still running. If the tray or the server dies in any way, their children die with them (job objects).
+
+Control the install with `fixerctl.py`, never with hand kills (hand kills are how duplicate trays got made):
+
+```
+python fixerctl.py status            trays, server, port, anything of this install still running (read-only)
+python fixerctl.py stop              stop everything and end every tray
+python fixerctl.py start             start exactly one tray, detached from the calling session
+python fixerctl.py restart
+python fixerctl.py deploy [--force]  from the repo's desktop folder: copy changed files into the install, restart
+```
+
+**When the PC gives its memory back.** The phone says when the app goes to the background (`leave`) and sends the
+owner's choice from Settings (`free_after_min`: 1, 3, 5, 10, 20, 60 minutes or 0 = never; default 5). Once nothing is
+running or waiting and that time has passed, the engine, the chat model and ComfyUI are all stopped. The older
+20-minute idle rule is the backstop and stretches to the same choice (never = never). `leave_free_minutes` in
+`local.json` is the default until a phone has sent a choice. From the phone, "Free up my computer" does it at once.
+
+**Why was that picture slow?** `GET http://127.0.0.1:8765/local/timings` (this PC only) lists the recent jobs: seconds
+loading, drawing and improving the words, and whether a model had to load. No words or pictures are in it.
+
+**Video length.** `seconds` up to `video_max_seconds` (`local.json`, default 30). Wan 2.2 is trained on 5-second clips,
+so a longer one is made in 5-second parts, each starting from the previous part's last frame; a 30-second clip takes
+about six times as long as a 5-second one, and picture quality can drift from part to part.
+
+By hand:
 
 ```
 cd C:\FixerDesktop

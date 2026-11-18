@@ -1,12 +1,19 @@
 """Fixer Desktop tray icon: the owner's on/off switch.
 
 Green = on, amber = working, grey = off. Hover for the state. Right-click:
-  Turn on / Turn off          off stops the server entirely (all graphics memory and RAM returned)
+  Turn on / Turn off          off stops the server entirely (asks it to quit itself, forces it only if it will not;
+                              ComfyUI and the chat model go with it, all graphics memory and RAM returned)
   Free graphics memory        unloads the models but keeps the server on (they reload on the next request)
   Start with Windows          puts this tray icon in the Startup folder
   Turn on automatically       whether the server starts when the tray starts
   Pair a phone…               opens a window with the QR code
-  Open folder / Quit
+  Open folder
+  Quit                        stops the server the same way, then removes the icon (11-18: if not everything stopped
+                              it tries once more first; Turn off then shows "Couldn't stop everything", not "Off")
+
+Only one tray can run (a second one exits at once). The tray owns the server: it puts it in a job object, so if the
+tray is ended in any way (Task Manager, a closing session) the server and its children end too. To control the install
+from a terminal use fixerctl.py (status / stop / start / restart / deploy), never hand kills.
 
 Settings for the tray itself live in tray.json beside it (no request data).
 """
@@ -24,13 +31,17 @@ from pathlib import Path
 import pystray
 from PIL import Image, ImageDraw
 
+import fixerctl as fx           # beside this file, in the install and in the repo's desktop folder
+
 ROOT = Path(__file__).resolve().parent
 PY = ROOT / "venv" / "Scripts" / "python.exe"
 SERVER = ROOT / "fixer_desktop.py"
 CONF = ROOT / "tray.json"
 PORT = int(os.environ.get("FIXER_PORT", "8765"))
-STARTUP = Path(os.environ["APPDATA"]) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / "Fixer Desktop.lnk"
+LOG = ROOT / "tray.log"
+STARTUP = Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / "Fixer Desktop.lnk"
 NO_WINDOW = 0x08000000
+STOP_FAILED = "Couldn't stop everything (see tray.log)"   # 11-18: shown instead of "Off" when a stop fell short
 
 
 def load_conf() -> dict:
@@ -44,9 +55,20 @@ def save_conf(c: dict):
     CONF.write_text(json.dumps(c, indent=2), encoding="utf-8")
 
 
+def log(msg: str):
+    """One short line per stop (no request data). Never raises; the file is cut when it grows past 200 KB."""
+    try:
+        if LOG.exists() and LOG.stat().st_size > 200_000:
+            LOG.write_text("", encoding="utf-8")
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+    except Exception:
+        pass
+
+
 def icon_image(state: str) -> Image.Image:
     color = {"off": (130, 130, 140), "idle": (60, 190, 110), "loaded": (60, 190, 110), "busy": (250, 190, 60),
-             "starting": (90, 150, 230)}[state]
+             "starting": (90, 150, 230), "stopping": (225, 120, 90)}[state]
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     d.rounded_rectangle((2, 2, 62, 62), radius=14, fill=(45, 35, 95, 255))
@@ -55,12 +77,44 @@ def icon_image(state: str) -> Image.Image:
     return img
 
 
+CREATE_SUSPENDED = 0x00000004
+
+
+def start_in_job(cmd: list[str], cwd, job) -> subprocess.Popen:
+    """11-18: starts cmd suspended, puts it in `job`, then lets it run, so nothing it starts (the venv launcher's real
+    Python, the server's children) can be born outside the job. If it cannot be resumed it is killed and started the
+    old way (start, then add), and that is logged."""
+    io = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+    p = subprocess.Popen(cmd, cwd=str(cwd), creationflags=NO_WINDOW | CREATE_SUSPENDED, **io)
+    added = job.add(p)
+    if fx.resume_process(p):
+        if not added:
+            log("server not placed in the tray's job (carrying on without it)")
+        return p
+    log("could not resume the suspended server; starting it the old way")
+    try:
+        p.kill()
+        p.wait(10)
+    except Exception:                                   # noqa: BLE001
+        pass
+    p = subprocess.Popen(cmd, cwd=str(cwd), creationflags=NO_WINDOW, **io)
+    if not job.add(p):
+        log("server not placed in the tray's job (carrying on without it)")
+    return p
+
+
 class Tray:
     def __init__(self):
         self.conf = load_conf()
         self.proc: subprocess.Popen | None = None
         self.state = "off"
         self.detail = "Off"
+        self.job = fx.Job()                             # the server lives in this: it ends when this tray ends
+        self.stopping = False
+        self.stop_failed = False                        # 11-18: the last stop fell short (shown instead of "Off")
+        self.want_quit = False
+        self.stop_lock = threading.Lock()
+        self.stop_thread: threading.Thread | None = None
         self.icon = pystray.Icon("fixer", icon_image("off"), "Fixer Desktop — Off", menu=self.menu())
 
     # ---- server process
@@ -69,25 +123,60 @@ class Tray:
         return self.proc is not None and self.proc.poll() is None
 
     def turn_on(self, *_):
-        if self.running() or self.reachable():
+        if self.stopping or self.running():
             return
-        self.proc = subprocess.Popen([str(PY), "-u", str(SERVER)], cwd=str(ROOT), creationflags=NO_WINDOW,
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+        if self.reachable():                            # already serving (started by hand or by an older tray): adopt it
+            return
+        self.job.close()                                # a fresh job each time; closing the old one clears strays
+        self.job = fx.Job()
+        self.stop_failed = False
+        self.proc = start_in_job([str(PY), "-u", str(SERVER)], ROOT, self.job)
         self.set("starting", "Starting…")
 
+    def stop_all(self, quit_after: bool = False):
+        """Stops the server, ComfyUI and the chat model, off the menu thread; then (Quit) removes the icon."""
+        if quit_after:
+            self.want_quit = True
+        if self.stop_lock.locked():
+            return                                      # already stopping; a Quit asked meanwhile ends it after
+        self.stop_thread = threading.Thread(target=self._stop_worker, daemon=False, name="tray-stop")
+        self.stop_thread.start()
+
+    def _stop_worker(self):
+        if not self.stop_lock.acquire(blocking=False):
+            return
+        ok = False
+        try:
+            self.stopping = True
+            self.set("stopping", "Stopping…")
+            ok = self._stop_once()
+            if not ok and self.want_quit:               # 11-18: Quit tries once more before the icon goes
+                log("not everything stopped; trying once more before quitting")
+                ok = self._stop_once()
+            self.stop_failed = not ok
+            self.proc = None
+        finally:
+            self.stopping = False
+            self.stop_lock.release()
+        self.set("off", "Off" if ok else STOP_FAILED)
+        if self.want_quit:
+            self.icon.stop()
+
+    def _stop_once(self) -> bool:
+        """One run of the shared stop routine. True only when it reports everything stopped."""
+        try:
+            rep = fx.stop_everything(ROOT, PORT, proc=self.proc, job=self.job,
+                                     protect={os.getpid(), os.getppid()}, say=log)
+            log(f"stopped: polite={rep['polite']} forced={rep['forced']} swept={rep['swept']} "
+                f"port_closed={rep['port_closed']} remaining={rep['remaining']} unkilled={rep.get('unkilled', [])} "
+                f"ok={rep['ok']}")
+            return bool(rep.get("ok"))
+        except Exception as ex:                         # noqa: BLE001
+            log(f"stop failed: {type(ex).__name__}: {ex}")
+            return False
+
     def turn_off(self, *_):
-        if self.proc is not None and self.proc.poll() is None:
-            subprocess.run(["taskkill", "/PID", str(self.proc.pid), "/T", "/F"], creationflags=NO_WINDOW,
-                           capture_output=True)
-        else:
-            # Started some other way (e.g. by hand): stop whatever listens on the port.
-            out = subprocess.run(["powershell", "-NoProfile", "-Command",
-                                  f"(Get-NetTCPConnection -LocalPort {PORT} -State Listen -ErrorAction SilentlyContinue).OwningProcess"],
-                                 capture_output=True, text=True, creationflags=NO_WINDOW).stdout.split()
-            for pid in out:
-                subprocess.run(["taskkill", "/PID", pid, "/T", "/F"], creationflags=NO_WINDOW, capture_output=True)
-        self.proc = None
-        self.set("off", "Off")
+        self.stop_all(False)
 
     def free_gpu(self, *_):
         try:
@@ -115,12 +204,15 @@ class Tray:
 
     def watch(self):
         while True:
+            if self.stopping:
+                time.sleep(0.5)
+                continue
             s = self.reachable()
             if s is None:
                 if self.state == "starting" and self.running():
                     pass
                 else:
-                    self.set("off", "Off")
+                    self.set("off", STOP_FAILED if self.stop_failed else "Off")
             elif s.get("busy"):
                 self.set("busy", "Working…")
             elif s.get("loaded"):
@@ -158,14 +250,14 @@ class Tray:
         os.startfile(str(ROOT))
 
     def quit(self, *_):
-        self.icon.stop()
+        self.stop_all(True)                             # the server first, then the icon
 
     def menu(self):
-        on = lambda item: self.state != "off"  # noqa: E731
+        on = lambda item: self.state not in ("off", "stopping")  # noqa: E731
         return pystray.Menu(
             pystray.MenuItem(lambda item: f"Fixer Desktop — {self.detail}", None, enabled=False),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Turn on", self.turn_on, visible=lambda i: not on(i), default=True),
+            pystray.MenuItem("Turn on", self.turn_on, visible=lambda i: self.state == "off", default=True),
             pystray.MenuItem("Turn off", self.turn_off, visible=on),
             pystray.MenuItem("Free graphics memory", self.free_gpu, visible=lambda i: self.state == "loaded"),
             pystray.Menu.SEPARATOR,
@@ -186,4 +278,7 @@ class Tray:
 
 
 if __name__ == "__main__":
+    _held = fx.acquire_single()                         # first thing: one tray only
+    if _held is None:
+        sys.exit(0)
     Tray().run()

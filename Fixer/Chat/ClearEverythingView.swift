@@ -6,7 +6,7 @@ struct ClearEverythingView: View {
     @ObservedObject var chat: Chat
     var onClear: () -> Void                    // the chat screen drops its draft, attachment and viewers
     var onFinished: () -> Void                 // closes History
-    var startNow = false                       // History's Clear all: already confirmed there, go straight to erasing
+    var startNow = false                       // already confirmed by the caller, go straight to erasing
     @ObservedObject private var desktop = Desktop.shared
     @Environment(\.dismiss) private var dismiss
 
@@ -32,7 +32,7 @@ struct ClearEverythingView: View {
             if stage == .review && !startNow { review } else { progress }
         }
         .task { if startNow, stage == .review { await run() } }
-        .navigationTitle("Clear everything")
+        .navigationTitle(TidyText.eraseTitle)
         .navigationBarTitleDisplayMode(.inline)
         .navigationBarBackButtonHidden(stage == .erasing)
         .interactiveDismissDisabled(stage == .erasing)

@@ -53,6 +53,9 @@ struct ChatScreen: View {
                         .accessibilityLabel("History")
                 }
                 ToolbarItem(placement: .topBarTrailing) {
+                    TidyMenu(chat: chat, onClear: { router.clearedCount += 1 }) { TidyCircleLabel() }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
                     Button { chat.newChat() } label: { Image(systemName: "square.and.pencil") }
                         .buttonStyle(GlassCircleButtonStyle())
                         .accessibilityLabel("New chat")
@@ -61,7 +64,7 @@ struct ChatScreen: View {
             .sheet(isPresented: $showHistory) {
                 HistorySheet(chat: chat, onCleared: { router.clearedCount += 1 })
             }
-            .sheet(isPresented: $showQueue) { NavigationStack { QueueScreen(inSheet: true) } }
+            .sheet(isPresented: $showQueue) { NavigationStack { QueueScreen(inSheet: true, chat: chat) } }
             .photosPicker(isPresented: $showPicker, selection: $pick, matching: .images)
             .fullScreenCover(isPresented: $showCamera) {
                 CameraPicker { image in
@@ -495,8 +498,6 @@ struct HistorySheet: View {
     var onCleared: () -> Void = {}
     @Environment(\.dismiss) private var dismiss
     @State private var items: [Conversation] = []
-    @State private var confirmClear = false
-    @State private var clearing = false
 
     var body: some View {
         NavigationStack {
@@ -519,23 +520,8 @@ struct HistorySheet: View {
                     for i in idx { History.delete(items[i].id) }
                     items.remove(atOffsets: idx)
                 }
-                Section {
-                    Button(role: .destructive) { confirmClear = true } label: {
-                        Label("Clear all", systemImage: "trash").frame(maxWidth: .infinity, minHeight: 44)
-                    }
-                } footer: {
-                    Text("Erases every chat, picture and video on this iPhone and anything your computer still holds. "
-                         + "Protected Library items stay. You'll see each part ticked off.")
-                }
-            }
-            .confirmationDialog("Clear all?", isPresented: $confirmClear, titleVisibility: .visible) {
-                Button("Clear all", role: .destructive) { clearing = true }
-                Button("Cancel", role: .cancel) {}
-            } message: {
-                Text("Every chat, picture and video on this iPhone and your computer is erased. Protected Library items stay. This can't be undone.")
-            }
-            .navigationDestination(isPresented: $clearing) {
-                ClearEverythingView(chat: chat, onClear: onCleared, onFinished: { dismiss() }, startNow: true)
+                TidyFreeSection()
+                TidyEraseSection(chat: chat, onClear: onCleared, onFinished: { dismiss() })
             }
             .navigationTitle("History")
             .toolbar {

@@ -156,7 +156,7 @@ final class CreateStore: ObservableObject {
     /// Makes a video on the computer, from words and/or a start photo, checks it with the content filter and adds it to
     /// this session's results and the Library. One at a time. Used by the Video form and by "Animate" in the viewer.
     func startVideo(prompt: String, start: UIImage?, explicit: String, parent: UUID?, action: String,
-                   style: String? = nil, loras: [LoraSetting] = []) {
+                   style: String? = nil, loras: [LoraSetting] = [], seconds: Int = 5) {
         // 11-17: a new video from here replaces the unfinished one (the computer drops the old one itself).
         var cg: CGImage?
         if let start {
@@ -180,7 +180,7 @@ final class CreateStore: ObservableObject {
             do {
                 let data = try await Desktop.shared.video(
                     prompt: sent, start: startPhoto, explicit: explicit, slot: "make:video", style: style,
-                    loras: loras,
+                    loras: loras, seconds: seconds,
                     status: { msg in Task { @MainActor in if myEpoch == self.epoch { self.videoStatus = msg } } },
                     progress: { v in Task { @MainActor in if myEpoch == self.epoch { self.videoProgress = v } } })
                 if await ContentGate.blocksVideo(data, filter) {
@@ -401,7 +401,8 @@ struct CreateScreen: View {
     @State var photo: UIImage?                 // a photo to edit, start from, or use as a reference
     @AppStorage("make.editor") var editor = "auto"   // which editor changes a photo (11-17)
     @AppStorage("make.explicitAddon") var explicitAddon = "Auto"   // 11-17: Qwen-Image 2.1 add-on for photo edits
-    @AppStorage("make.enhance") var enhanceNew = true              // 11-17: Enhance my prompt, new pictures
+    @AppStorage("make.videoSeconds") var videoSeconds = 5            // 11-18: video length: 5, 10, 20 or 30 s
+    @AppStorage("make.enhance") var enhanceNew = true             // 11-17: Enhance my prompt, new pictures
     @AppStorage("make.enhanceEdits") var enhanceEdits = false      // ... and changes to a photo or picture
     @State var morePhotos: [UIImage] = []      // photos 2 and 3 for an edit that combines photos
     @State var morePick: PhotosPickerItem?
@@ -439,7 +440,6 @@ struct CreateScreen: View {
     @State var startTick = 0
     @State var stopTick = 0
     @State var noteDismissed: String?
-    @State var resultsAtStart = 0                      // how many results there were when the last Create began
 
     struct LoraPick: Identifiable { let id = UUID(); var name: String; var strength: Double }
 
@@ -473,10 +473,7 @@ struct CreateScreen: View {
             .onChange(of: store.results.count) { old, new in
                 if new > old, store.reviseStatus == nil { workingID = nil }       // a new picture: work on it
             }
-            .onChange(of: createRunning) { was, now in
-                // A Create that made pictures ends: the sheet moves on to changing the newest one.
-                if was, !now, mode == "picture", store.results.count > resultsAtStart { target = .change }
-            }
+            // 11-18: no automatic jump to "Change this" after a Create; the sheet stays on New.
             .onChange(of: working?.id) { _, _ in
                 if let w = working { changeMode = CreateStore.defaultChangeMode(for: w.recipeID) }
                 if working == nil || working?.videoURL != nil { target = .new }
@@ -542,7 +539,7 @@ struct CreateScreen: View {
             }
             .onChange(of: startTick) { _, _ in noteDismissed = nil }
             .onChange(of: rawNote) { _, n in if n == nil { noteDismissed = nil } }
-            .sheet(isPresented: $showQueue) { NavigationStack { QueueScreen(inSheet: true) } }
+            .sheet(isPresented: $showQueue) { NavigationStack { QueueScreen(inSheet: true, chat: chat) } }
             .sheet(isPresented: $showModels) { MakeModelSheet(recipes: recipes, chosen: modelChoice) }
             .onChange(of: router.clearedCount) { _, _ in
                 workingID = nil; changeText = ""
@@ -911,7 +908,6 @@ struct CreateScreen: View {
         progress = 0
         status = "Starting…"
         createSignature = formSignature
-        resultsAtStart = store.results.count
         startTick += 1
         store.blockedNote = nil
         let hasPhoto = photo != nil
@@ -1052,6 +1048,7 @@ struct MakeMediaViewer: View {
     @Environment(\.dismiss) private var dismiss
     @State private var current: UUID
     @State private var note: String?
+    @AppStorage("make.videoSeconds") private var videoSeconds = 5     // 11-18: same choice as the Make sheet's
 
     init(startID: UUID, chat: Chat, router: AppRouter, onTweak: @escaping (CreateResult) -> Void) {
         self.chat = chat
@@ -1079,7 +1076,7 @@ struct MakeMediaViewer: View {
         a.animate = { item, words in
             guard case .memory(let ui) = item.source else { return }
             store.startVideo(prompt: words, start: ui, explicit: Rules.shared.explicitVideo,
-                             parent: item.libraryID, action: "animate")
+                             parent: item.libraryID, action: "animate", seconds: videoSeconds)
         }
         // No "send to chat" (11-17): work made in Make stays in Make; the chat would switch models to pick it up.
         a.makeAnother = { item in

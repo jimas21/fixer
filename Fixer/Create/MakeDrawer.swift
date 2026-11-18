@@ -404,6 +404,17 @@ extension CreateScreen {
     }
 
     @ViewBuilder var videoSettingsPage: some View {
+        drawerSection("Length") {
+            Picker("Length", selection: $videoSeconds) {
+                Text("5 s").tag(5)
+                Text("10 s").tag(10)
+                Text("20 s").tag(20)
+                Text("30 s").tag(30)
+            }
+            .pickerStyle(.segmented)
+            Text("Longer videos are made five seconds at a time, each part continuing from the last, so a 30-second video takes about six times as long as a 5-second one.")
+                .font(.caption).foregroundStyle(Fx.secondaryText)
+        }
         drawerSection("Explicit videos") {
             Picker("Explicit videos", selection: $rules.explicitVideo) {
                 Text("Off").tag("off")
@@ -416,7 +427,7 @@ extension CreateScreen {
         }
         recipeWords
         drawerSection(nil) {
-            Text("Made on your computer by a video model that turns words, or a photo, into a 5-second clip with natural motion. About 2–3 minutes.")
+            Text("Made on your computer by a video model that turns words, or a photo, into a clip with natural motion. A 5-second clip takes about 2–3 minutes; longer ones take proportionally longer.")
                 .font(.footnote).foregroundStyle(Fx.secondaryText)
         }
     }

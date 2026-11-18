@@ -9,6 +9,8 @@ struct SettingsScreen: View {
     @ObservedObject private var favorites = Favorites.shared
     @Environment(\.dismiss) private var dismiss
     @State private var connection: String?
+    @EnvironmentObject private var router: AppRouter
+    @AppStorage("pc.freeAfterMinutes") private var freeAfter = 5     // 11-18: minutes after leaving the app (0 = never)
     @AppStorage("make.explicit") private var makeExplicit = false   // shows the explicit chips in Make (11-18)
 
     private var chatSlot: ModelSlot { ModelSlot.chat() }
@@ -36,7 +38,7 @@ struct SettingsScreen: View {
                         Toggle("Use \(link.name)", isOn: $rules.usePC)
                     }
                     if desktop.isOn {
-                        NavigationLink { QueueScreen() } label: { Label("Your computer's work", systemImage: "list.number") }
+                        NavigationLink { QueueScreen(chat: chat) } label: { Label("Your computer's work", systemImage: "list.number") }
                     }
                 }
 
@@ -49,6 +51,10 @@ struct SettingsScreen: View {
                     Text(desktop.isOn ? "Running on \(desktop.link?.name ?? "your computer")." : "Running on this iPhone.")
                 }
 
+                if desktop.isOn {
+                    FreeAfterSection(minutes: $freeAfter)
+                }
+
                 Section {
                     Toggle("Explicit options in Make", isOn: $makeExplicit)
                 } footer: {
@@ -57,11 +63,8 @@ struct SettingsScreen: View {
                          + "filter.")
                 }
 
-                Section("Privacy") {
-                    NavigationLink { ClearEverythingPage(chat: chat) } label: {
-                        Label("Clear everything", systemImage: "trash").foregroundStyle(.red)
-                    }
-                }
+                TidyFreeSection()
+                TidyEraseSection(chat: chat, onClear: { router.clearedCount += 1 })
 
                 Section {
                     NavigationLink("Responses") { ResponseSettings() }
@@ -563,12 +566,26 @@ struct ModelsOnComputer: View {
     }
 }
 
-/// Clear everything inside the Settings tab: Done goes back to the Settings list.
-private struct ClearEverythingPage: View {
-    let chat: Chat
-    @EnvironmentObject private var router: AppRouter
-    @Environment(\.dismiss) private var dismiss
+/// 11-18: how long after the owner leaves the app the computer frees itself. The computer reads it from the next
+/// "leave" or app-open message, so a change is sent at once.
+private struct FreeAfterSection: View {
+    @Binding var minutes: Int
     var body: some View {
-        ClearEverythingView(chat: chat, onClear: { router.clearedCount += 1 }, onFinished: { dismiss() })
+        Section {
+            Picker("Free up my computer after I leave", selection: $minutes) {
+                Text("1 minute").tag(1)
+                Text("3 minutes").tag(3)
+                Text("5 minutes").tag(5)
+                Text("10 minutes").tag(10)
+                Text("20 minutes").tag(20)
+                Text("1 hour").tag(60)
+                Text("Never").tag(0)
+            }
+            .onChange(of: minutes) { _, _ in Desktop.shared.sendFreeAfter() }
+        } header: {
+            Text("Your computer")
+        } footer: {
+            Text("Once nothing is running. Shorter gives your computer back sooner; longer means no reload wait when you return.")
+        }
     }
 }

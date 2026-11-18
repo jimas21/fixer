@@ -33,6 +33,7 @@ extension CreateScreen {
             .accessibilityHidden(!showStopAll)
             .accessibilityLabel("Stop everything")
             .accessibilityHint("Stops every picture and video this iPhone has running on your computer")
+            TidyMenu(chat: chat, onClear: { router.clearedCount += 1 }) { TidyCircleLabel(large: true) }
         }
         .padding(12)
         .dynamicTypeSize(...DynamicTypeSize.xxLarge)

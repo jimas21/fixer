@@ -33,6 +33,11 @@ struct LibraryScreen: View {
             .tabBarClearance()
             .navigationTitle("Library")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    TidyMenu(chat: chat, onClear: { router.clearedCount += 1 }) { TidyCircleLabel() }
+                }
+            }
             .task(id: router.tab) { if router.tab == .library { await store.unlock() } }
             .onChange(of: phase) { _, now in
                 if now == .active, router.tab == .library { Task { await store.unlock(automatic: true) } }
@@ -91,7 +96,7 @@ struct LibraryScreen: View {
                     ForEach(Filter.allCases) { Text($0.rawValue).tag($0) }
                 }
                 .pickerStyle(.segmented)
-                Text("\(kept) protected · \(erased) will be erased by Clear everything")
+                Text("\(kept) protected · \(erased) will be erased by Erase everything")
                     .font(.footnote).foregroundStyle(.secondary)
                 if store.entries.isEmpty {
                     Text("Nothing here yet. Pictures and videos you make show up here.")
@@ -128,11 +133,11 @@ struct LibraryScreen: View {
                 }
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("\(e.meta.kind == .video ? "Video" : "Picture"), \(e.isProtected ? "protected" : "will be erased by Clear everything")")
+        .accessibilityLabel("\(e.meta.kind == .video ? "Video" : "Picture"), \(e.isProtected ? "protected" : "will be erased by Erase everything")")
     }
 
     private func badge(_ e: LibraryEntry) -> some View {
-        Label(e.isProtected ? "Protected" : "Clears", systemImage: e.isProtected ? "lock.fill" : "trash")
+        Label(e.isProtected ? "Protected" : "Erases", systemImage: e.isProtected ? "lock.fill" : "trash")
             .font(.caption2.weight(.semibold))
             .foregroundStyle(.white)
             .padding(.horizontal, 6).padding(.vertical, 3)

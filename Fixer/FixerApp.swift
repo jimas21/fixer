@@ -41,6 +41,7 @@ struct FixerApp: App {
             // Settings are rewritten as a new file (which drops the mark), so it's set again on leaving the app.
             if now == .background {
                 Privacy.excludeFromBackup()
+                Desktop.shared.leave()                   // 11-18: the computer may give its memory back early
                 LibraryStore.shared.lock()               // the Library opens again only with Face ID or the passcode
             }
         }

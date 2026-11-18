@@ -29,6 +29,21 @@ Protocol (version "fixer1"):
                   (ids or slot), reorder, acknowledge a collected result. Never waits for the card.
   free_memory     stop everything and unload every model (ComfyUI, the chat model, the helper); reports the figures.
   chat "caps":["queue"] adds the queue tools and a live note of the line to that chat turn.
+  11-18 additions:
+  leave           POST /v1/leave {}: the phone app went to the background. Replies {"t":"info","leaving":true}, done.
+                  Once the line is empty and leave_free_minutes (local.json, default 5; 0 = off) have passed with no
+                  other request, the PC frees everything (engine, helper, chat model, ComfyUI). The 20-min idle rule
+                  stays as the backstop.
+  free_after_min  in "leave" and "warm": the owner's choice of how long after he leaves the PC frees itself (1, 3, 5,
+                  10, 20, 60 or 0 = never; any number 0..1440). It replaces leave_free_minutes and stretches (never
+                  shortens) the 20-min idle rule; 0 turns both off. Absent = the PC's own default.
+  video          "seconds": 1..video_max_seconds (default 30; the phone sends 5, 10, 20 or 30). Longer than 5 s is
+                  made as 5-second parts, each continuing from the previous part's last frame; the "video" frame's
+                  "seconds" is the real length.
+  this PC only    GET /local/state (also "pid", "comfy", "llama", "free_after_min"), POST /local/unload,
+                  POST /local/quit (needs the header X-Fixer-Local: 1): replies {"quitting": true}, stops every job and child, wipes
+                  comfy-private and ends the process (<= 20 s). GET /local/timings: the recent finished jobs' speed
+                  numbers (no words). A request carrying an Origin header (a web page in a browser) is refused.
 """
 from __future__ import annotations
 
@@ -389,16 +404,39 @@ class _KillWithMe:
                         ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
                         ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
 
+        k32.GetCurrentProcess.restype = ctypes.c_void_p
         h = k32.CreateJobObjectW(None, None)
         info = Extended()
         info.BasicLimitInformation.LimitFlags = 0x2000          # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         if h and k32.SetInformationJobObject(h, 9, ctypes.byref(info), ctypes.sizeof(info)):
             self.h = h
         self._k32 = k32
+        self.owned = False
 
-    def add(self, proc: subprocess.Popen):
-        if self.h:
-            self._k32.AssignProcessToJobObject(self.h, int(proc._handle))
+    def own(self) -> bool:
+        """11-18: puts this server itself in the job, so EVERY child it starts later (the helper process, anything a
+        library spawns) is in it too and dies with the server, however the server dies. Called from main() only, so
+        importing this file (the checks) changes nothing. Nested jobs (Windows 8+): the venv launcher and the tray each
+        already hold the server in a job of their own; adding it to this new, empty one nests it under those. The job
+        never allows breakaway, so a child cannot slip out of it."""
+        if not self.h or self.owned:
+            return self.owned
+        try:
+            self.owned = bool(self._k32.AssignProcessToJobObject(self.h, self._k32.GetCurrentProcess()))
+        except Exception:                                # noqa: BLE001
+            self.owned = False
+        return self.owned
+
+    def add(self, proc):
+        """A child started before own() (or if own() failed). Popen, or a multiprocessing Process (11-18)."""
+        if not self.h:
+            return
+        handle = getattr(proc, "_handle", None) or getattr(getattr(proc, "_popen", None), "_handle", None)
+        if handle:
+            try:
+                self._k32.AssignProcessToJobObject(self.h, int(handle))
+            except Exception:                            # noqa: BLE001
+                pass
 
 
 _JOB = _KillWithMe()
@@ -428,6 +466,7 @@ class LlamaBrain:
         self.resume_wanted = False
         self.starting = False
         self.card_gb = 0.0                   # measured card share (display only)
+        self.epoch = 0                       # 11-18: bumped by a hard stop (leave / quit): an in-flight resume gives up
 
     def running(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
@@ -522,10 +561,23 @@ class LlamaBrain:
                 return
             self.paused_for = None
             again, self.resume_wanted = self.resume_wanted, False
+            epoch = self.epoch
         if again:
             choice = gguf_choice(LAST_BRAIN)
             if choice is not None:
-                _quietly(lambda: self.ensure(LAST_BRAIN, choice, lambda s: None))
+                def back():
+                    with self.lock:                      # re-entrant: ensure() takes it again
+                        if self.epoch == epoch:          # 11-18: not after a leave-free / quit stopped everything
+                            self.ensure(LAST_BRAIN, choice, lambda s: None)
+                _quietly(back)
+
+    def stop_for_good(self) -> None:
+        """11-18: the phone left (or the server quits): stop, forget any pause, and never come back by itself."""
+        with self.lock:
+            self.epoch += 1
+            self.resume_wanted = False
+            self.paused_for = None
+            self._stop()
 
     def state(self) -> str:
         return "paused" if self.paused_for else "loading" if self.starting else "ready" if self.running() else "off"
@@ -1033,6 +1085,7 @@ class Worker:
         recv_out, send_out = ctx.Pipe(duplex=False)      # helper -> server
         self.proc = ctx.Process(target=_worker_main, args=(recv_in, send_out), daemon=True, name="fixer-worker")
         self.proc.start()
+        _JOB.add(self.proc)                              # 11-18: dies with the server even if own() failed
         recv_in.close()
         send_out.close()
         self.to_worker, self.from_worker = send_in, recv_out
@@ -2038,25 +2091,69 @@ def _tiny_decode(latents, status, vae_cfg):
 
 
 
+class _Mp4Writer:
+    """H.264 / yuv420p MP4 (plays on iPhone), built in memory: never a temp file. 11-18: frames go in one at a time,
+    so a long clip never needs all of its frames decoded at once (481 frames at 832x480 would be ~0.6 GB)."""
+
+    def __init__(self, fps: int):
+        self.fps = fps
+        self.buf = io.BytesIO()
+        self.out = self.st = None
+        self.w = self.h = 0
+        self.n = 0
+
+    def add(self, frame) -> None:
+        import av
+        import numpy as np
+        fr = np.asarray(frame)
+        if fr.dtype != np.uint8:
+            fr = (np.clip(fr, 0, 1) * 255).round().astype(np.uint8)
+        if self.out is None:
+            self.h, self.w = fr.shape[0] // 2 * 2, fr.shape[1] // 2 * 2
+            self.out = av.open(self.buf, mode="w", format="mp4")   # no +faststart: it re-opens the output
+            self.st = self.out.add_stream("libx264", rate=self.fps, options={"crf": "19", "preset": "medium"})
+            self.st.width, self.st.height, self.st.pix_fmt = self.w, self.h, "yuv420p"
+        for pkt in self.st.encode(av.VideoFrame.from_ndarray(np.ascontiguousarray(fr[:self.h, :self.w, :3]),
+                                                             format="rgb24")):
+            self.out.mux(pkt)
+        self.n += 1
+
+    def finish(self) -> bytes:
+        if self.out is None:
+            return b""
+        for pkt in self.st.encode():
+            self.out.mux(pkt)
+        self.out.close()
+        self.out = None
+        data = self.buf.getvalue()
+        self.buf = io.BytesIO()
+        return data
+
+    def discard(self) -> None:
+        """A stopped or failed clip: nothing is kept."""
+        try:
+            if self.out is not None:
+                self.out.close()
+        except Exception:                                # noqa: BLE001
+            pass
+        self.out = None
+        self.buf = io.BytesIO()
+
+
 def _encode_mp4(frames, fps: int) -> bytes:
-    """H.264 / yuv420p MP4 (plays on iPhone), built in memory: never a temp file."""
-    import av
-    import numpy as np
-    arr = frames if isinstance(frames, np.ndarray) else np.stack([np.asarray(f) for f in frames])
-    if arr.dtype != np.uint8:
-        arr = (np.clip(arr, 0, 1) * 255).round().astype(np.uint8)
-    h, w = arr.shape[1] // 2 * 2, arr.shape[2] // 2 * 2
-    buf = io.BytesIO()
-    out = av.open(buf, mode="w", format="mp4")          # no +faststart: it re-opens the output, impossible in memory
-    st = out.add_stream("libx264", rate=fps, options={"crf": "19", "preset": "medium"})
-    st.width, st.height, st.pix_fmt = w, h, "yuv420p"
-    for fr in arr:
-        for pkt in st.encode(av.VideoFrame.from_ndarray(np.ascontiguousarray(fr[:h, :w, :3]), format="rgb24")):
-            out.mux(pkt)
-    for pkt in st.encode():
-        out.mux(pkt)
-    out.close()
-    return buf.getvalue()
+    """H.264 / yuv420p MP4 of a whole array or list of frames (see _Mp4Writer)."""
+    wr = _Mp4Writer(fps)
+    for fr in frames:
+        wr.add(fr)
+    return wr.finish()
+
+
+def _asked_seconds(p: dict) -> float:
+    """The clip length the phone asked for (5 when missing or unreadable)."""
+    try:
+        return float(p.get("seconds", 5))
+    except (TypeError, ValueError):
+        return 5.0
 
 
 def job_video(p: dict, emit, cancel):
@@ -2068,6 +2165,8 @@ def job_video(p: dict, emit, cancel):
         repo = DEFAULT_VIDEO                           # only reached when ComfyUI can't run: the old 5B path
     if not _local_complete(repo):
         raise UserFacing(NO_ENGINE_VIDEOS)             # 11-17: never downloads a removed or missing model
+    if _asked_seconds(p) > 10:                         # 11-18: _video_run caps this path at 10 s; say so plainly
+        status("This computer can only make a 10-second video this way.")
     if ENGINE.image_repo:
         ENGINE.unload_image()                          # video needs the RAM and graphics memory
     VIDEO_BUSY.set()
@@ -3384,6 +3483,33 @@ def _explicit_video(prompt: str, mode: str | None = None) -> float:
 COMFY_VIDEO = os.environ.get("FIXER_COMFY_VIDEO", "1") != "0"         # 0 = back to the 5B diffusers video
 WAN14_AREA = int(os.environ.get("FIXER_WAN_AREA", str(832 * 480)))   # pixels per frame; 1280*720 = HD, ~2.5x slower
 WAN14_FPS = 16                                                         # trained rate: 81 frames = 5 s
+WAN14_PART = 81                                                        # 11-18: frames per part of a longer clip (4k+1)
+
+
+def _video_parts(seconds, max_seconds: float | None = None) -> tuple[int, list[int]]:
+    """11-18: (frames in the whole clip, frames per part) for a clip of `seconds`. Wan 2.2 is trained on 81-frame
+    (5 s) clips, so a longer clip is made as parts of at most 81 frames, each starting from the previous part's last
+    frame; that shared frame is dropped when joining, so the clip has 1 + sum(part - 1) frames. Every part is 4k+1
+    frames (the model's own rule), the parts are as even as possible (no tiny last part), and the length is clamped to
+    1 s .. video_max_seconds (local.json knob, default 30)."""
+    top = max(5.0, float(_tune("video_max_seconds", 30) if max_seconds is None else max_seconds))
+    try:
+        s = float(seconds)
+    except (TypeError, ValueError):
+        s = 5.0
+    s = max(1.0, min(top, s if s == s else 5.0))         # (s == s: not NaN)
+    total = int(round(s * WAN14_FPS / 4)) * 4 + 1
+    units = (total - 1) // 4                             # 4-frame steps after the first frame
+    per = (WAN14_PART - 1) // 4
+    n = max(1, -(-units // per))
+    base, extra = divmod(units, n)
+    return total, [(base + (1 if i < extra else 0)) * 4 + 1 for i in range(n)]
+
+
+def _part_seed(seed: int, i: int) -> int:
+    """11-18: part 1 keeps the job's seed (a 5 s clip is unchanged); later parts derive theirs from it, so a fixed
+    seed still reproduces the whole clip."""
+    return (int(seed) + i * 0x9E3779B1) % (2 ** 32)
 
 
 def _wan14_ready() -> bool:
@@ -3512,16 +3638,19 @@ def job_comfy_video(p: dict, emit, cancel):
 
 
 def _comfy_video(p: dict, emit, cancel):
-    """A 5 s clip with Wan 2.2 A14B in ComfyUI. From a photo it animates that photo; from words alone it first draws
-    the opening frame with a picture model, then animates it (the 14B model only works from a picture)."""
+    """A clip of 1-30 s ("seconds", default 5) with Wan 2.2 A14B in ComfyUI. From a photo it animates that photo; from
+    words alone it first draws the opening frame with a picture model, then animates it (the 14B model only works from
+    a picture). 11-18: longer than 5 s = 5-second parts, each continuing from the previous part's last frame (see
+    _video_parts); same words, add-ons, strength and size for every part, a seed per part derived from the job's.
+    Frames are encoded part by part, so peak RAM is one part's PNGs (~40-80 MB) plus the MP4 so far."""
     import uuid
     import numpy as np
     from PIL import Image
     status = lambda s: emit({"t": "status", "v": s})  # noqa: E731
     prompt = p.get("prompt") or "natural motion, the camera holds steady"
     seed = int(p.get("seed") or int.from_bytes(os.urandom(4), "big")) % (2 ** 32)
-    seconds = max(1.0, min(5.0, float(p.get("seconds", 5))))
-    length = int(round(seconds * WAN14_FPS / 4)) * 4 + 1
+    total, parts = _video_parts(p.get("seconds", 5))
+    n = len(parts)
     _room_for_video(status)
     if _worker_alive():
         WORKER.stop()
@@ -3529,6 +3658,9 @@ def _comfy_video(p: dict, emit, cancel):
     name = f"vid_{uuid.uuid4().hex}.png"
     folder = COMFY_PRIVATE / "input"
     folder.mkdir(parents=True, exist_ok=True)
+    names = [name]                                     # every start picture written for this job: all deleted below
+    writer = _Mp4Writer(WAN14_FPS)
+    mp4 = b""
     try:
         if p.get("image"):
             start = _image_in(p["image"])
@@ -3548,27 +3680,70 @@ def _comfy_video(p: dict, emit, cancel):
                 return
             start = Image.open(io.BytesIO(png)).convert("RGB")
         start.resize((w, h), Image.LANCZOS).save(folder / name, format="PNG")
+        del start
         status("Loading the video model…")
         strength = _explicit_video(prompt, p.get("explicit"))
         vloras, vtrig = _job_loras(p.get("loras"), "wan22")
-        wf = _wan14_workflow(_with_triggers(prompt, vtrig), name, w, h, length, seed, explicit=strength, loras=vloras)
-        _timing(model="Wan 2.2 14B", explicit=strength > 0, mp=w * h / 1e6, steps=4, count=length)
-        def part(o):
-            if o.get("t") != "progress":
-                emit(o)
-            elif o.get("node") in ("13", "14"):        # the two experts: first and second half of the bar
-                emit({"t": "progress", "v": round((0.0 if o["node"] == "13" else 0.475) + o["v"] * 0.475, 3)})
-        frames = asyncio.run(_comfy_run(wf, part, cancel, frames=True, label="Creating video…"))
+        words = _with_triggers(prompt, vtrig)
+        # count = every frame of the clip: the timing averages are per frame, so a 30 s clip's estimate scales with it
+        _timing(model="Wan 2.2 14B", explicit=strength > 0, mp=w * h / 1e6, steps=4, count=total)
+        weights = [x / sum(parts) for x in parts]     # one bar over the whole job, each part by its share of frames
+        shown = [0.0]
+
+        def bar(v: float):
+            v = round(min(0.98, v), 3)                 # 1.0 only once the clip is finished
+            if v > shown[0]:
+                shown[0] = v
+                emit({"t": "progress", "v": v})
+
+        cur = name
+        for i, length in enumerate(parts):
+            if cancel.is_set():
+                writer.discard()
+                return
+            label = "Creating video…" if n == 1 else f"Creating video… part {i + 1} of {n}"
+            if i:
+                status(label)
+            done_w = sum(weights[:i])
+
+            def part(o, _done=done_w, _w=weights[i]):
+                if o.get("t") != "progress":
+                    emit(o)
+                elif o.get("node") in ("13", "14"):    # the two experts: first and second half of this part's share
+                    bar((_done + _w * ((0.0 if o["node"] == "13" else 0.5) + o["v"] * 0.5)) * 0.96)
+            wf = _wan14_workflow(words, cur, w, h, length, _part_seed(seed, i), explicit=strength, loras=vloras)
+            frames = asyncio.run(_comfy_run(wf, part, cancel, frames=True, label=label))
+            (folder / cur).unlink(missing_ok=True)     # this part's start picture is not needed any more
+            if cancel.is_set() or not frames:
+                writer.discard()
+                return
+            if i + 1 < n:                              # the next part starts from this part's last frame
+                nxt = f"vid_{uuid.uuid4().hex}.png"
+                names.append(nxt)
+                last = Image.open(io.BytesIO(frames[-1])).convert("RGB")
+                (last if last.size == (w, h) else last.resize((w, h), Image.LANCZOS)).save(folder / nxt, format="PNG")
+                del last
+                cur = nxt
+            for b in frames[1 if i else 0:]:           # a later part's first frame repeats the previous last one
+                writer.add(np.asarray(Image.open(io.BytesIO(b)).convert("RGB")))
+            del frames
+            bar((done_w + weights[i]) * 0.96)
+        if cancel.is_set():
+            writer.discard()
+            return
+        status("Finishing video…")
+        made = writer.n
+        mp4 = writer.finish()
+    except BaseException:
+        writer.discard()
+        raise
     finally:
-        (folder / name).unlink(missing_ok=True)
-    if cancel.is_set() or not frames:
+        for x in names:
+            (folder / x).unlink(missing_ok=True)
+    if cancel.is_set() or not mp4:
         return
-    status("Finishing video…")
-    arr = np.stack([np.asarray(Image.open(io.BytesIO(b)).convert("RGB")) for b in frames])
-    mp4 = _encode_mp4(arr, WAN14_FPS)
-    del arr, frames
     emit({"t": "progress", "v": 1.0})
-    emit({"t": "video", "v": base64.b64encode(mp4).decode(), "seconds": round((length - 1) / WAN14_FPS, 2),
+    emit({"t": "video", "v": base64.b64encode(mp4).decode(), "seconds": round((made - 1) / WAN14_FPS, 2),
           "width": w, "height": h, "seed": seed})
 
 
@@ -4947,11 +5122,12 @@ JOBS = {"status": job_status, "chat": job_chat, "image": job_image, "video": job
         "lora_search": job_lora_search, "lora_thumb": job_lora_thumb, "lora_inspect": job_lora_inspect,
         "lora_add": job_lora_add, "lora_list": job_lora_list, "lora_set": job_lora_set,
         "lora_remove": job_lora_remove, "lora_key": job_lora_key,
-        "stop_all": _no_job, "queue": _no_job, "free_memory": _no_job}   # these three answer on the event loop
+        "stop_all": _no_job, "queue": _no_job, "free_memory": _no_job,   # these answer on the event loop
+        "leave": _no_job}
 # 11-17: never wait for the line, stream as before. (comfy_recipes never needed the card: it waited behind videos and
 # left Make on "Asking your computer..." for minutes.)
 IMMEDIATE = {"status", "search", "forget", "config", "comfy_recipes", "make_recipes", "chat", "installed"}
-ASYNC_OPS = {"queue", "stop_all", "free_memory"}
+ASYNC_OPS = {"queue", "stop_all", "free_memory", "leave"}
 
 
 def _comfy_stop_now():
@@ -4981,6 +5157,7 @@ CHATS_ACTIVE = 0                      # chats answering right now (the idle stop
 # ---------------------------------------------------------------- the line (11-17)
 
 LAST_SEEN = time.monotonic()          # 11-17: the last request of any kind from a phone (chat, job, warm-up, queue)
+LEFT_AT: float | None = None          # 11-18: when a phone said "leave" (app went to the background); None = someone is here
 HIDDEN_OPS = {"warm"}                 # make warm-ups: never listed, never noted, never wait
 QUEUED_OPS = {"image", "video", "cutout", "upscale", "comfy_run", "remove_model", "warm"}   # warm: for "make" only
 RESULT_TYPES = {"image", "video", "mask"}
@@ -5569,7 +5746,80 @@ async def _op_free_memory(payload: dict, send, phone: str) -> bool:
     return False
 
 
-ASYNC_HANDLERS = {"queue": _op_queue, "stop_all": _op_stop_all, "free_memory": _op_free_memory}
+async def _op_leave(payload: dict, send, phone: str) -> bool:
+    """11-18: the phone app went to the background. Loads nothing and never waits for the line: it only starts the
+    leave grace (see _leave_free_due). Any later request other than "leave" cancels it (handle)."""
+    global LEFT_AT
+    LEFT_AT = time.monotonic()
+    await send({"t": "info", "leaving": True})
+    return False
+
+
+def _leave_free_due(now: float, left_at: float | None, grace: float, busy: bool, waiting: int, chats: int,
+                    gpu_locked: bool) -> bool:
+    """11-18: free the PC now? Only when a phone left, nobody came back since, the feature is on (grace > 0), the
+    grace has passed, nothing runs or waits in the line, no chat is streaming and nothing holds the card. Held results
+    do not count (they are bytes in RAM and stay held). A job running at leave time finishes first."""
+    if left_at is None or grace <= 0:
+        return False
+    if busy or waiting or chats or gpu_locked:
+        return False
+    return now - left_at >= grace
+
+
+def _leave_free():
+    """What the idle unloader frees (engine + helper, chat model, ComfyUI), at once. A paused chat model stays off."""
+    ENGINE.unload()                                    # also ends the helper process
+    LLAMA.stop_for_good()
+    COMFY.stop()                                       # also empties its private folder
+
+
+FREE_AFTER_MIN: float | None = None   # 11-18: the owner's "free my computer after" choice from the phone; None = unset
+
+
+def _parse_free_after(v) -> float | None:
+    """11-18: the phone's "free_after_min": a real number 0..1440, else None (ignored: bool, text, NaN, negative)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    v = float(v)
+    if v != v or v < 0 or v > 1440:
+        return None
+    return v
+
+
+def _leave_grace_s(choice: float | None, default_min: float) -> float:
+    """11-18: seconds after a leave before the PC frees itself: his choice, else leave_free_minutes. 0 = never."""
+    return (default_min if choice is None else choice) * 60
+
+
+def _idle_limit_s(choice: float | None, idle_unload: float) -> float:
+    """11-18: the idle rule's limit in seconds (also the backstop when no "leave" arrives). Unset: IDLE_UNLOAD.
+    0 ("never"): never. Otherwise the longer of IDLE_UNLOAD and his choice, so "1 hour" really is an hour."""
+    if choice is None:
+        return idle_unload
+    if choice <= 0:
+        return float("inf")
+    return max(idle_unload, choice * 60)
+
+
+async def _leave_check(now: float | None = None) -> bool:
+    """One pass of the leave rule (from the idle loop, every 30 s). True = it freed everything."""
+    global LEFT_AT
+    if LLAMA.starting:                                 # 11-18: a chat model start holds its lock for minutes; next pass
+        return False
+    grace = _leave_grace_s(FREE_AFTER_MIN, _tune("leave_free_minutes", 5))   # read live; 0 turns it off
+    now = time.monotonic() if now is None else now
+    if not _leave_free_due(now, LEFT_AT, grace, QUEUE.busy(), len(QUEUE.waiting()), CHATS_ACTIVE, GPU.locked()):
+        return False
+    async with GPU:
+        if LEFT_AT is None or QUEUE.busy() or QUEUE.waiting():     # someone came back while we waited for the lock
+            return False
+        LEFT_AT = None                                 # once per leave
+        await asyncio.get_running_loop().run_in_executor(None, _leave_free)
+    return True
+
+
+ASYNC_HANDLERS = {"queue": _op_queue, "stop_all": _op_stop_all, "free_memory": _op_free_memory, "leave": _op_leave}
 
 
 def _drop_expired_pairings():
@@ -5607,18 +5857,23 @@ async def idle_unloader(app):
             # Idle means no pictures AND no chat: a long chat between pictures no longer unloads the picture model
             # (the next picture then waited 25-110 s to load it again).
             idle = time.monotonic() - max(LAST_USE, LAST_CHAT, LAST_SEEN)
-            if ENGINE.kind and not GPU.locked() and idle > IDLE_UNLOAD:
+            limit = _idle_limit_s(FREE_AFTER_MIN, IDLE_UNLOAD)       # 11-18: the owner's choice stretches it or ends it
+            if ENGINE.kind and not GPU.locked() and idle > limit:
                 async with GPU:
                     await asyncio.get_running_loop().run_in_executor(None, ENGINE.unload)
             # The chat model too: its prompt cache holds the last conversation, so it never outlives the idle time.
-            if LLAMA.running() and not GPU.locked() and CHATS_ACTIVE == 0 and idle > IDLE_UNLOAD:
+            if LLAMA.running() and not GPU.locked() and CHATS_ACTIVE == 0 and idle > limit:
                 await asyncio.get_running_loop().run_in_executor(None, LLAMA.stop)
             # ComfyUI holds the last photos, prompts and results in memory and its private folder: same idle rule.
-            if COMFY.running() and not GPU.locked() and idle > IDLE_UNLOAD:
+            if COMFY.running() and not GPU.locked() and idle > limit:
                 async with GPU:
                     await asyncio.get_running_loop().run_in_executor(None, COMFY.stop)
             # A pause can never outlive its video, even if the runner's after-job step was skipped by an error.
-            if LLAMA.paused_for and not QUEUE.busy() and not QUEUE.waiting():
+            try:
+                await _leave_check()                   # 11-18: the phone left: free the PC after a short grace
+            except Exception:                          # noqa: BLE001
+                log.warning("leave free failed")
+            if LLAMA.paused_for and not QUEUE.busy() and not QUEUE.waiting():   # (a leave-free above cleared it)
                 threading.Thread(target=LLAMA.resume, daemon=True, name="brain-resume").start()
             await asyncio.get_running_loop().run_in_executor(None, _drop_expired_pairings)
     task = asyncio.create_task(loop())
@@ -5643,7 +5898,7 @@ def _deny() -> web.Response:
 
 
 async def handle(request: web.Request) -> web.StreamResponse:
-    global LAST_CHAT, CHATS_ACTIVE, LAST_SEEN
+    global LAST_CHAT, CHATS_ACTIVE, LAST_SEEN, LEFT_AT, FREE_AFTER_MIN
     op = request.match_info["op"]
     if op not in JOBS:
         return web.Response(status=404)
@@ -5661,10 +5916,16 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if not REPLAY.fresh(body[:12]):
         return _deny()
     del body
+    if op in ("leave", "warm") and isinstance(payload, dict):    # 11-18: the owner's "free my computer after" choice
+        choice = _parse_free_after(payload.get("free_after_min"))
+        if choice is not None:
+            FREE_AFTER_MIN = choice
 
     resp = web.StreamResponse(headers={"Content-Type": "application/octet-stream", "Cache-Control": "no-store"})
     await resp.prepare(request)
-    LAST_SEEN = time.monotonic()                       # every authenticated request is "in use" (idle stop)
+    if op != "leave":
+        LAST_SEEN = time.monotonic()                   # every authenticated request is "in use" (idle stop)
+        LEFT_AT = None                                 # 11-18: someone is back: no leave-free
     seq = 0
 
     async def send(obj: dict):
@@ -5706,7 +5967,10 @@ async def handle(request: web.Request) -> web.StreamResponse:
             return
 
     try:
-        if op in ASYNC_OPS:
+        if op == "warm" and isinstance(payload, dict) and payload.get("for") == "settings":
+            await send({"t": "info", "warm": False})     # 11-18: only records free_after_min (above); loads nothing
+            await send({"t": "done"})
+        elif op in ASYNC_OPS:
             if not await ASYNC_HANDLERS[op](payload, send, phone):
                 await send({"t": "done"})
         elif op in QUEUED_OPS and not (op == "warm" and payload.get("for") != "make"):
@@ -5782,7 +6046,9 @@ def _plain(e: Exception) -> str:
 
 def _from_this_pc(request: web.Request) -> bool:
     # A tunnel (cloudflared) on this PC also connects from 127.0.0.1, but adds forwarding headers.
-    forwarded = any(h in request.headers for h in ("Cf-Connecting-Ip", "X-Forwarded-For", "Forwarded", "Cf-Ray"))
+    # 11-18: a web page open in a browser on this PC can also reach 127.0.0.1; browsers add Origin to those requests.
+    forwarded = any(h in request.headers for h in ("Cf-Connecting-Ip", "X-Forwarded-For", "Forwarded", "Cf-Ray",
+                                                   "Origin"))
     return request.remote in ("127.0.0.1", "::1") and not forwarded
 
 
@@ -5791,7 +6057,103 @@ async def local_state(request: web.Request) -> web.Response:
     if not _from_this_pc(request):
         return web.Response(status=404)
     return web.json_response({"loaded": ENGINE.repo, "busy": QUEUE.busy(), "waiting": len(QUEUE.waiting()),
-                              "idle_s": int(time.monotonic() - LAST_USE)})
+                              "idle_s": int(time.monotonic() - LAST_USE),
+                              "pid": os.getpid(), "comfy": COMFY.running(), "llama": LLAMA.running(),   # 11-18
+                              "free_after_min": FREE_AFTER_MIN})
+
+
+# 11-18: the only fields /local/timings hands out. Names of models and recipes and numbers; never the prompt or photo.
+TIMING_FIELDS = ("kind", "model", "recipe", "editor", "explicit", "mp", "steps", "count", "load_s", "draw_s",
+                 "engine_start_s", "loaded", "runs", "enhance", "enhance_s", "total_s", "ok")
+
+
+def _timings_report(now: float | None = None) -> dict:
+    """11-18: the recent finished jobs (oldest first, newest last), each with its age in seconds instead of its
+    monotonic stamp, plus when a phone left, the owner's free-after choice and the idle time. Only TIMING_FIELDS."""
+    now = time.monotonic() if now is None else now
+    jobs = []
+    for r in list(TIMINGS):
+        d = {k: r[k] for k in TIMING_FIELDS if k in r}
+        for k in ("load_s", "draw_s", "total_s", "engine_start_s", "enhance_s", "mp"):
+            if isinstance(d.get(k), float):
+                d[k] = round(d[k], 2)
+        d["age_s"] = int(now - r.get("at", now))
+        jobs.append(d)
+    return {"jobs": jobs, "left_s": None if LEFT_AT is None else int(now - LEFT_AT), "free_after_min": FREE_AFTER_MIN,
+            "idle_s": int(now - max(LAST_USE, LAST_CHAT, LAST_SEEN))}
+
+
+async def local_timings(request: web.Request) -> web.Response:
+    """11-18: "why was that picture slow", from this PC only: GET /local/timings (see _timings_report)."""
+    if not _from_this_pc(request):
+        return web.Response(status=404)
+    return web.json_response(_timings_report())
+
+
+_EXIT = os._exit                                       # 11-18: the checks swap this out
+QUIT_GRACE = 20.0                                      # seconds: the process ends by then, cleaned up or not
+_QUITTING = threading.Event()
+
+
+def _shutdown_cleanup():
+    """What main()'s finally and /local/quit both run: the chat model, the helper and ComfyUI (which also empties its
+    private folder). 11-18: their processes are killed first without waiting for their locks (a start in progress
+    holds one for minutes), then each normal stop runs; one failing never skips the next."""
+    for proc in (getattr(LLAMA, "proc", None), getattr(COMFY, "proc", None)):
+        try:
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+        except Exception:                              # noqa: BLE001
+            pass
+    for step in (LLAMA.stop_for_good, WORKER.stop, COMFY.stop):
+        try:
+            step()
+        except Exception:                              # noqa: BLE001
+            log.warning("shutdown step failed")
+
+
+async def _quit_now():
+    """11-18: stops every job, then cleans up, then ends the process. A watchdog ends it after QUIT_GRACE seconds
+    whatever happens (a thread stuck in a model load can neither be interrupted nor joined: a plain exit would wait for
+    it forever). Children not stopped by then die with the server's job object (_JOB.own)."""
+    loop = asyncio.get_running_loop()
+    watchdog = threading.Timer(QUIT_GRACE, lambda: _EXIT(1))
+    watchdog.daemon = True
+    watchdog.start()
+    await asyncio.sleep(0.2)                           # let the reply go out first
+    QUEUE.stop_all("stop_all", drop_held=True)
+    done = threading.Event()
+
+    def work():
+        try:
+            _comfy_stop_now()
+            _shutdown_cleanup()
+        finally:
+            done.set()
+    threading.Thread(target=work, daemon=True, name="fixer-quit").start()   # not the executor: it may be full
+    while not done.is_set() and watchdog.is_alive():
+        await asyncio.sleep(0.1)
+    watchdog.cancel()
+    try:
+        sys.stderr.flush()
+        sys.stdout.flush()
+    except Exception:                                  # noqa: BLE001
+        pass
+    _EXIT(0)
+
+
+async def local_quit(request: web.Request) -> web.Response:
+    """11-18: the tray's Turn off / Quit (this PC only, with the header X-Fixer-Local: 1, which a web page cannot send
+    without the browser asking first): {"quitting": true}, then the server ends itself (_quit_now)."""
+    if not _from_this_pc(request) or request.headers.get("X-Fixer-Local") != "1":
+        return web.Response(status=404)
+    if not _QUITTING.is_set():
+        _QUITTING.set()
+        _QUIT_TASK.append(asyncio.get_running_loop().create_task(_quit_now()))   # held: a bare task can be collected
+    return web.json_response({"quitting": True})
+
+
+_QUIT_TASK: list = []
 
 
 async def local_unload(request: web.Request) -> web.Response:
@@ -5813,24 +6175,37 @@ def app() -> web.Application:
         threading.Thread(target=lambda: _quietly(COMFY.ensure), daemon=True, name="comfy-start").start()
     a.router.add_post("/v1/{op}", handle)
     a.router.add_get("/local/state", local_state)
+    a.router.add_get("/local/timings", local_timings)
     a.router.add_post("/local/unload", local_unload)
+    a.router.add_post("/local/quit", local_quit)
     a.router.add_get("/", lambda r: web.Response(text="Fixer Desktop"))
     return a
 
 
 def main():
+    _JOB.own()                                         # 11-18: first, before any child: every child dies with us
     lower_priority()
     import shutil
     shutil.rmtree(COMFY_PRIVATE, ignore_errors=True)   # a crash or kill could have left a job's photo behind
     if not KEYS.exists():
         print(f"No phones paired yet. Run:  python pair.py \"My iPhone\"   (keys go in {KEYS})", file=sys.stderr)
     print(f"Fixer Desktop on {HOST}:{PORT}  models: {MODELS} (cap {CAP_GB:.0f} GB)", file=sys.stderr)
+    code = 1
     try:
         web.run_app(app(), host=HOST, port=PORT, access_log=None, print=None)
+        code = 0
+    except BaseException:                              # noqa: BLE001 - shown here: the hard exit below skips it
+        import traceback
+        traceback.print_exc()
     finally:
-        LLAMA.stop()
-        WORKER.stop()
-        COMFY.stop()                                   # also empties its private folder
+        _shutdown_cleanup()                            # chat model, helper, ComfyUI (also empties its private folder)
+        try:
+            sys.stderr.flush()
+            sys.stdout.flush()
+        except Exception:                              # noqa: BLE001
+            pass
+        # 11-18: a plain return would join the executor's threads at exit, and one stuck in a model load never ends
+        _EXIT(code)
 
 
 if __name__ == "__main__":

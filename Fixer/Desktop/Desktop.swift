@@ -396,13 +396,13 @@ final class Desktop: ObservableObject {
     /// A short video from the computer: from `prompt`, or animating `start` when given. Returns MP4 data.
     /// `explicit` is "off", "on" or "auto" (the chat always sends "auto": the computer decides from the words).
     func video(prompt: String, start: CGImage?, explicit: String, slot: String? = nil,
-               style: String? = nil, loras: [LoraSetting] = [],
+               style: String? = nil, loras: [LoraSetting] = [], seconds: Int = 5,
                queued: @escaping @Sendable (String) -> Void = { _ in },
                status: @escaping @Sendable (String) -> Void,
                progress: @escaping @Sendable (Double) -> Void) async throws -> Data {
         guard let link else { throw PCError.notPaired }
         var payload: [String: Any] = ["prompt": prompt, "model": Rules.shared.pcVideoID,
-                                      "explicit": explicit]
+                                      "explicit": explicit, "seconds": seconds]
         if let style { payload["style"] = style }
         if !loras.isEmpty {
             payload["loras"] = loras.map { l -> [String: Any] in ["name": l.name, "strength": l.strength] }
@@ -724,11 +724,56 @@ final class Desktop: ObservableObject {
     /// and the address race runs now too. At most once a minute. (Until 11-17 this warmed the picture model, which
     /// held up the first chat for up to two minutes.)
     func warmUp(force: Bool = false) {
-        guard isOn, let link, force || (lastWarmUp.map { Date().timeIntervalSince($0) > 60 } ?? true) else { return }
+        guard isOn, let link, force || leaveSent || (lastWarmUp.map { Date().timeIntervalSince($0) > 60 } ?? true)
+        else { return }
         lastWarmUp = Date()
-        let frames = call("warm", ["for": "chat", "brain": Rules.shared.pcBrainID], link: link)
+        leaveSent = false                   // 11-18: coming back always tells the computer, cancelling a pending free
+        let frames = call("warm", ["for": "chat", "brain": Rules.shared.pcBrainID,
+                                   "free_after_min": freeAfterMinutes], link: link)
         Task.detached(priority: .userInitiated) { for try await _ in frames {} }
         Task { await refreshConfig() }
+    }
+
+    private var leaveSent = false
+
+    /// 11-18: the owner changed "free after" in Settings: tells the computer the number and nothing else. ("for":
+    /// "settings" loads no model and does not start a queue job; an older computer ignores the unknown value.)
+    func sendFreeAfter() {
+        guard isOn, let link else { return }
+        let frames = call("warm", ["for": "settings", "free_after_min": freeAfterMinutes], link: link)
+        Task.detached(priority: .userInitiated) { do { for try await _ in frames {} } catch {} }
+    }
+
+    /// 11-18: the owner's "free my computer after I leave" choice (Settings): minutes, 0 = never; 5 until chosen.
+    private var freeAfterMinutes: Int {
+        let d = UserDefaults.standard
+        return d.object(forKey: "pc.freeAfterMinutes") == nil ? 5 : d.integer(forKey: "pc.freeAfterMinutes")
+    }
+
+    /// 11-18: the app went to the background: tells the computer so it can give its memory back early. Fire and
+    /// forget; an older computer answers 404, which is swallowed. A background task keeps the send alive after iOS
+    /// suspends the app. Coming back calls warmUp(), which cancels the pending free on the computer.
+    func leave() {
+        guard isOn, let link else { return }
+        leaveSent = true
+        let app = UIApplication.shared
+        let box = BackgroundTaskBox()
+        box.id = app.beginBackgroundTask(withName: "fixer.leave") { Task { @MainActor in box.end() } }
+        let frames = call("leave", ["free_after_min": freeAfterMinutes], link: link)
+        Task.detached(priority: .userInitiated) {
+            do { for try await _ in frames {} } catch {}
+            await MainActor.run { box.end() }
+        }
+    }
+
+    /// Holds one background-task id so the expiry handler and the finished send can each end it, once.
+    final class BackgroundTaskBox: @unchecked Sendable {
+        var id = UIBackgroundTaskIdentifier.invalid
+        @MainActor func end() {
+            guard id != .invalid else { return }
+            UIApplication.shared.endBackgroundTask(id)
+            id = .invalid
+        }
     }
 
     /// The Make tab opened (or the chat's picture model changed): load the picture model ahead of the first

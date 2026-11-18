@@ -2,16 +2,17 @@ import SwiftUI
 
 /// Everything the computer is doing or holding for the phone (11-17, "it keeps getting backed up and I can't do
 /// anything"): what's being made now with its progress, what waits in line (stop, move up, run next), finished work
-/// waiting to be collected, how full the graphics card and memory are, Stop everything and Free memory.
+/// waiting to be collected, how full the graphics card and memory are, Stop everything, Free up my computer and Erase everything.
 struct QueueScreen: View {
     var inSheet = false
+    var chat: Chat?                              // 11-18: for Erase everything; nil where the screen has none
+    @EnvironmentObject private var router: AppRouter
     @ObservedObject private var desktop = Desktop.shared
     @Environment(\.dismiss) private var dismiss
     @State private var queue: PCQueue?
     @State private var failed: String?
     @State private var oldComputer = false
     @State private var confirmStop = false
-    @State private var confirmFree = false
     @State private var note: String?
     @State private var working = false
 
@@ -63,12 +64,6 @@ struct QueueScreen: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("Everything being made or waiting on your computer stops. Finished work it was holding is dropped.")
-        }
-        .confirmationDialog("Free memory?", isPresented: $confirmFree, titleVisibility: .visible) {
-            Button("Free memory", role: .destructive) { act { _ = try await desktop.freeMemory() } }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("This stops everything and unloads every model from your computer's graphics card and memory.")
         }
     }
 
@@ -238,10 +233,12 @@ struct QueueScreen: View {
                 else { confirmStop = true }
             }
             .disabled(working)
-            Button("Free memory") { confirmFree = true }
-                .disabled(working)
         } footer: {
-            Text("Free memory stops everything and unloads every model from your computer's graphics card and memory. The next message or picture takes a little longer to start.")
+            Text("Stops everything being made or waiting on your computer. Finished work it was holding is dropped.")
+        }
+        TidyFreeSection(onDone: { Task { await refresh() } })
+        if let chat {
+            TidyEraseSection(chat: chat, onClear: { router.clearedCount += 1 })
         }
     }
 

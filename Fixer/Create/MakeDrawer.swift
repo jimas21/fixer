@@ -87,7 +87,7 @@ extension CreateScreen {
         case .tips:
             n = recipe?.toggles.flatMap(\.items).filter { chosen.contains($0.id) }.count ?? 0
         case .addons:
-            n = loras.count
+            n = fittingLoras.filter { isLoraOn($0) }.count
         default:
             n = 0
         }
@@ -111,7 +111,7 @@ extension CreateScreen {
             case .tips:
                 if let r = recipe { drawerSection(nil) { styleTips(r) } }
             case .addons:
-                if !loraFiles.isEmpty { drawerSection(nil) { loraSection } }
+                drawerSection(nil) { loraSection }
             case .settings:
                 if mode == "video" {
                     videoSettingsPage
@@ -296,33 +296,156 @@ extension CreateScreen {
         .accessibilityAddTraits(on ? .isSelected : [])
     }
 
-    var loraSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            ForEach($loras) { $pick in
-                VStack(alignment: .leading) {
-                    HStack {
-                        Picker("LoRA", selection: $pick.name) { ForEach(loraFiles, id: \.self) { Text($0).tag($0) } }
-                            .pickerStyle(.menu)
-                        Spacer()
-                        Button { let id = pick.id; loras.removeAll { $0.id == id } } label: {
-                            Image(systemName: "minus.circle").foregroundStyle(Fx.danger).iconButton()
-                        }
-                        .buttonStyle(.borderless)
-                        .accessibilityLabel("Remove this add-on")
+    // MARK: add-ons (LoRAs)
+
+    /// Which LoRAs fit what the dock would make right now: the video model, the photo editor, or the picture model.
+    var loraFamily: String {
+        if mode == "video" { return videoLoraFamily }
+        if photo != nil, photoMode != "start" { return editor == "qwen21" ? "qwen21" : "qwen-edit" }
+        return recipe?.loraFamily ?? ""
+    }
+
+    var loraModelName: String {
+        if mode == "video" { return "Wan 2.2 video" }
+        if photo != nil, photoMode != "start" { return editor == "qwen21" ? "Qwen-Image 2.1" : "Qwen Edit" }
+        return recipe?.name ?? "this model"
+    }
+
+    /// The add-ons on the computer that fit it. One the computer couldn't sort is offered everywhere.
+    var fittingLoras: [LoraEntry] {
+        let family = loraFamily
+        return loraLibrary.filter { $0.family == family || $0.family == "unknown" }
+    }
+
+    /// The add-ons switched on by hand: pictures and videos keep their own.
+    private var loraPicks: [LoraPick] { mode == "video" ? videoLoras : loras }
+
+    private func setLoraPicks(_ picks: [LoraPick]) {
+        if mode == "video" { videoLoras = picks } else { loras = picks }
+    }
+
+    /// What goes with the next run: the picks that fit. (The computer adds the "always" ones itself.)
+    var activeLoras: [LoraPick] {
+        let names = Set(fittingLoras.map(\.file))
+        return loraPicks.filter { names.contains($0.name) }
+    }
+
+    func isLoraOn(_ e: LoraEntry) -> Bool {
+        e.alwaysOn || loraPicks.contains { $0.name == e.file }
+    }
+
+    private func loraStrengthValue(_ e: LoraEntry) -> Double {
+        loraPicks.first { $0.name == e.file }?.strength ?? e.strength
+    }
+
+    private func loraStrength(_ e: LoraEntry) -> Binding<Double> {
+        Binding(get: { loraStrengthValue(e) },
+                set: { v in
+                    var picks = loraPicks
+                    if let i = picks.firstIndex(where: { $0.name == e.file }) {
+                        picks[i].strength = v
+                    } else {
+                        picks.append(LoraPick(name: e.file, strength: v))
                     }
-                    HStack {
-                        Text("Strength")
-                        Slider(value: $pick.strength, in: 0...2, step: 0.05)
-                        Text(String(format: "%.2f", pick.strength)).monospacedDigit().foregroundStyle(Fx.secondaryText)
+                    setLoraPicks(picks)
+                })
+    }
+
+    private func setLora(_ e: LoraEntry, on: Bool) {
+        var picks = loraPicks
+        picks.removeAll { $0.name == e.file }
+        if on { picks.append(LoraPick(name: e.file, strength: e.strength)) }
+        setLoraPicks(picks)
+        if !on, e.alwaysOn { setLoraAlways(e, false) }
+    }
+
+    /// "Always use with this model": kept on the computer, so the chat's pictures and videos get it too.
+    private func setLoraAlways(_ e: LoraEntry, _ on: Bool) {
+        let level = loraStrengthValue(e)
+        if on, !loraPicks.contains(where: { $0.name == e.file }) {
+            setLoraPicks(loraPicks + [LoraPick(name: e.file, strength: level)])
+        }
+        if let i = loraLibrary.firstIndex(where: { $0.file == e.file }) { loraLibrary[i].alwaysOn = on }
+        Task {
+            do {
+                let saved = try await Desktop.shared.loraSet(file: e.file, strength: level, alwaysOn: on)
+                if let i = loraLibrary.firstIndex(where: { $0.file == saved.file }) { loraLibrary[i] = saved }
+            } catch {
+                if let i = loraLibrary.firstIndex(where: { $0.file == e.file }) { loraLibrary[i].alwaysOn = !on }
+                styleNote = error.localizedDescription
+            }
+        }
+    }
+
+    /// An "always" add-on's strength is kept on the computer too, once the slider is let go.
+    private func saveLoraStrength(_ e: LoraEntry) {
+        let level = loraStrengthValue(e)
+        Task {
+            if let saved = try? await Desktop.shared.loraSet(file: e.file, strength: level),
+               let i = loraLibrary.firstIndex(where: { $0.file == saved.file }) {
+                loraLibrary[i] = saved
+            }
+        }
+    }
+
+    /// A LoRA just added in the browser: listed at once, and switched on when it fits what is being made.
+    private func loraAdded(_ e: LoraEntry) {
+        if let i = loraLibrary.firstIndex(where: { $0.file == e.file }) {
+            loraLibrary[i] = e
+        } else {
+            loraLibrary.append(e)
+        }
+        if e.family == loraFamily || e.family == "unknown" { setLora(e, on: true) }
+    }
+
+    var loraSection: some View {
+        let fitting = fittingLoras
+        return VStack(alignment: .leading, spacing: 12) {
+            if fitting.isEmpty {
+                Text("No add-ons for \(loraModelName) on your computer yet.")
+                    .font(.footnote).foregroundStyle(Fx.secondaryText)
+            }
+            ForEach(fitting) { e in loraRow(e) }
+            Button { showLoraBrowser = true } label: {
+                Label("Add a LoRA", systemImage: "plus.circle").frame(minHeight: 44)
+            }
+            Text("Small add-ons that teach the model one extra look, subject or detail. Strength 1 is the add-on as "
+                 + "made; lower blends it in gently, above 1.5 often distorts. Only add-ons made for "
+                 + "\(loraModelName) are listed, because others would not work with it.")
+                .font(.caption).foregroundStyle(Fx.secondaryText)
+        }
+        .sheet(isPresented: $showLoraBrowser) {
+            LoraBrowser(family: loraFamily, modelName: loraModelName, onAdded: { e in loraAdded(e) })
+        }
+    }
+
+    /// One add-on: a switch, and while it is on its strength and "always use".
+    private func loraRow(_ e: LoraEntry) -> some View {
+        let on = isLoraOn(e)
+        let level = loraStrength(e)
+        return VStack(alignment: .leading, spacing: 6) {
+            Toggle(isOn: Binding(get: { isLoraOn(e) }, set: { setLora(e, on: $0) })) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(e.name).lineLimit(2)
+                    if !e.triggers.isEmpty {
+                        Text("Adds: " + e.triggers.joined(separator: ", "))
+                            .font(.caption).foregroundStyle(Fx.secondaryText).lineLimit(2)
                     }
                 }
             }
-            Button("Add a style add-on") { loras.append(LoraPick(name: loraFiles[0], strength: 1.0)) }
-                .frame(minHeight: 44)
-            Text("Small add-ons that teach the model one extra look, subject or detail. Strength 1 is the add-on as "
-                 + "made; lower blends it in gently, above 1.5 often distorts. An add-on only works with the model "
-                 + "family it was made for.")
-                .font(.caption).foregroundStyle(Fx.secondaryText)
+            .frame(minHeight: 44)
+            if on {
+                HStack {
+                    Text("Strength").font(.footnote)
+                    Slider(value: level, in: 0...2, step: 0.05, onEditingChanged: { editing in
+                        if !editing, e.alwaysOn { saveLoraStrength(e) }
+                    })
+                    Text(String(format: "%.2f", level.wrappedValue))
+                        .font(.footnote).monospacedDigit().foregroundStyle(Fx.secondaryText)
+                }
+                Toggle("Always use with this model", isOn: Binding(get: { e.alwaysOn }, set: { setLoraAlways(e, $0) }))
+                    .font(.footnote)
+            }
         }
     }
 

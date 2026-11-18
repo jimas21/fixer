@@ -41,11 +41,12 @@ extension CreateScreen {
     var sections: [MakeSection] {
         let picks: [MakeSection] = recipeStore.catalog != nil && !activeGroups.isEmpty ? [.picks] : []
         if effectiveTarget == .change { return picks + [.help] }
-        if mode == "video" { return picks + [.photo, .settings] }
+        // Add-ons is always there, so the first LoRA can be added from it.
+        if mode == "video" { return picks + [.photo, .addons, .settings] }
         guard let r = recipe else { return [] }
         var list = picks + [.photo]
         if !r.toggles.isEmpty { list.append(.tips) }
-        if !loraFiles.isEmpty { list.append(.addons) }
+        list.append(.addons)
         list.append(.settings)
         return list
     }
@@ -190,7 +191,8 @@ extension CreateScreen {
     }
 
     var videoFormSignature: String {
-        [assembledVideoPrompt, videoPhoto == nil ? "nophoto" : "photo", rules.explicitVideo].joined(separator: "|")
+        [assembledVideoPrompt, videoPhoto == nil ? "nophoto" : "photo", rules.explicitVideo,
+         String(videoLoras.count)].joined(separator: "|")
     }
 
     var changeFormSignature: String { [changeText, changeMode, editor].joined(separator: "|") }

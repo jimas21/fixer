@@ -396,7 +396,7 @@ final class Desktop: ObservableObject {
     /// A short video from the computer: from `prompt`, or animating `start` when given. Returns MP4 data.
     /// `explicit` is "off", "on" or "auto" (the chat always sends "auto": the computer decides from the words).
     func video(prompt: String, start: CGImage?, explicit: String, slot: String? = nil,
-               style: String? = nil, age: Int? = nil,
+               style: String? = nil, age: Int? = nil, loras: [LoraSetting] = [],
                queued: @escaping @Sendable (String) -> Void = { _ in },
                status: @escaping @Sendable (String) -> Void,
                progress: @escaping @Sendable (Double) -> Void) async throws -> Data {
@@ -405,6 +405,9 @@ final class Desktop: ObservableObject {
                                       "explicit": explicit]
         if let style { payload["style"] = style }
         if let age { payload["age"] = age }
+        if !loras.isEmpty {
+            payload["loras"] = loras.map { l -> [String: Any] in ["name": l.name, "strength": l.strength] }
+        }
         if let start {
             guard let jpeg = Self.jpeg(start, longest: 1280) else { throw PCError.bad }
             payload["image"] = jpeg
@@ -537,13 +540,121 @@ final class Desktop: ObservableObject {
 
     // MARK: Create screen (ComfyUI recipes on the computer)
 
-    /// The recipes the computer can run, with the controls to show for each, and its LoRA files.
-    func createRecipes() async throws -> (recipes: [CreateRecipe], loras: [String]) {
+    /// The recipes the computer can run, with the controls to show for each, and its LoRA library (`library`; an
+    /// older computer sends file names only, which become entries of unknown family).
+    func createRecipes() async throws -> (recipes: [CreateRecipe], loras: [String], library: [LoraEntry], videoFamily: String) {
         guard let link else { throw PCError.notPaired }
         for try await f in call("comfy_recipes", [:], link: link) where f["t"] as? String == "info" {
             let recipes = (f["recipes"] as? [[String: Any]] ?? []).compactMap(CreateRecipe.init)
             recipeCache = recipes
-            return (recipes, f["loras"] as? [String] ?? [])
+            let names = f["loras"] as? [String] ?? []
+            var library = (f["lora_library"] as? [[String: Any]] ?? []).compactMap { LoraEntry($0) }
+            if library.isEmpty { library = names.map { LoraEntry(file: $0) } }
+            return (recipes, names, library, f["video_lora_family"] as? String ?? "wan22")
+        }
+        throw PCError.bad
+    }
+
+    // MARK: LoRA library (add-ons kept on the computer)
+
+    /// Every LoRA on the computer, and whether a Civitai key is saved there (the key itself never comes back).
+    func loraList() async throws -> (loras: [LoraEntry], hasKey: Bool) {
+        guard let link else { throw PCError.notPaired }
+        for try await f in call("lora_list", [:], link: link) where f["t"] as? String == "info" {
+            let loras = (f["loras"] as? [[String: Any]] ?? []).compactMap { LoraEntry($0) }
+            return (loras, f["civitai_key"] as? Bool ?? false)
+        }
+        throw PCError.bad
+    }
+
+    /// One page of LoRAs made for `family`, from Civitai or Hugging Face. `cursor` nil = the first page.
+    func loraSearch(source: String, family: String, query: String,
+                    cursor: String?) async throws -> (results: [LoraSearchResult], cursor: String?) {
+        guard let link else { throw PCError.notPaired }
+        var payload: [String: Any] = ["source": source, "family": family, "query": query]
+        if let cursor { payload["cursor"] = cursor }
+        for try await f in call("lora_search", payload, link: link) where f["t"] as? String == "info" {
+            let results = (f["results"] as? [[String: Any]] ?? []).compactMap(LoraSearchResult.init)
+            return (results, f["cursor"] as? String)
+        }
+        throw PCError.bad
+    }
+
+    /// A search result's small preview, fetched through the computer (nothing is kept on the phone).
+    func loraThumb(_ thumb: String) async throws -> UIImage? {
+        guard let link else { throw PCError.notPaired }
+        for try await f in call("lora_thumb", ["thumb": thumb], link: link) where f["t"] as? String == "info" {
+            guard let b64 = f["jpeg"] as? String, let data = Data(base64Encoded: b64) else { return nil }
+            return UIImage(data: data)
+        }
+        return nil
+    }
+
+    /// What a link or a search result holds: a card to confirm, or several files to choose from first.
+    func loraInspect(url: String?, ref: String?, choice: String?) async throws -> LoraInspection {
+        guard let link else { throw PCError.notPaired }
+        var payload: [String: Any] = [:]
+        if let url { payload["link"] = url }
+        if let ref { payload["ref"] = ref }
+        if let choice { payload["choice"] = choice }
+        for try await f in call("lora_inspect", payload, link: link) where f["t"] as? String == "info" {
+            let card = (f["card"] as? [String: Any]).flatMap(LoraCard.init)
+            let choices = (f["choices"] as? [[String: Any]] ?? []).compactMap(LoraChoice.init)
+            return LoraInspection(card: card, choices: choices)
+        }
+        throw PCError.bad
+    }
+
+    /// Downloads a LoRA to the computer and adds it to the library. Cancelling the task drops the connection, and
+    /// the computer then throws the half-downloaded file away.
+    func loraAdd(token: String, family: String?, high: String?,
+                 status: @escaping (String) -> Void,
+                 progress: @escaping (Double) -> Void) async throws -> LoraEntry {
+        guard let link else { throw PCError.notPaired }
+        var payload: [String: Any] = ["token": token]
+        if let family, !family.isEmpty { payload["family"] = family }
+        if let high, !high.isEmpty { payload["high"] = high }
+        for try await f in call("lora_add", payload, link: link) {
+            switch f["t"] as? String {
+            case "progress": progress((f["v"] as? NSNumber)?.doubleValue ?? 0)
+            case "status": status(f["v"] as? String ?? "")
+            case "info":
+                if let d = f["lora"] as? [String: Any], let entry = LoraEntry(d) { return entry }
+            default: break
+            }
+        }
+        try Task.checkCancellation()
+        throw PCError.server("The add-on didn't finish downloading. Try again.")
+    }
+
+    /// Changes a LoRA's usual strength, its "always use" switch or the model family it is filed under.
+    func loraSet(file: String, strength: Double? = nil, alwaysOn: Bool? = nil,
+                 family: String? = nil) async throws -> LoraEntry {
+        guard let link else { throw PCError.notPaired }
+        var payload: [String: Any] = ["file": file]
+        if let strength { payload["strength"] = strength }
+        if let alwaysOn { payload["always_on"] = alwaysOn }
+        if let family { payload["family"] = family }
+        for try await f in call("lora_set", payload, link: link) where f["t"] as? String == "info" {
+            if let d = f["lora"] as? [String: Any], let entry = LoraEntry(d) { return entry }
+        }
+        throw PCError.bad
+    }
+
+    /// Deletes a LoRA (both files of a video pair) from the computer.
+    func loraRemove(_ file: String) async throws {
+        guard let link else { throw PCError.notPaired }
+        for try await f in call("lora_remove", ["file": file], link: link) {
+            if f["t"] as? String == "info" { return }
+        }
+        throw PCError.bad
+    }
+
+    /// Saves the optional Civitai key on the computer ("" removes it). Returns whether one is saved now.
+    func loraKey(_ key: String) async throws -> Bool {
+        guard let link else { throw PCError.notPaired }
+        for try await f in call("lora_key", ["key": key], link: link) where f["t"] as? String == "info" {
+            return f["civitai_key"] as? Bool ?? !key.isEmpty
         }
         throw PCError.bad
     }

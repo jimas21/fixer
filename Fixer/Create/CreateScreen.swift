@@ -49,12 +49,14 @@ struct CreateRecipe: Identifiable {
     let toggles: [PromptToggleGroup]
     let model: String?          // the phone-side model id, when the computer sends it
     let note: String?
+    let loraFamily: String?     // which LoRAs fit this model (sdxl, chroma, qwen21); nil from an older computer
 
     init?(_ d: [String: Any]) {
         guard let id = d["id"] as? String else { return nil }
         self.id = id
         model = d["model"] as? String
         note = d["note"] as? String
+        loraFamily = d["lora_family"] as? String
         name = d["name"] as? String ?? id
         kind = d["kind"] as? String ?? "image"
         controls = (d["controls"] as? [[String: Any]] ?? []).compactMap(CreateControl.init)
@@ -154,7 +156,7 @@ final class CreateStore: ObservableObject {
     /// Makes a video on the computer, from words and/or a start photo, checks it with the content filter and adds it to
     /// this session's results and the Library. One at a time. Used by the Video form and by "Animate" in the viewer.
     func startVideo(prompt: String, start: UIImage?, explicit: String, parent: UUID?, action: String,
-                   style: String? = nil, age: Int? = nil) {
+                   style: String? = nil, age: Int? = nil, loras: [LoraSetting] = []) {
         // 11-17: a new video from here replaces the unfinished one (the computer drops the old one itself).
         var cg: CGImage?
         if let start {
@@ -178,6 +180,7 @@ final class CreateStore: ObservableObject {
             do {
                 let data = try await Desktop.shared.video(
                     prompt: sent, start: startPhoto, explicit: explicit, slot: "make:video", style: style, age: age,
+                    loras: loras,
                     status: { msg in Task { @MainActor in if myEpoch == self.epoch { self.videoStatus = msg } } },
                     progress: { v in Task { @MainActor in if myEpoch == self.epoch { self.videoProgress = v } } })
                 if await ContentGate.blocksVideo(data, filter) {
@@ -382,6 +385,10 @@ struct CreateScreen: View {
     @State var shape = "square"
     @State var fixedSeed: Int?
     @State var loras: [LoraPick] = []
+    @State var videoLoras: [LoraPick] = []          // the add-ons switched on for videos (pictures keep their own)
+    @State var loraLibrary: [LoraEntry] = []        // every LoRA on the computer, with the model family each fits
+    @State var videoLoraFamily = "wan22"
+    @State var showLoraBrowser = false
     @State var loading = true
     @State var failed: String?
     @State var running: Task<Void, Never>?
@@ -852,6 +859,8 @@ struct CreateScreen: View {
             let r = try await Desktop.shared.createRecipes()
             recipes = r.recipes
             loraFiles = r.loras
+            loraLibrary = r.library
+            videoLoraFamily = r.videoFamily
             if recipe == nil { recipeID = recipes.first?.id ?? "" }
             if editor == "qwen21", !hasQwen21 { editor = "auto" }      // this computer doesn't have it
         } catch {
@@ -895,7 +904,8 @@ struct CreateScreen: View {
                 }
             }
         }
-        values["loras"] = loras.map { p -> [String: Any] in ["name": p.name, "strength": p.strength] }
+        let picked = activeLoras                    // only the add-ons that fit what is being made
+        values["loras"] = picked.map { p -> [String: Any] in ["name": p.name, "strength": p.strength] }
         let known = Set(r.toggles.flatMap(\.items).map(\.id))
         values["toggles"] = chosen.filter { known.contains($0) }.sorted()
         preview = nil
@@ -916,7 +926,7 @@ struct CreateScreen: View {
         if let explicitOverride { menusNow["explicit"] = explicitOverride }   // so a later change copies the same switch
         let formMenus = menusNow
         let formToggles = Array(chosen).sorted()
-        let formLoras = loras.map { LoraSetting(name: $0.name, strength: $0.strength) }
+        let formLoras = picked.map { LoraSetting(name: $0.name, strength: $0.strength) }
         let formMode = hasPhoto ? photoMode : nil
         let formStrength = hasPhoto && photoMode == "start" ? strength : nil
         running?.cancel()                                  // 11-17: a new Create replaces the one in progress

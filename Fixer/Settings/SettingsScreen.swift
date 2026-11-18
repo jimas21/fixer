@@ -340,18 +340,37 @@ struct InstalledModel: Identifiable, Hashable {
     }
 }
 
-/// Settings → Models on your computer: the picture, video and chat models downloaded on the PC, each removable.
-/// (LoRAs and the Civitai key are added here once the LoRA library exists.)
+/// Settings → Models on your computer: the picture, video and chat models downloaded on the PC and the LoRA
+/// add-ons, each removable, plus the optional Civitai key some add-on downloads need.
 struct ModelsOnComputer: View {
     @ObservedObject private var desktop = Desktop.shared
     @State private var models: [InstalledModel] = []
+    @State private var loras: [LoraEntry] = []
+    @State private var lorasKnown = false          // false on an older computer that has no LoRA library
+    @State private var hasKey = false
+    @State private var keyText = ""
     @State private var loading = true
     @State private var failed: String?
     @State private var removing: InstalledModel?
+    @State private var removingLora: LoraEntry?
     @State private var notice: String?
 
-    private static let sections: [(kind: String, title: String)] =
-        [("picture", "Picture models"), ("video", "Video"), ("chat", "Chat models")]
+    private static let kinds = ["picture", "video", "chat"]
+
+    private static func title(_ kind: String) -> String {
+        switch kind {
+        case "picture": return "Picture models"
+        case "video": return "Video"
+        default: return "Chat models"
+        }
+    }
+
+    private var removingName: String { removing?.name ?? removingLora?.name ?? "it" }
+
+    private var askingToRemove: Binding<Bool> {
+        Binding(get: { removing != nil || removingLora != nil },
+                set: { if !$0 { removing = nil; removingLora = nil } })
+    }
 
     var body: some View {
         List {
@@ -359,36 +378,75 @@ struct ModelsOnComputer: View {
                 HStack { ProgressView(); Text("Reading your computer…").foregroundStyle(.secondary) }
             }
             if let failed { Text(failed).font(.footnote).foregroundStyle(.secondary) }
-            ForEach(Self.sections, id: \.kind) { section in
-                let items = models.filter { $0.kind == section.kind }
-                if !items.isEmpty {
-                    Section(section.title) { ForEach(items) { row($0) } }
-                }
+            ForEach(Self.kinds, id: \.self) { kind in
+                modelSection(kind)
+            }
+            if lorasKnown {
+                loraSection
+                keySection
             }
         }
         .navigationTitle("Models on your computer")
         .task { await load() }
         .refreshable { await load() }
-        .confirmationDialog(removing.map { "Remove \($0.name) from your computer?" } ?? "",
-                            isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }),
+        .confirmationDialog("Remove \(removingName) from your computer?", isPresented: askingToRemove,
                             titleVisibility: .visible) {
             if let m = removing {
-                Button("Remove from computer", role: .destructive) {
-                    removing = nil
-                    Task {
-                        do { notice = try await desktop.removeModel(m.id) }
-                        catch { notice = error.localizedDescription }
-                        await load()
-                    }
-                }
+                Button("Remove from computer", role: .destructive) { remove(model: m) }
+            } else if let l = removingLora {
+                Button("Remove from computer", role: .destructive) { remove(lora: l) }
             }
-            Button("Cancel", role: .cancel) { removing = nil }
+            Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Frees its space on the computer. Choosing it again later downloads it again.")
+            Text(removingLora != nil
+                 ? "Frees its space on the computer. Adding it again later downloads it again."
+                 : "Frees its space on the computer. Choosing it again later downloads it again.")
         }
         .alert("Fixer", isPresented: Binding(get: { notice != nil }, set: { if !$0 { notice = nil } })) {
             Button("OK", role: .cancel) {}
         } message: { Text(notice ?? "") }
+    }
+
+    @ViewBuilder private func modelSection(_ kind: String) -> some View {
+        let items = models.filter { $0.kind == kind }
+        if !items.isEmpty {
+            Section(Self.title(kind)) {
+                ForEach(items) { m in row(m) }
+            }
+        }
+    }
+
+    private var loraSection: some View {
+        Section {
+            if loras.isEmpty {
+                Text("None yet. Add one in Make, on the Add-ons page.").font(.footnote).foregroundStyle(.secondary)
+            }
+            ForEach(loras) { l in loraRow(l) }
+        } header: {
+            Text("Add-ons (LoRAs)")
+        }
+    }
+
+    private var keySection: some View {
+        let typed = keyText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return Section {
+            if hasKey {
+                Label("A key is saved on your computer.", systemImage: "checkmark.circle")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+            SecureField(hasKey ? "Replace the key" : "Civitai key (optional)", text: $keyText)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+            Button("Save key") { saveKey(typed) }
+                .disabled(typed.isEmpty)
+            if hasKey {
+                Button("Remove the key", role: .destructive) { saveKey("") }
+            }
+        } header: {
+            Text("Civitai key")
+        } footer: {
+            Text("Only some add-ons on Civitai need a key to download. A free one from your Civitai account settings is enough. It is kept on your computer and never shown again.")
+        }
     }
 
     @ViewBuilder private func row(_ m: InstalledModel) -> some View {
@@ -416,13 +474,69 @@ struct ModelsOnComputer: View {
         }
     }
 
+    private func loraRow(_ l: LoraEntry) -> some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(l.name)
+                Text(loraDetail(l)).font(.footnote).foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+        .contextMenu {
+            Button(role: .destructive) { removingLora = l } label: {
+                Label("Remove from computer", systemImage: "trash")
+            }
+        }
+        .swipeActions {
+            Button(role: .destructive) { removingLora = l } label: { Label("Remove", systemImage: "trash") }
+        }
+    }
+
+    private func loraDetail(_ l: LoraEntry) -> String {
+        var parts = ["For " + LoraEntry.familyName(l.family), LoraEntry.sizeText(l.size)]
+        if l.alwaysOn { parts.append("Always on") }
+        return parts.joined(separator: " · ")
+    }
+
     private func sizeText(_ gb: Double) -> String { gb >= 0.1 ? String(format: "%.1f GB", gb) : "small" }
+
+    private func remove(model m: InstalledModel) {
+        Task {
+            do { notice = try await desktop.removeModel(m.id) }
+            catch { notice = error.localizedDescription }
+            await load()
+        }
+    }
+
+    private func remove(lora l: LoraEntry) {
+        Task {
+            do { try await desktop.loraRemove(l.file) }
+            catch { notice = error.localizedDescription }
+            await load()
+        }
+    }
+
+    private func saveKey(_ key: String) {
+        Task {
+            do {
+                hasKey = try await desktop.loraKey(key)
+                keyText = ""
+            } catch {
+                notice = error.localizedDescription
+            }
+        }
+    }
 
     private func load() async {
         guard desktop.isPaired else { failed = "Your computer isn't connected."; loading = false; return }
         loading = true; failed = nil
         do { models = try await desktop.installedInventory() }
         catch { failed = "Couldn't reach your computer. Pull down to try again." }
+        if let library = try? await desktop.loraList() {
+            loras = library.loras
+            hasKey = library.hasKey
+            lorasKnown = true
+        }
         loading = false
     }
 }

@@ -511,7 +511,6 @@ struct CreateScreen: View {
                 }
             }
             .onChange(of: makeExplicit) { _, on in explicitSwitchChanged(on) }
-            .onChange(of: age) { _, new in ageChanged(new) }
     }
 
     /// The second half of the screen's handlers (loading, sheets, clear everything, haptics), kept apart so no single
@@ -529,7 +528,6 @@ struct CreateScreen: View {
             }
             .onChange(of: startTick) { _, _ in noteDismissed = nil }
             .onChange(of: rawNote) { _, n in if n == nil { noteDismissed = nil } }
-            .onChange(of: recipeStore.catalog) { _, c in if let c { age = Double(c.ageDefault) } }
             .sheet(isPresented: $showQueue) { NavigationStack { QueueScreen(inSheet: true) } }
             .sheet(isPresented: $showModels) { MakeModelSheet(recipes: recipes, chosen: modelChoice) }
             .sheet(isPresented: $showHelpers) {
@@ -869,14 +867,10 @@ struct CreateScreen: View {
             }
         }
         if let s = fixedSeed { values["seed"] = s }
-        // The prompt the model gets: the recipe's opening words, the owner's words, its closing words. The computer
-        // applies the one age floor to it; the phone only sends the number on the slider.
+        // The prompt the model gets: the recipe's opening words, the owner's words, its closing words.
         let assembled = assembledPrompt
         values["prompt"] = assembled
-        if recipeStore.catalog != nil {
-            values["age"] = Int(age)
-            if let applied, applied.kind == "picture" { values["style"] = applied.id }
-        }
+        if let applied, applied.kind == "picture" { values["style"] = applied.id }
         var explicitOverride: String?              // the photo editor's add-on switch, when it replaces the recipe's own
         // "Enhance my prompt": a photo being edited or used as a reference follows the changes switch.
         let enhanceOn = (photo != nil && photoMode != "start") ? enhanceEdits : enhanceNew

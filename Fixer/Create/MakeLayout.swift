@@ -180,7 +180,6 @@ extension CreateScreen {
     func currentSnapshot(_ a: AppliedStyle) -> StyleSnapshot {
         var snap = StyleSnapshot()
         if a.kind == "video" {
-            snap.prefix = AgeWords.neutral(videoPrefix)
             snap.suffix = videoSuffix
             snap.explicitVideo = rules.explicitVideo
             return snap
@@ -194,7 +193,6 @@ extension CreateScreen {
             if let c = recipe?.controls.first(where: { $0.key == k }) { snap.menus[k] = menus[k] ?? c.defaultText ?? c.options.first ?? "" }
         }
         snap.negative = texts["negative"] ?? ""
-        snap.prefix = AgeWords.neutral(stylePrefix)
         snap.suffix = styleSuffix
         return snap
     }
@@ -211,12 +209,10 @@ extension CreateScreen {
     func applyStyle(_ s: StyleRecipe) {
         target = .new
         styleNote = nil
-        let years = Int(age)
         var numberKeys: [String] = []
         var menuKeys: [String] = []
         if s.kind == "video" {
             mode = "video"
-            videoPrefix = AgeWords.render(s.prefix, age: years)
             videoSuffix = s.suffix
             if let ev = s.explicitVideo { rules.explicitVideo = ev }
         } else {
@@ -242,7 +238,6 @@ extension CreateScreen {
                     texts["negative"] = neg
                 }
             }
-            stylePrefix = AgeWords.render(s.prefix, age: years)
             styleSuffix = s.suffix
         }
         var a = AppliedStyle(id: s.id, kind: s.kind, numberKeys: numberKeys.sorted(), menuKeys: menuKeys.sorted(),
@@ -262,11 +257,6 @@ extension CreateScreen {
         }
     }
 
-    func ageChanged(_ value: Double) {
-        let years = Int(value)
-        stylePrefix = AgeWords.replacing(in: stylePrefix, with: years)
-        videoPrefix = AgeWords.replacing(in: videoPrefix, with: years)
-    }
 
     // MARK: quick picks
 

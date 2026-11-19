@@ -4,7 +4,8 @@
 The icon set is generated, not hand-drawn, so it stays one consistent style ("simple and tasteful"): monochrome line
 art on a 48-unit grid, one stroke weight, round caps, no text, no faces. Every shape is reduced to plain <path>
 polylines (curves are sampled, crops are clipped here in Python), so Xcode's SVG support never meets a clipPath,
-mask, gradient, dash pattern or <text> it might not render.
+mask, gradient, dash pattern or <text> it might not render. (A Camera set was drawn once and dropped as not
+needed; it is in git history, commit 1294753.)
 
 Run it from anywhere:
 
@@ -137,7 +138,7 @@ def _clip_seg(a: Pt, b: Pt, r):
 
 
 def clip(polys: list[Poly], r) -> list[Poly]:
-    """Crop polylines to the rectangle r = (x0, y0, x1, y1): the viewfinder crops in the camera icons."""
+    """Crop polylines to the rectangle r = (x0, y0, x1, y1) (for cropping a drawing to a frame)."""
     out: list[Poly] = []
     for pts in polys:
         cur: Poly = []
@@ -230,7 +231,7 @@ class Art:
 
 # ---------------------------------------------------------------------------------------------------------------------
 # The person: a head and one plain column, nothing else (no arms, no hands, no face). The legs are a single line up
-# from the floor. Used where a picture needs "someone" (height, camera framings); the Build icons use `form` instead.
+# from the floor. Used by the Height icons; the Build icons use `form` instead.
 # Designed in a 100-unit-tall space (head top 0, soles 100); widths are half-widths from the centre line.
 # ---------------------------------------------------------------------------------------------------------------------
 
@@ -275,56 +276,6 @@ def figure(over: dict | None = None, cx: float = 24, sole: float = 45, height: f
     k = height / 100
     parts = figure_parts(over)
     return xf(parts["head"] + parts["body"], s=k, dx=cx, dy=sole - 100 * k)
-
-
-# ---------------------------------------------------------------------------------------------------------------------
-# Small glyphs
-# ---------------------------------------------------------------------------------------------------------------------
-
-def brackets(x0: float, y0: float, x1: float, y1: float, n: float = 5.5) -> list[Poly]:
-    """Viewfinder corner marks."""
-    return [
-        [(x0, y0 + n), (x0, y0), (x0 + n, y0)],
-        [(x1 - n, y0), (x1, y0), (x1, y0 + n)],
-        [(x1, y1 - n), (x1, y1), (x1 - n, y1)],
-        [(x0 + n, y1), (x0, y1), (x0, y1 - n)],
-    ]
-
-
-def camera(cx: float, cy: float, rot: float = 0, s: float = 1.0) -> list[Poly]:
-    """A small camera seen from the front: body, lens, viewfinder hump. Where it sits says where it looks from."""
-    body = rrect(-5.2, -3.4, 5.2, 4.0, 1.3)
-    hump = [(-2.4, -3.4), (-1.6, -5.2), (1.6, -5.2), (2.4, -3.4)]
-    lens = arc(0, 0.3, 2.2)
-    return xf([body, hump, lens], s=s, rot=rot, dx=cx, dy=cy)
-
-
-FRAME = (6.0, 9.0, 42.0, 39.0)   # the viewfinder used by every framing icon
-
-
-def framed(polys: list[Poly], frame=FRAME) -> list[Poly]:
-    return clip(polys, frame) + brackets(*frame)
-
-
-def lens_fov(barrel: float, half_angle: float, front: float = 0.0) -> Art:
-    """Camera body side-on at the left, a lens `barrel` long, and the field of view opening to the right."""
-    a = Art()
-    x0, cy = 4.5, 26.0
-    a.s([rrect(x0, cy - 6.5, x0 + 9, cy + 6.5, 1.6)])
-    a.s([[(x0 + 2.5, cy - 6.5), (x0 + 3.5, cy - 9.0), (x0 + 6.5, cy - 9.0), (x0 + 7.5, cy - 6.5)]])
-    lx0, lx1 = x0 + 9, x0 + 9 + barrel
-    r0, r1 = 3.6, 3.6 + front
-    a.s([[(lx0, cy - r0), (lx1, cy - r1), (lx1, cy + r1), (lx0, cy + r0)]])
-    if barrel > 6:
-        for gx in (lx0 + barrel * 0.35, lx0 + barrel * 0.55):
-            rr = r0 + (r1 - r0) * (gx - lx0) / barrel
-            a.s([[(gx, cy - rr), (gx, cy + rr)]], w=THIN)
-    tip = (lx1 + 1.0, cy)
-    reach = 44.5 - tip[0]
-    h = math.tan(math.radians(half_angle)) * reach
-    for sgn in (-1, 1):
-        a.s(dashed([tip, (44.5, cy + sgn * min(h, 17))], 2.0, 1.6), w=THIN)
-    return a
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -409,236 +360,9 @@ HEIGHT = {
 }
 
 
-# ---------------------------------------------------------------------------------------------------------------------
-# Camera — framings (the figure cropped by a viewfinder), angles (where the camera is), lenses (field of view), and a
-# few formats.
-# ---------------------------------------------------------------------------------------------------------------------
-
-def crop(top_unit: float, bottom_unit: float, cx: float = 24, frame=FRAME, pad: float = 2.5, over=None) -> Art:
-    """The figure scaled so units top_unit..bottom_unit of its 100-unit height fill the frame (head pad above)."""
-    x0, y0, x1, y1 = frame
-    k = (y1 - y0 - pad) / (bottom_unit - top_unit)
-    height = 100 * k
-    sole = y0 + pad - top_unit * k + height
-    return Art().s(framed(figure(over, cx=cx, sole=sole, height=height), frame))
-
-
-def head_turn(meridian_rx: float, meridian_side: int) -> Art:
-    """A construction head: the sphere, its vertical centre line and brow line bending with the turn."""
-    a = Art()
-    cx, cy, r = 24.0, 21.0, 12.0
-    a.s([arc(cx, cy, r)])
-    if meridian_rx <= 0.01:
-        a.s([[(cx, cy - r), (cx, cy + r)]], w=THIN)
-    else:
-        a.s([arc(cx, cy, meridian_rx, r, a0=-90 * meridian_side, a1=90 * meridian_side)], w=THIN)
-    a.s([arc(cx, cy, r, r * 0.22, a0=0, a1=180)], w=THIN)
-    jx = cx + meridian_side * meridian_rx * 0.45
-    a.s([[(jx - 4.4, cy + r - 0.9), (jx - 4.8, 44.0)], [(jx + 4.4, cy + r - 0.9), (jx + 4.8, 44.0)]])
-    return a
-
-
-def profile() -> Art:
-    pts = [
-        (20.0, 44.0), (20.6, 36.0), (17.0, 31.5), (14.5, 25.0), (14.0, 17.0), (17.5, 9.5), (24.5, 6.0),
-        (31.0, 7.6), (34.2, 12.5), (35.0, 17.6), (37.8, 22.4), (35.4, 23.4), (35.8, 25.6), (34.8, 27.0),
-        (35.2, 28.6), (33.0, 31.6), (28.4, 32.0), (28.6, 44.0),
-    ]
-    a = Art().s([catmull(pts)])
-    return a
-
-
-def eye() -> Art:
-    a = Art()
-    upper = catmull([(9.0, 25.0), (16.0, 17.6), (24.0, 15.8), (32.0, 17.6), (39.0, 24.0)])
-    lower = catmull([(9.0, 25.0), (17.0, 29.6), (25.0, 31.0), (33.0, 29.4), (39.0, 24.0)])
-    a.s(clip([upper, lower], FRAME))
-    a.s([arc(24.0, 23.8, 6.4, a0=-55, a1=235)])
-    a.f([arc(24.0, 23.8, 2.6)])
-    a.s(brackets(*FRAME))
-    return a
-
-
-def angle_cam(cam: Pt, rot: float, target: Pt, fig=None) -> Art:
-    a = Art()
-    a.s([[(5.0, 44.5), (43.0, 44.5)]], w=THIN)
-    a.s(figure(fig, cx=31.0, sole=44.5, height=31.0))
-    a.s(camera(cam[0], cam[1]))
-    dx, dy = target[0] - cam[0], target[1] - cam[1]
-    n = math.hypot(dx, dy)
-    start = (cam[0] + dx / n * 7.0, cam[1] + dy / n * 7.0)
-    a.s(dashed([start, target], 1.8, 1.6), w=THIN)
-    return a
-
-
-def foreshorten(top_scale: float, bottom_scale: float, cam_y: float) -> Art:
-    """The person as seen from far above or below: the near end swells, the far end shrinks; the camera sits there."""
-    top, h = (13.5, 31.0) if cam_y < 24 else (4.0, 30.0)
-    f = figure(None, cx=24, sole=top + h, height=h)
-
-    def fn(x: float, y: float) -> Pt:
-        t = (y - top) / h
-        s = top_scale + (bottom_scale - top_scale) * t
-        return (24 + (x - 24) * s, y)
-    return Art().s(warp(f, fn)).s(camera(24.0, cam_y, s=0.85))
-
-
-def clip_out(polys: list[Poly], c: Pt, r: float) -> list[Poly]:
-    """Remove the parts of polylines inside a circle (to tuck one shape behind another)."""
-    out: list[Poly] = []
-    for poly in polys:
-        dense: Poly = []
-        for a, b in zip(poly, poly[1:]):
-            n = max(1, int(math.dist(a, b) / 0.3))
-            dense += [(a[0] + (b[0] - a[0]) * i / n, a[1] + (b[1] - a[1]) * i / n) for i in range(n)]
-        dense.append(poly[-1])
-        seg: Poly = []
-        for p in dense:
-            if math.dist(p, c) < r:
-                if len(seg) > 1:
-                    out.append(seg)
-                seg = []
-            else:
-                seg.append(p)
-        if len(seg) > 1:
-            out.append(seg)
-    return out
-
-
-def birds_eye() -> Art:
-    """A person from straight overhead: the crown of the head over the line of the shoulders."""
-    a = Art()
-    shoulders = rrect(8.0, 17.0, 40.0, 31.0, 7.0)
-    hx, hy, hr = 24.0, 24.0, 5.6
-    a.s([p for p in clip_out([shoulders], (hx, hy), hr + 1.8)])
-    a.s([arc(hx, hy, hr)])
-    a.s(brackets(*FRAME))
-    return a
-
-
-def over_shoulder() -> Art:
-    """The back of someone's head and shoulder in the near left corner; the person they face, small, at the right."""
-    a = Art()
-    near_head = arc(15.0, 25.0, 8.0)
-    near_body = catmull([(2.0, 37.0), (8.0, 34.4), (16.0, 34.0), (24.0, 37.0), (27.0, 41.0)])
-    a.s(framed([near_head, near_body]))
-    a.s(clip(figure(None, cx=32.5, sole=52.0, height=34.0), FRAME))
-    return a
-
-
-def dutch() -> Art:
-    f = figure(None, cx=24.0, sole=78.0, height=68.0)
-    horizon = [[(0.0, 31.0), (48.0, 31.0)]]
-    tilted = xf(f + horizon, rot=-14, about=(24.0, 24.0))
-    return Art().s(framed(tilted))
-
-
-def phone_snap() -> Art:
-    a = Art()
-    a.s([rrect(14.0, 4.5, 34.0, 43.5, 3.6)])
-    a.s([[(21.5, 7.6), (26.5, 7.6)]], w=THIN)
-    a.s(clip(figure(None, cx=24.0, sole=50.0, height=36.0), (15.5, 10.5, 32.5, 36.5)))
-    a.s([arc(24.0, 39.8, 1.9)])
-    return a
-
-
-def selfie() -> Art:
-    a = Art()
-    a.s([arc(17.0, 23.0, 6.6)])
-    a.s([catmull([(4.0, 44.0), (6.0, 35.6), (11.0, 32.6), (17.0, 32.0), (23.0, 32.6), (27.0, 34.4)])])
-    a.s([catmull([(27.0, 34.4), (31.0, 26.0), (33.6, 17.0)])])     # the raised arm
-    a.s(xf([rrect(-4.2, -7.0, 4.2, 7.0, 1.8)], rot=14, dx=36.0, dy=12.0))
-    return a
-
-
-def pov() -> Art:
-    """Your own two hands at the bottom of the picture, reaching in."""
-    a = Art()
-    a.s([[(4.0, 20.0), (44.0, 20.0)]], w=THIN)
-    for side in (-1, 1):
-        local = [rrect(-3.8, -5.6, 3.8, 5.6, 3.6), [(-3.0, 5.2), (-3.0, 30.0)], [(3.0, 5.2), (3.0, 30.0)]]
-        parts = xf(local, rot=-side * 26, dx=24 + side * 8.0, dy=29.0)
-        a.s([parts[0]])
-        a.s(clip(parts[1:], (0, 0, 48, 46.5)))
-    return a
-
-
-def fisheye() -> Art:
-    """A grid bowed outward: barrel distortion inside the viewfinder."""
-    a = Art()
-    cx, cy = 24.0, 24.0
-    hw, hh, bulge = 15.0, 12.0, 0.22
-
-    def bow(u: float, v: float) -> Pt:    # u, v in -1..1 -> bowed point
-        r2 = u * u * 0.6 + v * v * 0.6
-        k = 1 + bulge * (1 - r2)
-        return (cx + u * hw * k, cy + v * hh * k)
-
-    for i, t in enumerate((-1.0, -0.5, 0.0, 0.5, 1.0)):
-        w = STROKE if abs(t) == 1.0 else THIN
-        a.s([[bow(t, -1 + 2 * j / 30) for j in range(31)]], w=w)
-        a.s([[bow(-1 + 2 * j / 30, t) for j in range(31)]], w=w)
-    return a
-
-
-def film() -> Art:
-    a = Art()
-    a.s([rrect(4.0, 11.0, 44.0, 37.0, 1.6)])
-    for x in range(7, 44, 5):
-        a.s([rrect(x - 1.2, 13.0, x + 1.2, 15.6, 0.5), rrect(x - 1.2, 32.4, x + 1.2, 35.0, 0.5)], w=THIN)
-    a.s([[(4.0, 17.6), (44.0, 17.6)], [(4.0, 30.4), (44.0, 30.4)]], w=THIN)
-    for x0 in (8.0, 26.0):
-        a.s([rrect(x0, 19.6, x0 + 14.0, 28.4, 0.8)])
-    return a
-
-
-def macro() -> Art:
-    a = Art()
-    fc = (19.0, 19.0)
-    for i in range(5):
-        ang = -90 + i * 72
-        a.s([arc(fc[0] + 4.4 * math.cos(math.radians(ang)), fc[1] + 4.4 * math.sin(math.radians(ang)),
-                 3.4, 2.2, rot=ang)], w=THIN)
-    a.s([arc(fc[0], fc[1], 1.8)], w=THIN)
-    a.s([arc(fc[0], fc[1], 12.0)])
-    a.s([[(27.6, 27.6), (40.0, 40.0)]], w=STROKE * 1.8)
-    return a
-
-
-CAMERA = {
-    "face close-up":         lambda: crop(0.0, 23.0),
-    "extreme close-up":      eye,
-    "waist up":              lambda: crop(0.0, 42.0),
-    "full body":             lambda: Art().s(framed(figure(None, cx=24, sole=37.0, height=26.0))),
-    "cowboy shot":           lambda: crop(0.0, 62.0),
-    "wide shot":             lambda: Art().s(framed(
-                                 figure(None, cx=30.0, sole=33.0, height=10.5)
-                                 + [catmull([(4.0, 33.0), (14.0, 29.6), (22.0, 33.0)]), [(4.0, 33.0), (44.0, 33.0)]])),
-    "low angle":             lambda: angle_cam((10.0, 38.0), 0, (28.6, 17.0)),
-    "high angle":            lambda: angle_cam((10.0, 9.0), 0, (28.4, 24.0)),
-    "over-the-shoulder":     over_shoulder,
-    "Dutch angle":           dutch,
-    "bird's eye":            birds_eye,
-    "from above":            lambda: foreshorten(1.5, 0.5, 6.0),
-    "from below":            lambda: foreshorten(0.5, 1.5, 42.0),
-    "85mm portrait lens":    lambda: lens_fov(9.0, 14.0, 0.8),
-    "50mm lens":             lambda: lens_fov(5.0, 24.0, 0.4),
-    "35mm film":             film,
-    "telephoto compression": lambda: lens_fov(17.0, 6.0, 1.6),
-    "macro detail":          macro,
-    "phone snapshot":        phone_snap,
-    "selfie":                selfie,
-    "POV first-person":      pov,
-    "three-quarter view":    lambda: head_turn(6.6, 1),
-    "profile view":          profile,
-    "fisheye":               fisheye,
-}
-
-
 GROUPS: dict[str, dict] = {
     "body": BODY,
     "height": HEIGHT,
-    "camera": CAMERA,
 }
 
 

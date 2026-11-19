@@ -296,8 +296,14 @@ class Tray:
         self.icon.update_menu()
 
     def pair(self, *_):
-        subprocess.Popen(["cmd", "/c", "start", "Pair a phone", "cmd", "/k",
-                          f'"{PY}" "{ROOT / "pair.py"}"'], cwd=str(ROOT))
+        # 11-19: straight to a QR window (pythonw, no console). The old `cmd /c start ... cmd /k "<quoted>"` reached
+        # cmd as \"...\" (Python's argument quoting), which cmd reported as "not recognized", and gave pair.py no name.
+        pyw = PY.with_name("pythonw.exe")
+        try:
+            subprocess.Popen([str(pyw if pyw.exists() else PY), str(ROOT / "pair.py"), "--window"],
+                             cwd=str(ROOT), creationflags=NO_WINDOW)
+        except Exception as e:                       # noqa: BLE001
+            log(f"pair: couldn't start pair.py: {e}")
 
     def open_folder(self, *_):
         os.startfile(str(ROOT))

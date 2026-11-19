@@ -369,6 +369,8 @@ final class Desktop: ObservableObject {
                                       "strength": rules.editStrength, "model": legacyModel, "model_choice": choice,
                                       "longest": rules.pcSize, "width": rules.pcSize, "height": rules.pcSize]
         if let explicit { payload["explicit"] = explicit }
+        // 11-19: Explicit off this session -> the computer uses no explicit model, editor or add-on, whatever the words.
+        payload["safe"] = !rules.explicitNow
         if enhance { payload["enhance"] = true }
         if let start {
             guard let png = Self.png(start) else { throw PCError.bad }
@@ -402,7 +404,8 @@ final class Desktop: ObservableObject {
                progress: @escaping @Sendable (Double) -> Void) async throws -> Data {
         guard let link else { throw PCError.notPaired }
         var payload: [String: Any] = ["prompt": prompt, "model": Rules.shared.pcVideoID,
-                                      "explicit": explicit, "seconds": seconds]
+                                      "explicit": explicit, "seconds": seconds,
+                                      "safe": !Rules.shared.explicitNow]       // 11-19: see image()
         if let style { payload["style"] = style }
         if !loras.isEmpty {
             payload["loras"] = loras.map { l -> [String: Any] in
@@ -713,7 +716,9 @@ final class Desktop: ObservableObject {
                 onEvent: @escaping (CreateEvent) -> Void) async throws {
         guard let link else { throw PCError.notPaired }
         var enhanced: String?                       // 11-17: sent once, before drawing; goes with every picture of this run
-        for try await f in jobStream("comfy_run", ["recipe": recipe, "values": values], slot: slot, link: link, queued: queued) {
+        let safe = !Rules.shared.explicitNow                // 11-19: see image()
+        for try await f in jobStream("comfy_run", ["recipe": recipe, "values": values, "safe": safe], slot: slot,
+                                     link: link, queued: queued) {
             switch f["t"] as? String {
             case "status": onEvent(.status(f["v"] as? String ?? ""))
             case "progress": onEvent(.progress(f["v"] as? Double ?? 0))
@@ -829,9 +834,6 @@ final class Desktop: ObservableObject {
         var p = payload
         if let slot { p["slot"] = slot }
         p["ack"] = true
-        // 11-19: every picture, change and video says whether Explicit is off this session; the computer then uses no
-        // explicit model, editor or add-on for it, whatever the words or the chat model's call.
-        if ["image", "video", "comfy_run"].contains(op) { p["safe"] = !Rules.shared.explicitNow }
         let first = call(op, p, link: link)
         let single = op != "comfy_run"
         return AsyncThrowingStream { continuation in

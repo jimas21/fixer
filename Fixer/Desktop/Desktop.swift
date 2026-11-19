@@ -797,7 +797,10 @@ final class Desktop: ObservableObject {
     /// background (only one already downloaded and loaded before, never a download), so the first answer is quick.
     func noteBrain(ready: Bool) {
         brainReadyAt = ready ? Date() : nil
-        if !ready, Brain.shared.hasLocalModel { Task { try? await Brain.shared.load() } }
+        // Only while Fixer is on screen: a load during the background window after leaving could get it killed.
+        if !ready, Brain.shared.hasLocalModel, UIApplication.shared.applicationState == .active {
+            Task { try? await Brain.shared.load() }
+        }
     }
 
     /// 11-18: the owner changed "free after" in Settings: tells the computer the number and nothing else. ("for":

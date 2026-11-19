@@ -674,12 +674,19 @@ final class Chat: ObservableObject {
             do {
                 let full = try await streamTurn(prompt, image: image, history: history, recap: recap, pc: true, into: replyID)
                 Desktop.shared.noteBrain(ready: true)  // 11-19: it answered, so its model is up: keep using it
+                Brain.shared.resetChat()               // 11-19: the iPhone's session lacks this turn: rebuild from the recap
                 return full
             }
             catch let e as PCError where e.isUnreachable {
                 try Task.checkCancellation()           // stopped (new chat / clear everything): no phone fallback
                 Desktop.shared.noteBrain(ready: false)
                 busy = "Your computer isn't reachable. Answering on this iPhone…"
+            }
+            catch PCError.paused where Brain.shared.hasLocalModel {
+                // 11-19: the computer paused its chat for a video: answer here rather than failing the turn
+                try Task.checkCancellation()
+                Desktop.shared.noteBrain(ready: false)
+                busy = "Your computer is busy with a video. Answering on this iPhone…"
             }
         }
         return try await streamTurn(prompt, image: image, history: history, recap: recap, pc: false, into: replyID)

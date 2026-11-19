@@ -76,6 +76,7 @@ def show_window(name: str):
     root = tk.Tk()
     root.title("Pair a phone — Fixer Desktop")
     root.resizable(False, False)
+    pid = None
     try:
         import qrcode
         from PIL import ImageTk
@@ -84,6 +85,13 @@ def show_window(name: str):
         qr.add_data(link)
         img = ImageTk.PhotoImage(qr.make_image(fill_color="black", back_color="white").get_image())
     except Exception as e:                             # noqa: BLE001 - shown to the owner, not swallowed
+        if pid:                                        # no code was shown: the key it saved must not stay valid
+            try:
+                data = load()
+                data["phones"].pop(pid, None)
+                save(data)
+            except Exception:                          # noqa: BLE001
+                pass
         root.withdraw()
         messagebox.showerror("Pair a phone", f"Couldn't make a pairing code:\n{e}")
         root.destroy()

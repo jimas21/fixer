@@ -4758,7 +4758,10 @@ def job_brain_warm(p: dict, emit, cancel):
     def brain_state() -> str:
         if choice is None:
             return "ready"                             # not a llama-server model: job_chat answers its own way
-        return "ready" if LLAMA.state() == "ready" and LLAMA.repo == repo else LLAMA.state()
+        s = LLAMA.state()
+        if s == "ready" and LLAMA.repo != repo:
+            return "off"                               # another model is up: this one still has to load
+        return s
 
     emit({"t": "info", "brain_state": brain_state()})
     if choice is not None and not LLAMA.paused_for and (_is_moe(repo) or not VIDEO_BUSY.is_set()):

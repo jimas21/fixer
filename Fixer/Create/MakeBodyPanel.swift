@@ -27,50 +27,76 @@ extension CreateScreen {
         return activeGroups.contains { bodyIDs.contains($0.id) }
     }
 
-    /// Slider position for an axis: 0 = none, 1...n = the active term. Read back from the prompt each render, so the
-    /// slider reflects a term set by a chip too, and writing removes the axis's other terms before adding the new one.
-    func bodyAxisBinding(_ axis: BodyAxis) -> Binding<Double> {
-        Binding(
-            get: {
-                let text = self.quickBinding.wrappedValue
-                for (i, t) in axis.terms.enumerated() where PhraseList.contains(text, t) {
-                    return Double(i + 1)
-                }
-                return 0
-            },
-            set: { newValue in
-                let idx = Int(newValue.rounded())
-                let add = (1...axis.terms.count).contains(idx) ? axis.terms[idx - 1] : nil
-                let b = self.quickBinding
-                b.wrappedValue = PhraseList.replacing(b.wrappedValue, remove: axis.terms, with: add)
-                self.quickTick += 1
-            }
-        )
+    /// Position for an axis: 0 = none, 1...n = the active term. Read back from the prompt each render, so the slider
+    /// reflects a term set by a chip too.
+    func bodyAxisValue(_ axis: BodyAxis) -> Int {
+        let text = quickBinding.wrappedValue
+        for (i, t) in axis.terms.enumerated() where PhraseList.contains(text, t) { return i + 1 }
+        return 0
+    }
+
+    /// Writes one axis position into the prompt words (dropping the axis's other terms first), with one haptic tick.
+    func commitBodyAxis(_ axis: BodyAxis, _ idx: Int) {
+        let add = (1...axis.terms.count).contains(idx) ? axis.terms[idx - 1] : nil
+        let b = quickBinding
+        b.wrappedValue = PhraseList.replacing(b.wrappedValue, remove: axis.terms, with: add)
+        quickTick += 1
     }
 
     var bodyPanel: some View {
         VStack(spacing: 16) {
             ForEach(Self.bodyAxes) { axis in
-                bodyAxisRow(axis)
+                BodyAxisSlider(label: axis.label, terms: axis.terms, value: bodyAxisValue(axis)) { idx in
+                    commitBodyAxis(axis, idx)
+                }
             }
         }
     }
+}
 
-    @ViewBuilder
-    private func bodyAxisRow(_ axis: BodyAxis) -> some View {
-        let binding = bodyAxisBinding(axis)
-        let idx = Int(binding.wrappedValue.rounded())
-        let current = (1...axis.terms.count).contains(idx) ? axis.terms[idx - 1] : "—"
+/// One graded Body slider. While a finger is on it, the position lives only here: the label previews the term live,
+/// but the prompt is not touched and nothing buzzes. On release the chosen stop is written ONCE, with one soft tick.
+/// (It used to write the prompt and fire a haptic on every step crossed mid-drag, which buzzed constantly and
+/// re-rendered the whole Make sheet per step.) A change made without a drag (VoiceOver adjust) commits at once.
+struct BodyAxisSlider: View {
+    let label: String
+    let terms: [String]
+    let value: Int                      // committed position from the prompt: 0 = none, 1...terms.count
+    let commit: (Int) -> Void
+    @State private var live: Double?    // position during a drag; nil when not dragging
+    @State private var editing = false
+
+    private var shown: Int { Int((live ?? Double(value)).rounded()) }
+
+    var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
-                Text(axis.label).font(.footnote.weight(.semibold))
+                Text(label).font(.footnote.weight(.semibold))
                 Spacer()
-                Text(current)
+                Text(shown == 0 ? "—" : terms[shown - 1])
                     .font(.footnote)
-                    .foregroundStyle(idx == 0 ? Fx.secondaryText : Fx.accentSoftText)
+                    .foregroundStyle(shown == 0 ? Fx.secondaryText : Fx.accentSoftText)
             }
-            Slider(value: binding, in: 0...Double(axis.terms.count), step: 1)
-                .tint(Fx.accent)
+            Slider(
+                value: Binding(
+                    get: { live ?? Double(value) },
+                    set: { v in
+                        if editing { live = v }
+                        else if Int(v.rounded()) != value { commit(Int(v.rounded())) }
+                    }
+                ),
+                in: 0...Double(terms.count), step: 1,
+                onEditingChanged: { began in
+                    editing = began
+                    guard !began else { return }
+                    let s = shown
+                    live = nil
+                    if s != value { commit(s) }
+                }
+            )
+            .tint(Fx.accent)
+            .accessibilityLabel(label)
+            .accessibilityValue(shown == 0 ? "not set" : terms[shown - 1])
         }
     }
 }

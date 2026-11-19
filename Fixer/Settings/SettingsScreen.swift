@@ -55,12 +55,12 @@ struct SettingsScreen: View {
                 }
 
                 Section {
-                    Toggle("Explicit", isOn: $rules.explicitNow)
+                    Toggle("Explicit (18+) this session", isOn: $rules.explicitNow)
                     Toggle("Always explicit", isOn: $rules.alwaysExplicit)
                 } footer: {
-                    Text("Explicit is off each time Fixer opens, and after 15 minutes away: pictures and videos use "
-                         + "only the everyday models and settings, and Make hides its explicit chips. Turn it on for "
-                         + "this session here, from the + in the chat, or at the top of Make. Always explicit starts "
+                    Text("18+ is off each time Fixer opens, and after 15 minutes away: pictures and videos use only "
+                         + "the everyday models and settings, and Make hides its explicit chips. Tap the 18+ chip in "
+                         + "the chat or at the top of Make to turn it on for this session. Always explicit starts "
                          + "every session with it on.")
                 }
 
@@ -521,6 +521,7 @@ struct ModelsOnComputer: View {
     private func loraDetail(_ l: LoraEntry) -> String {
         var parts = [LoraEntry.sizeText(l.size)]            // the section header already names the model
         if l.alwaysOn { parts.append("Always on") }
+        if l.explicit { parts.append("18+") }
         return parts.joined(separator: " · ")
     }
 

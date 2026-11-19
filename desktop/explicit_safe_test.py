@@ -67,6 +67,33 @@ try:
         fd._TL.safe = False
     check(fd._is_explicit(words), "after the job: words count again")
 
+    # Add-ons (11-19): the 18+ mark, and safe jobs leave marked ones out (asked for or always on).
+    check(fd._lora_is_explicit("x.safetensors", {"name": "Plain style", "explicit": True}), "own mark: 18+")
+    check(not fd._lora_is_explicit("nsfw_pose.safetensors", {"name": "NSFW pose", "explicit": False}),
+          "own mark beats the name")
+    check(fd._lora_is_explicit("y.safetensors", {"name": "Film look", "nsfw": True}), "Civitai NSFW flag: 18+")
+    check(fd._lora_is_explicit("nsfw_pose-ab12.safetensors", {"name": "pose"}), "explicit word in the file name")
+    check(not fd._lora_is_explicit("film_grain.safetensors", {"name": "Film grain", "triggers": ["grainy"]}),
+          "ordinary add-on: not 18+")
+    lib_rows = [{"file": "a.safetensors", "family": "sdxl", "explicit": True, "always_on": True, "strength": 1.0},
+                {"file": "b.safetensors", "family": "sdxl", "explicit": False, "always_on": True, "strength": 1.0},
+                {"file": "c.safetensors", "family": "sdxl", "explicit": True, "always_on": False, "strength": 1.0}]
+    orig_entries = fd._lora_entries
+    fd._lora_entries = lambda: lib_rows
+    try:
+        got, _ = fd._job_loras(["c.safetensors"], "sdxl")
+        names = sorted(x[0] for x in got)
+        check(names == ["a.safetensors", "b.safetensors", "c.safetensors"], f"not safe: all add-ons used ({names})")
+        fd._TL.safe = True
+        try:
+            got, _ = fd._job_loras(["c.safetensors"], "sdxl")
+            names = sorted(x[0] for x in got)
+            check(names == ["b.safetensors"], f"safe: only the ordinary add-on ({names})")
+        finally:
+            fd._TL.safe = False
+    finally:
+        fd._lora_entries = orig_entries
+
     # The chat's Auto model list: safe never takes the explicit list.
     seen = []
     orig = fd._first_ready

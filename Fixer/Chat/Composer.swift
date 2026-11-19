@@ -25,7 +25,6 @@ struct QuietComposer: View {
     private var elsewhere: Int { chat.jobs.filter { $0.conversation != chat.conversation.id }.count }
     private var showThink: Bool { desktop.isOn && rules.thinkMode }
     private var showEnhance: Bool { desktop.isOn && chatEnhance }
-    private var showExplicit: Bool { desktop.isOn && rules.explicitNow }
     private var workingImage: UIImage? { attachment ?? chat.photo }
     private var showTopLine: Bool { workingImage != nil || elsewhere > 0 }
 
@@ -114,6 +113,7 @@ struct QuietComposer: View {
         HStack(spacing: 0) {
             ComposerPlusMenu(onPhotos: onPhotos, onCamera: onCamera, onQueue: onQueue)
             ModelChip()
+            if desktop.isOn { AdultChip() }
             if showThink {
                 StatePill(systemImage: "brain",
                           label: "Think is on. Tap to turn it off") { rules.thinkMode = false }
@@ -124,18 +124,11 @@ struct QuietComposer: View {
                           label: "Enhance my prompt is on. Tap to turn it off") { chatEnhance = false }
                     .transition(.scale(scale: 0.9).combined(with: .opacity))
             }
-            if showExplicit {
-                StatePill(systemImage: "flame", label: "Explicit is on. Tap to turn it off", warm: true) {
-                    rules.explicitNow = false
-                }
-                .transition(.scale(scale: 0.9).combined(with: .opacity))
-            }
             Spacer(minLength: 0)
             SendStopButton(isStop: mode == .stop, enabled: mode != .idle, action: primary)
         }
         .fxAnimation(Motion.pop, value: showThink)
         .fxAnimation(Motion.pop, value: showEnhance)
-        .fxAnimation(Motion.pop, value: showExplicit)
     }
 
     private func primary() {
@@ -204,22 +197,64 @@ struct ComposerPhotoChip: View {
 struct StatePill: View {
     let systemImage: String
     let label: String
-    var warm = false                                     // Explicit: the warm colours Make's explicit chips use
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
             ZStack {
-                Circle().fill(warm ? Fx.explicitFill : Fx.onTint).frame(width: 36, height: 36)
+                Circle().fill(Fx.onTint).frame(width: 36, height: 36)
                 Image(systemName: systemImage)
                     .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(warm ? Fx.explicitText : Fx.accentSoftText)
+                    .foregroundStyle(Fx.accentSoftText)
             }
             .frame(width: 44, height: 44)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .accessibilityLabel(label)
+    }
+}
+
+/// 11-19: this session's Explicit switch (off each time Fixer opens unless "Always explicit" is on in Settings).
+/// Off: just a quiet flame. On: a warm "flame 18+" capsule in the colours of Make's explicit chips. One tap flips it.
+struct AdultChip: View {
+    @ObservedObject private var rules = Rules.shared
+    var onBar = false                                    // over Make's picture: a solid fill so it reads on any image
+
+    var body: some View {
+        let on = rules.explicitNow
+        Button { rules.explicitNow.toggle() } label: {
+            HStack(spacing: 3) {
+                Image(systemName: on ? "flame.fill" : "flame")
+                    .font(.system(size: on ? 13 : 16, weight: on ? .semibold : .regular))
+                if on {
+                    Text("18+")
+                        .font(.caption.weight(.bold))
+                        .monospacedDigit()
+                        .transition(.opacity.combined(with: .scale(scale: 0.8, anchor: .leading)))
+                }
+            }
+                .foregroundStyle(on ? Fx.explicitText : Fx.secondaryText)
+                .padding(.horizontal, on ? (onBar ? 14 : 9) : 0)
+                .frame(minWidth: onBar ? 44 : 30, minHeight: onBar ? 44 : 30)   // in Make: as tall as its round buttons
+                .background {
+                    if on { Capsule().fill(Fx.explicitFill) }
+                    else if onBar { Circle().fill(Fx.bar) }
+                }
+                .overlay {
+                    if on { Capsule().strokeBorder(Fx.explicitStroke, lineWidth: 1) }
+                    else if onBar { Circle().strokeBorder(Fx.hairline, lineWidth: 0.5) }
+                }
+                .padding(.horizontal, 4)
+                .frame(minWidth: 44, minHeight: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .fxAnimation(Motion.pop, value: on)
+        .sensoryFeedback(.selection, trigger: on)
+        .accessibilityLabel("18 plus")
+        .accessibilityValue(on ? "On" : "Off")
+        .accessibilityHint("For this session only, unless Always explicit is on in Settings")
     }
 }
 
@@ -241,7 +276,6 @@ struct ComposerPlusMenu: View {
             if desktop.isOn {
                 Toggle(isOn: $rules.thinkMode) { Label("Think", systemImage: "brain") }
                 Toggle(isOn: $chatEnhance) { Label("Enhance my prompt", systemImage: "sparkles") }
-                Toggle(isOn: $rules.explicitNow) { Label("Explicit", systemImage: "flame") }
                 Divider()
                 Button { onQueue() } label: { Label("Queue", systemImage: "list.number") }
             }

@@ -565,7 +565,6 @@ struct CreateScreen: View {
             .sensoryFeedback(.success, trigger: store.results.count)
             .sensoryFeedback(.selection, trigger: applied?.id)
             .sensoryFeedback(.selection, trigger: quickTick)
-            .sensoryFeedback(.impact(weight: .light), trigger: makeExplicit)
     }
 
     /// "Make another" from the Library or chat: applied once the models have loaded, so the model and seed restore.
@@ -823,7 +822,7 @@ struct CreateScreen: View {
         case "qwen21": "The new Qwen-Image 2.1: the same model as its pictures, so it starts at once after one. Use the Explicit add-on switch below for nudity."
         default: makeExplicit
             ? "Picks for you: Qwen-Image 2.1 for pictures made with it, Qwen Edit Explicit when your words are explicit or you're on an explicit model, otherwise Qwen Edit."
-            : "Picks for you: Qwen-Image 2.1 for pictures made with it, otherwise Qwen Edit. Explicit is off for this session."
+            : "Picks for you: Qwen-Image 2.1 for pictures made with it, otherwise Qwen Edit. 18+ is off for this session."
         }
     }
 

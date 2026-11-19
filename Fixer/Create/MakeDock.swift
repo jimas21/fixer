@@ -297,8 +297,8 @@ extension CreateScreen {
                         Text("Auto").tag("auto")
                     }
                 } else {
-                    Text("Explicit is off for this session")
-                    Button { rules.explicitNow = true } label: { Label("Turn Explicit on", systemImage: "flame") }
+                    Text("18+ is off for this session")
+                    Button { rules.explicitNow = true } label: { Text("Turn on 18+") }
                 }
             } label: { MakeTile(caption: "Explicit", value: rules.videoExplicitNow.capitalized) }
                 .accessibilityLabel("Explicit videos: \(rules.videoExplicitNow)")

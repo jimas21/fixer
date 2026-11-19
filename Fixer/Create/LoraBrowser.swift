@@ -13,6 +13,7 @@ struct LoraEntry: Identifiable, Hashable {
     var triggers: [String]
     var strength: Double        // the strength it is used at unless a run says otherwise
     var alwaysOn: Bool          // used with every picture or video of its model, the chat's included
+    var explicit: Bool          // 11-19: an 18+ add-on: hidden and never used while 18+ is off
     var source: String
     var pair: Bool              // one file of a video pair
     var role: String?           // "high" or "low" for a file of a pair
@@ -38,6 +39,7 @@ struct LoraEntry: Identifiable, Hashable {
         triggers = d["triggers"] as? [String] ?? []
         strength = (d["strength"] as? NSNumber)?.doubleValue ?? 1
         alwaysOn = d["always_on"] as? Bool ?? false
+        explicit = d["explicit"] as? Bool ?? false
         source = d["source"] as? String ?? ""
         if let pairID = d["pair"] as? String {
             pair = !pairID.isEmpty
@@ -56,6 +58,7 @@ struct LoraEntry: Identifiable, Hashable {
         triggers = []
         strength = 1
         alwaysOn = false
+        explicit = false
         source = ""
         pair = false
         role = nil

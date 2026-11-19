@@ -18,21 +18,7 @@ extension CreateScreen {
                 .accessibilityHint("See what's running on your computer")
             }
             MakeModeSwitch(mode: $mode)
-            // 11-19: this session's Explicit switch (off each time Fixer opens unless "Always explicit" is on).
-            Button { rules.explicitNow.toggle() } label: {
-                Image(systemName: "flame")
-                    .font(.system(size: 17, weight: .semibold))
-                    .foregroundStyle(makeExplicit ? Fx.explicitText : Fx.secondaryText)
-                    .frame(width: 44, height: 44)
-                    .background(Circle().fill(makeExplicit ? Fx.explicitSwitch : Fx.bar))
-                    .overlay(Circle().strokeBorder(makeExplicit ? Fx.explicitStroke : Fx.hairline,
-                                                   lineWidth: makeExplicit ? 1 : 0.5))
-                    .contentShape(Circle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Explicit")
-            .accessibilityValue(makeExplicit ? "On" : "Off")
-            .accessibilityHint("On for this session only, unless Always explicit is on in Settings")
+            AdultChip(onBar: true)                       // 11-19: this session's Explicit switch
             Spacer(minLength: 0)
             Button(action: stopEverything) {
                 Text("Stop all")

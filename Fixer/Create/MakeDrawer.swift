@@ -189,7 +189,7 @@ extension CreateScreen {
     /// The add-ons on the computer that fit it. One the computer couldn't sort is offered everywhere.
     var fittingLoras: [LoraEntry] {
         let family = loraFamily
-        return loraLibrary.filter { $0.family == family || $0.family == "unknown" }
+        return loraLibrary.filter { ($0.family == family || $0.family == "unknown") && (makeExplicit || !$0.explicit) }
     }
 
     /// The add-ons switched on by hand: pictures and videos keep their own.
@@ -266,6 +266,20 @@ extension CreateScreen {
                 if let i = loraLibrary.firstIndex(where: { $0.file == saved.file }) { loraLibrary[i] = saved }
             } catch {
                 if let i = loraLibrary.firstIndex(where: { $0.file == e.file }) { loraLibrary[i].alwaysOn = !on }
+                styleNote = error.localizedDescription
+            }
+        }
+    }
+
+    /// 11-19: mark an add-on 18+ (or not), on the computer, so it is left out of every job while 18+ is off.
+    private func setLoraExplicit(_ e: LoraEntry, _ on: Bool) {
+        if let i = loraLibrary.firstIndex(where: { $0.file == e.file }) { loraLibrary[i].explicit = on }
+        Task {
+            do {
+                let saved = try await Desktop.shared.loraSet(file: e.file, explicit: on)
+                if let i = loraLibrary.firstIndex(where: { $0.file == saved.file }) { loraLibrary[i] = saved }
+            } catch {
+                if let i = loraLibrary.firstIndex(where: { $0.file == e.file }) { loraLibrary[i].explicit = !on }
                 styleNote = error.localizedDescription
             }
         }
@@ -417,6 +431,10 @@ extension CreateScreen {
                 }
                 Toggle("Always use with this model", isOn: Binding(get: { e.alwaysOn }, set: { setLoraAlways(e, $0) }))
                     .font(.footnote)
+                Toggle("18+ add-on", isOn: Binding(get: { e.explicit }, set: { setLoraExplicit(e, $0) }))
+                    .font(.footnote)
+                Text("18+ add-ons are hidden and never used while 18+ is off.")
+                    .font(.caption).foregroundStyle(Fx.secondaryText)
             }
         }
         .contextMenu {

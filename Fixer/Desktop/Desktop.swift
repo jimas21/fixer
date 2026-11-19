@@ -580,7 +580,8 @@ final class Desktop: ObservableObject {
                     period: String? = nil, category: String? = nil)
         async throws -> (results: [LoraSearchResult], cursor: String?) {
         guard let link else { throw PCError.notPaired }
-        var payload: [String: Any] = ["source": source, "family": family, "query": query, "sort": sort]
+        var payload: [String: Any] = ["source": source, "family": family, "query": query, "sort": sort,
+                                      "safe": !Rules.shared.explicitNow]    // 11-19: 18+ off -> no NSFW results
         if let cursor { payload["cursor"] = cursor }
         if let families, !families.isEmpty { payload["families"] = families }
         if let period { payload["period"] = period }
@@ -659,11 +660,12 @@ final class Desktop: ObservableObject {
 
     /// Changes a LoRA's usual strength, its "always use" switch or the model family it is filed under.
     func loraSet(file: String, strength: Double? = nil, alwaysOn: Bool? = nil,
-                 family: String? = nil) async throws -> LoraEntry {
+                 family: String? = nil, explicit: Bool? = nil) async throws -> LoraEntry {
         guard let link else { throw PCError.notPaired }
         var payload: [String: Any] = ["file": file]
         if let strength { payload["strength"] = strength }
         if let alwaysOn { payload["always_on"] = alwaysOn }
+        if let explicit { payload["explicit"] = explicit }
         if let family { payload["family"] = family }
         for try await f in call("lora_set", payload, link: link) where f["t"] as? String == "info" {
             let all = (f["library"] as? [[String: Any]] ?? []).compactMap { LoraEntry($0) }

@@ -259,6 +259,12 @@ extension CreateScreen {
 
     func explicitSwitchChanged(_ on: Bool) {
         guard !on else { return }                  // turning it on changes nothing by itself: the recipe you pick sets things
+        // 11-19: an 18+ recipe in use loses its own opening and closing words (never the owner's), so the next run
+        // doesn't carry them into an 18+-off session.
+        if let a = applied, recipeStore.catalog?.recipes.first(where: { $0.id == a.id })?.explicit == true {
+            if a.kind == "video" { videoPrefix = ""; videoSuffix = "" } else { stylePrefix = ""; styleSuffix = "" }
+            applied = nil
+        }
         rules.resetExplicitChoices()
         explicitAddon = "Off"
         if editor == "qwen-explicit" { editor = "auto" }

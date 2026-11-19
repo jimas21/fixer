@@ -3551,9 +3551,14 @@ EXPLICIT_PATTERN_DEFAULT = (r"\b(nsfw|nude|nudes|nudity|naked|topless|bottomless
 def _is_explicit(text: str) -> bool:
     """True when the words are explicit (phone_config "explicit_pattern", editable without an app update). Always
     False inside a job the phone sent with Explicit off (11-19), so nothing explicit is picked from the words."""
-    import re
     if getattr(_TL, "safe", False):
         return False
+    return _words_explicit(text)
+
+
+def _words_explicit(text: str) -> bool:
+    """The explicit-words check itself, with no regard to the job's safe flag (add-on names, 11-19)."""
+    import re
     try:
         cfg = json.loads(PHONE_CONFIG.read_text(encoding="utf-8"))
     except Exception:
@@ -4710,6 +4715,18 @@ def _lora_lib_write(lib: dict) -> None:
     tmp.replace(COMFY_LORAS / "library.json")            # atomic
 
 
+def _lora_is_explicit(fn: str, e: dict | None) -> bool:
+    """11-19: is this add-on 18+? The owner's own mark wins ("explicit", set on the phone); otherwise Civitai's NSFW
+    flag ("nsfw", recorded when it was added or looked up since), or explicit words in its name, file or triggers."""
+    e = e or {}
+    if isinstance(e.get("explicit"), bool):
+        return e["explicit"]
+    if e.get("nsfw") is True:
+        return True
+    words = " ".join([str(e.get("name") or ""), fn, *[str(t) for t in (e.get("triggers") or [])]])
+    return _words_explicit(re.sub(r"[_\-.]+", " ", words))
+
+
 def _lora_entries() -> list[dict]:
     """The library: one row per .safetensors file. A file with no record is listed with family 'unknown'."""
     lib = _lora_lib()
@@ -4721,12 +4738,49 @@ def _lora_entries() -> list[dict]:
             out.append({"file": fn, "name": e.get("name") or fn, "family": e.get("family") or "unknown",
                         "triggers": e.get("triggers") or [], "strength": e.get("strength", 1.0),
                         "always_on": bool(e.get("always_on")), "pair": e.get("pair"), "role": e.get("role"),
-                        "source": e.get("source", ""), "size": e.get("size") or (COMFY_LORAS / fn).stat().st_size})
+                        "source": e.get("source", ""), "size": e.get("size") or (COMFY_LORAS / fn).stat().st_size,
+                        "explicit": _lora_is_explicit(fn, e)})
         else:
             out.append({"file": fn, "name": re.sub(r"\.safetensors$", "", fn), "family": "unknown", "triggers": [],
                         "strength": 1.0, "always_on": False, "pair": None, "role": None, "source": "",
-                        "size": (COMFY_LORAS / fn).stat().st_size})
+                        "size": (COMFY_LORAS / fn).stat().st_size, "explicit": _lora_is_explicit(fn, None)})
     return out
+
+
+_NSFW_LOOKUP_BUSY = threading.Lock()
+
+
+def _lora_nsfw_backfill(limit: int = 40) -> None:
+    """11-19: add-ons added from Civitai before the 18+ mark existed get Civitai's NSFW flag, looked up once each, in
+    the background (off the phone's request). Never raises; one that can't be looked up is tried again next time."""
+    if not _NSFW_LOOKUP_BUSY.acquire(blocking=False):
+        return
+    try:
+        todo = [(fn, e) for fn, e in _lora_lib().items()
+                if e.get("source") == "civitai" and "nsfw" not in e
+                and re.match(r"civitai:\d*@\d+$", str(e.get("source_id") or ""))][:limit]
+        found = {}
+        for fn, e in todo:
+            version = str(e["source_id"]).split("@", 1)[1]
+            try:
+                v = _api_json(f"{CIVITAI_API}/model-versions/{version}", timeout=15)
+                found[fn] = bool((v.get("model") or {}).get("nsfw"))
+            except Exception:                            # noqa: BLE001 - offline, removed from Civitai: try later
+                continue
+        if not found or not LORA_LOCK.acquire(timeout=30):
+            return
+        try:
+            lib = _lora_lib()
+            for fn, flag in found.items():
+                if fn in lib:
+                    lib[fn]["nsfw"] = flag
+            _lora_lib_write(lib)
+        finally:
+            LORA_LOCK.release()
+    except Exception as e:                               # noqa: BLE001
+        log.warning("add-on NSFW lookup failed: %s", e.__class__.__name__)
+    finally:
+        _NSFW_LOOKUP_BUSY.release()
 
 
 def _family_model_name(family: str) -> str:
@@ -4778,11 +4832,15 @@ def _job_loras(requested, family, extra_always_on: bool = True):
                 strengths[nm] = st
     picked, seen = [], set()
 
+    safe = getattr(_TL, "safe", False)                   # 11-19: 18+ off on the phone -> no 18+ add-ons at all
+
     def add(fn):
         if fn in seen or fn not in lib:
             return
         seen.add(fn)
         e = lib[fn]
+        if safe and e.get("explicit"):
+            return
         s = max(0.0, min(2.0, float(strengths.get(fn, e.get("strength", 1.0)))))
         picked.append((fn, s, e))
     for fn in want:                                      # the user's chosen ones, of this family or unknown
@@ -5111,6 +5169,7 @@ def _plan_from_descriptor(d: dict) -> dict:
             raise UserFacing("That add-on has no safetensors file.")
         name = (v.get("model") or {}).get("name") or v.get("name") or f"civitai-{version}"
         return {"source": "civitai", "source_id": f"civitai:{model}@{version}", "name": name,
+                "nsfw": bool((v.get("model") or {}).get("nsfw")),      # 11-19: Civitai's own 18+ flag
                 "base": v.get("baseModel", ""), "triggers": v.get("trainedWords") or [], "files": rows,
                 "strength": _suggested_strength(_civitai_description(model, v))}
     if k in ("hf_repo", "hf_file"):
@@ -5163,6 +5222,7 @@ def job_lora_key(p: dict, emit, cancel):
 
 def job_lora_list(p: dict, emit, cancel):
     _resort_qwen_loras()
+    threading.Thread(target=_lora_nsfw_backfill, daemon=True, name="lora-nsfw").start()   # 11-19, once per add-on
     emit({"t": "info", "library": _lora_entries(), "civitai_key": bool(_civitai_token())})
 
 
@@ -5182,12 +5242,14 @@ def job_lora_set(p: dict, emit, cancel):
     if "family" in p and p.get("family") in LORA_FAMILIES:
         e["family"] = p["family"]
         e["family_checked"] = True                       # chosen by hand: the Qwen re-sort leaves it alone
+    if isinstance(p.get("explicit"), bool):              # 11-19: the owner's own 18+ mark beats any guess
+        e["explicit"] = p["explicit"]
     lib[fn] = e
     pair = e.get("pair")
     if pair:                                             # keep both halves of a Wan pair in step
         for k, v in lib.items():
             if v.get("pair") == pair and k != fn:
-                for field in ("strength", "always_on", "family"):
+                for field in ("strength", "always_on", "family", "explicit"):
                     if field in p:
                         v[field] = e[field]
     _lora_lib_write(lib)
@@ -5268,8 +5330,10 @@ def job_lora_search(p: dict, emit, cancel):
             return True
         return bool(f and f.startswith("qwen") and any(x.startswith("qwen") for x in famset))
 
+    safe = p.get("safe") is True                         # 11-19: 18+ off on the phone -> no NSFW results or previews
+
     def _page(mode: str, term: str, cur) -> dict:
-        params = [("types", "LORA"), ("nsfw", "true"), ("limit", "20"), ("sort", sort)]
+        params = [("types", "LORA"), ("nsfw", "false" if safe else "true"), ("limit", "20"), ("sort", sort)]
         if period:
             params.append(("period", period))              # a window turns a sort into "trending this week/month"
         if term:
@@ -5283,11 +5347,14 @@ def job_lora_search(p: dict, emit, cancel):
     def _rows(data: dict) -> list:
         out = []
         for m in data.get("items", []):
+            if safe and m.get("nsfw"):
+                continue
             v = (m.get("modelVersions") or [{}])[0]
             rows = _civitai_file_rows(v.get("files"))
             if not rows:
                 continue
-            thumb = next((im.get("url") for im in (v.get("images") or []) if im.get("url")), None)
+            thumb = next((im.get("url") for im in (v.get("images") or [])
+                          if im.get("url") and not (safe and (im.get("nsfwLevel") or 0) > 1)), None)
             base = v.get("baseModel", "")
             out.append({"source": "civitai", "source_id": f"civitai:{m.get('id')}@{v.get('id')}",
                         "name": m.get("name", ""), "base": base, "fits": _fits(base),
@@ -5410,6 +5477,8 @@ def job_lora_add(p: dict, emit, cancel):
                                "triggers": plan.get("triggers") or [],
                                "strength": float(seed) if seed else 1.0, "pair": pair_id,
                                "role": role, "always_on": False}
+            if plan["source"] == "civitai":
+                lib[final.name]["nsfw"] = bool(plan.get("nsfw"))
             added.append({"file": final.name, "family": fam})
         _lora_lib_write(lib)
         if not QUEUE.busy():                             # never under a picture or video that is being drawn

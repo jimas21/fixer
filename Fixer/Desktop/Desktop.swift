@@ -569,12 +569,19 @@ final class Desktop: ObservableObject {
         throw PCError.bad
     }
 
-    /// One page of LoRAs made for `family`, from Civitai or Hugging Face. `cursor` nil = the first page.
-    func loraSearch(source: String, family: String, query: String,
-                    cursor: String?) async throws -> (results: [LoraSearchResult], cursor: String?) {
+    /// One page of LoRAs for `family` (or the wider `families`), from Civitai or Hugging Face. `cursor` nil = the
+    /// first page. `sort` is "popular"/"rated"/"new"; `period` ("week"/"month"/…) makes a sort "trending";
+    /// `category` browses a Civitai tag (e.g. "character").
+    func loraSearch(source: String, family: String, query: String, cursor: String?,
+                    families: [String]? = nil, sort: String = "popular",
+                    period: String? = nil, category: String? = nil)
+        async throws -> (results: [LoraSearchResult], cursor: String?) {
         guard let link else { throw PCError.notPaired }
-        var payload: [String: Any] = ["source": source, "family": family, "query": query]
+        var payload: [String: Any] = ["source": source, "family": family, "query": query, "sort": sort]
         if let cursor { payload["cursor"] = cursor }
+        if let families, !families.isEmpty { payload["families"] = families }
+        if let period { payload["period"] = period }
+        if let category, !category.isEmpty { payload["category"] = category }
         for try await f in call("lora_search", payload, link: link) where f["t"] as? String == "info" {
             let results = (f["loras"] as? [[String: Any]] ?? []).compactMap { LoraSearchResult($0) }
             var next = f["cursor"] as? String

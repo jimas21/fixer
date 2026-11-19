@@ -5118,6 +5118,12 @@ def job_lora_search(p: dict, emit, cancel):
                 seen.add(b)
                 bases.append(b)
     famset = set(fams)
+    # Discovery facets (all optional, safe defaults): how to order, over what window, and a Civitai category tag.
+    sort = {"popular": "Most Downloaded", "rated": "Highest Rated", "new": "Newest"}.get(
+        str(p.get("sort") or "popular"), "Most Downloaded")
+    period = {"day": "Day", "week": "Week", "month": "Month", "year": "Year",
+              "all": "AllTime"}.get(str(p.get("period") or "").lower())
+    category = str(p.get("category") or "").strip()        # a Civitai tag to browse (e.g. "character", "style")
 
     def _fits(base: str) -> bool:                          # which chosen engine a result belongs to (for a badge)
         f = _resolve_family(base or "", None)[0]
@@ -5126,7 +5132,9 @@ def job_lora_search(p: dict, emit, cancel):
         return bool(f and f.startswith("qwen") and any(x.startswith("qwen") for x in famset))
 
     def _page(mode: str, term: str, cur) -> dict:
-        params = [("types", "LORA"), ("nsfw", "true"), ("limit", "20"), ("sort", "Most Downloaded")]
+        params = [("types", "LORA"), ("nsfw", "true"), ("limit", "20"), ("sort", sort)]
+        if period:
+            params.append(("period", period))              # a window turns a sort into "trending this week/month"
         if term:
             params.append((mode, term))                    # "query" matches the title, "tag" matches the concept
         if cur:
@@ -5151,11 +5159,19 @@ def job_lora_search(p: dict, emit, cancel):
                         "thumb": thumb, "triggers": v.get("trainedWords") or []})
         return out
 
-    # The cursor carries the search mode across "load more" so a tag fallback keeps paging as a tag search.
+    # The cursor carries the search mode across "load more", so a tag browse/fallback keeps paging as a tag search.
     mode, real_cursor = "query", cursor
     if isinstance(cursor, str) and cursor.startswith("tag::"):
         mode, real_cursor = "tag", cursor[5:]
-    data = _page(mode, query, real_cursor)
+    if mode == "tag":
+        term = query or category                           # whichever drove this tag page (recomputed on load-more)
+    elif query:
+        term = query
+    elif category:                                         # a category with no words is a tag browse
+        mode, term = "tag", category
+    else:
+        term = ""                                          # nothing typed: just the engine's most-popular
+    data = _page(mode, term, real_cursor)
     items = _rows(data)
     # A typed title search that finds nothing on the first page is retried as a concept tag (loose, like the website).
     if query and mode == "query" and not items and not real_cursor:

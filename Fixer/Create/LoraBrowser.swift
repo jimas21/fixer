@@ -95,6 +95,8 @@ struct LoraSearchResult: Identifiable, Hashable {
     let size: Double
     let downloads: Int
     let thumb: String?
+    let base: String            // Civitai's base-model label (e.g. "Chroma", "Pony", "Wan Video 2.2 T2V-A14B")
+    let fits: Bool              // whether it matches one of the engines being searched
     var id: String { ref }
 
     init?(_ d: [String: Any]) {
@@ -105,6 +107,18 @@ struct LoraSearchResult: Identifiable, Hashable {
         size = ((d["size_mb"] as? NSNumber)?.doubleValue ?? 0) * 1_048_576
         downloads = (d["downloads"] as? NSNumber)?.intValue ?? 0
         thumb = d["thumb"] as? String
+        base = d["base"] as? String ?? ""
+        fits = d["fits"] as? Bool ?? true
+    }
+
+    /// A short engine badge from the base-model label.
+    var engineLabel: String {
+        let b = base.lowercased()
+        if b.contains("chroma") { return "Chroma" }
+        if b.contains("wan") { return "Wan 2.2" }
+        if b.contains("qwen") { return "Qwen" }
+        if ["sdxl", "pony", "illustrious", "noobai"].contains(where: b.contains) { return "SDXL" }
+        return base
     }
 }
 
@@ -168,6 +182,9 @@ struct LoraBrowser: View {
     @State private var tab = "browse"
     @State private var source = "civitai"
     @State private var query = ""
+    @State private var engines: Set<String>        // which engines to search (defaults to the one in use)
+    @State private var category = ""               // a chosen category tag ("" = none)
+    @State private var sort = "popular"            // popular | trending | rated | new
     @State private var results: [LoraSearchResult] = []
     @State private var cursor: String?
     @State private var searching = false
@@ -175,6 +192,17 @@ struct LoraBrowser: View {
     @State private var searchRun = 0
     @State private var linkText = ""
     @State private var request: LoraRequest?
+
+    /// The categories to browse: the label shown, and the Civitai tag sent.
+    private let categories = [("Characters", "character"), ("Style", "style"), ("Concept", "concept"),
+                              ("Clothing", "clothing"), ("Poses", "poses"), ("Background", "background")]
+
+    init(family: String, modelName: String, onAdded: @escaping (LoraEntry) -> Void = { _ in }) {
+        self.family = family
+        self.modelName = modelName
+        self.onAdded = onAdded
+        _engines = State(initialValue: family.isEmpty ? [] : [family])
+    }
 
     var body: some View {
         NavigationStack {
@@ -219,11 +247,32 @@ struct LoraBrowser: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .submitLabel(.search)
-                        .onSubmit { Task { await search(reset: true) } }
+                        .onSubmit { category = ""; Task { await search(reset: true) } }
+                    if !query.isEmpty {
+                        Button { query = ""; Task { await search(reset: true) } } label: {
+                            Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
                     if searching { ProgressView() }
                 }
             } footer: {
-                Text("Showing add-ons made for \(modelName). Others would not work with it.")
+                Text(source == "hf"
+                     ? "Hugging Face add-ons for \(modelName)."
+                     : "Browse the Civitai community — pick engines, a category, or search. Each add-on is checked to fit before it downloads.")
+            }
+            if source == "civitai" {
+                Section("Engines") { engineChips }
+                Section("Sort") {
+                    Picker("Sort", selection: $sort) {
+                        Text("Popular").tag("popular")
+                        Text("Trending").tag("trending")
+                        Text("Top rated").tag("rated")
+                        Text("Newest").tag("new")
+                    }
+                    .pickerStyle(.segmented)
+                }
+                Section("Categories") { categoryChips }
             }
             if let searchNote {
                 Section {
@@ -231,7 +280,7 @@ struct LoraBrowser: View {
                 }
             }
             if !results.isEmpty {
-                Section {
+                Section("Add-ons") {
                     ForEach(results) { r in
                         Button {
                             request = LoraRequest(link: nil, ref: r.ref, title: r.name)
@@ -246,7 +295,70 @@ struct LoraBrowser: View {
                 }
             }
         }
-        .task(id: source) { await search(reset: true) }
+        .task(id: facetKey) { await search(reset: true) }
+    }
+
+    /// A change to the engines, category, sort or source re-runs the search from the first page.
+    private var facetKey: String {
+        source + "|" + engines.sorted().joined(separator: ",") + "|" + category + "|" + sort
+    }
+
+    private var engineChips: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(LoraEntry.families, id: \.self) { f in
+                    facetChip(Self.engineShort(f), on: engines.contains(f)) {
+                        if engines.contains(f) {
+                            if engines.count > 1 { engines.remove(f) }   // keep at least one engine selected
+                        } else {
+                            engines.insert(f)
+                        }
+                    }
+                }
+            }
+            .padding(.vertical, 2)
+        }
+        .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
+    }
+
+    private var categoryChips: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                facetChip("All", on: category.isEmpty) { category = "" }
+                ForEach(categories.indices, id: \.self) { i in
+                    let c = categories[i]
+                    facetChip(c.0, on: category == c.1) {
+                        query = ""
+                        category = (category == c.1) ? "" : c.1
+                    }
+                }
+            }
+            .padding(.vertical, 2)
+        }
+        .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
+    }
+
+    private func facetChip(_ label: String, on: Bool, _ tap: @escaping () -> Void) -> some View {
+        Button(action: tap) {
+            Text(label)
+                .font(.footnote.weight(.medium))
+                .padding(.horizontal, 12).padding(.vertical, 7)
+                .background(Capsule().fill(on ? Fx.accent.opacity(0.18) : Fx.tile))
+                .overlay(Capsule().strokeBorder(on ? Fx.accent : Fx.hairline, lineWidth: on ? 1 : 0.5))
+                .foregroundStyle(on ? Fx.accent : Fx.secondaryText)
+        }
+        .buttonStyle(.plain)
+    }
+
+    static func engineShort(_ f: String) -> String {
+        switch f {
+        case "sdxl": return "SDXL"
+        case "chroma": return "Chroma"
+        case "qwen21": return "Qwen"
+        case "qwen-edit": return "Qwen Edit"
+        case "wan22": return "Wan 2.2"
+        default: return f
+        }
     }
 
     private func resultRow(_ r: LoraSearchResult) -> some View {
@@ -254,7 +366,16 @@ struct LoraBrowser: View {
             LoraThumbView(thumb: r.thumb)
             VStack(alignment: .leading, spacing: 2) {
                 Text(r.name).lineLimit(2)
-                Text(resultDetail(r)).font(.footnote).foregroundStyle(.secondary).lineLimit(1)
+                HStack(spacing: 6) {
+                    if engines.count > 1, !r.engineLabel.isEmpty {
+                        Text(r.engineLabel)
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(Capsule().fill(Fx.tile))
+                            .foregroundStyle(Fx.secondaryText)
+                    }
+                    Text(resultDetail(r)).font(.footnote).foregroundStyle(.secondary).lineLimit(1)
+                }
             }
             Spacer(minLength: 0)
             Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
@@ -279,8 +400,15 @@ struct LoraBrowser: View {
         let words = query.trimmingCharacters(in: .whitespacesAndNewlines)
         searching = true
         if reset { searchNote = nil }
+        let (apiSort, period): (String, String?) =
+            sort == "trending" ? ("popular", "week") :
+            sort == "rated" ? ("rated", nil) :
+            sort == "new" ? ("new", nil) : ("popular", nil)
         do {
-            let page = try await Desktop.shared.loraSearch(source: source, family: family, query: words, cursor: from)
+            let page = try await Desktop.shared.loraSearch(
+                source: source, family: family, query: words, cursor: from,
+                families: engines.isEmpty ? nil : Array(engines),
+                sort: apiSort, period: period, category: category.isEmpty ? nil : category)
             guard run == searchRun else { return }
             if reset {
                 results = page.results
@@ -289,7 +417,7 @@ struct LoraBrowser: View {
                 results.append(contentsOf: page.results.filter { !have.contains($0.id) })
             }
             cursor = page.cursor
-            searchNote = results.isEmpty ? "Nothing found. Try other words." : nil
+            searchNote = results.isEmpty ? "Nothing here. Try other engines, a category, or words." : nil
         } catch {
             guard run == searchRun else { return }
             if !Task.isCancelled { searchNote = error.localizedDescription }

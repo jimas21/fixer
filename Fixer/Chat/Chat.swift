@@ -576,7 +576,13 @@ final class Chat: ObservableObject {
         if ["undo", "undo that", "undo it", "go back"].contains(text.lowercased()) { undo(); return }
 
         let painted = mask != nil
-        let pc = Desktop.shared.isOn
+        let pcOn = Desktop.shared.isOn
+        // 11-19: the computer THINKS only when its chat model is already up. Otherwise this iPhone answers at once
+        // (no 20-60 s wait for the computer's cold start) and the computer warms up meanwhile, taking the next turn.
+        // An iPhone with no model of its own yet waits for the computer, as before. Work (pictures, edits, videos)
+        // still goes to the computer whenever it's on: `pcOn` below.
+        let pc = pcOn && (Desktop.shared.pcBrainReady || !Brain.shared.hasLocalModel)
+        if pcOn, !pc { Desktop.shared.warmUp() }      // at most once a minute: wakes it if the last try found it off
         // The PC keeps nothing between turns, so it gets the conversation and the current photo every time.
         let image = pc ? cgImage : (photoUnseen ? cgImage : nil)
         let history = pc ? pcHistory() : []
@@ -590,7 +596,7 @@ final class Chat: ObservableObject {
                     || Plan.asksForAnother(text, after: conversation.messages)
                     || image != nil      // a photo is open: the brain decides change vs. chat, no word list (11-17)
                 thinkingLabel = photoTurn ? "Writing the prompt…" : "Thinking…"
-                busy = thinkingLabel
+                busy = pcOn && !pc ? "Answering on this iPhone while your computer starts…" : thinkingLabel
                 let prompt = (photoTurn ? Brain.photoTools + "\n\nMy message: " : "") + text
                     + (painted ? "\n(I painted an area of the photo.)" : "")
                     + (pc && image != nil ? "\n(This is the current photo.)" : "")
@@ -643,7 +649,7 @@ final class Chat: ObservableObject {
                     let hasVideo = work.actions.contains { if case .video = $0 { return true } else { return false } }
                     if Rules.shared.askBeforeVideo, hasVideo {
                         pendingPlan = work
-                    } else if pc {
+                    } else if pcOn {
                         startJob(work)                      // the computer works, the chat stays free
                     } else {
                         try await Agent.run(work, chat: self)   // on the phone: one thing at a time, as before
@@ -665,9 +671,14 @@ final class Chat: ObservableObject {
     private func think(_ prompt: String, image: CGImage?, history: [(role: String, text: String)], recap: String,
                        pc: Bool, into replyID: UUID) async throws -> String {
         if pc {
-            do { return try await streamTurn(prompt, image: image, history: history, recap: recap, pc: true, into: replyID) }
+            do {
+                let full = try await streamTurn(prompt, image: image, history: history, recap: recap, pc: true, into: replyID)
+                Desktop.shared.noteBrain(ready: true)  // 11-19: it answered, so its model is up: keep using it
+                return full
+            }
             catch let e as PCError where e.isUnreachable {
                 try Task.checkCancellation()           // stopped (new chat / clear everything): no phone fallback
+                Desktop.shared.noteBrain(ready: false)
                 busy = "Your computer isn't reachable. Answering on this iPhone…"
             }
         }

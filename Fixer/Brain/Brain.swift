@@ -63,8 +63,27 @@ final class Brain: ObservableObject {
 
     var isReady: Bool { state == .ready }
 
+    /// 11-19: true once this model has loaded on this iPhone at least once, i.e. it is downloaded. Only then does
+    /// chat answer here while the computer warms up, and only then is it preloaded (never a surprise download).
+    var hasLocalModel: Bool { UserDefaults.standard.bool(forKey: "brain.local." + Rules.shared.brainID) }
+
+    private var loading: Task<Void, Error>?
+    private var loadingID: String?
+
+    /// Loads the model if it isn't already. 11-19: callers arriving during a load (the preload when the computer
+    /// isn't ready, then the first message) wait for that same load instead of starting a second one.
     func load() async throws {
         let id = Rules.shared.brainID
+        if container != nil, loadedID == id { return }
+        if let loading, loadingID == id { try await loading.value; return }
+        let t = Task { try await self.loadNow(id) }
+        loading = t
+        loadingID = id
+        defer { if loadingID == id { loading = nil; loadingID = nil } }
+        try await t.value
+    }
+
+    private func loadNow(_ id: String) async throws {
         if container != nil, loadedID == id { return }
         container = nil
         chat = nil
@@ -86,6 +105,7 @@ final class Brain: ObservableObject {
             container = c
             loadedID = id
             state = .ready
+            UserDefaults.standard.set(true, forKey: "brain.local." + id)
         } catch {
             state = .failed(error.localizedDescription)
             throw error

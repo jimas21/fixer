@@ -4696,13 +4696,23 @@ def job_brain_warm(p: dict, emit, cancel):
     11-17: this used to warm the PICTURE model on every app open; ComfyUI's cold start and model load (25-110 s)
     then sat in front of the first chat. Pictures warm when the Make tab opens ("for": "make")."""
     repo = BRAIN_ALIASES.get(p.get("brain") or "", p.get("brain") or "") or LAST_BRAIN
+    # 11-19: say at once whether the chat model is already up, before any load. A phone that hears anything but
+    # "ready" answers on itself straight away instead of sitting behind this load (20-60 s cold), and switches back
+    # to this computer when the closing frame below says "ready". Read without the lock: a load in progress holds it.
     choice = gguf_choice(repo)
+
+    def brain_state() -> str:
+        if choice is None:
+            return "ready"                             # not a llama-server model: job_chat answers its own way
+        return "ready" if LLAMA.state() == "ready" and LLAMA.repo == repo else LLAMA.state()
+
+    emit({"t": "info", "brain_state": brain_state()})
     if choice is not None and not LLAMA.paused_for and (_is_moe(repo) or not VIDEO_BUSY.is_set()):
         try:
             LLAMA.ensure(repo, choice, lambda s: None)
         except Exception:
             pass                                       # a failed warm-up costs nothing: the chat loads as before
-    emit({"t": "info", "warm": True})
+    emit({"t": "info", "warm": True, "brain_state": brain_state()})
 
 
 def job_warm_skip(p: dict, emit, cancel):

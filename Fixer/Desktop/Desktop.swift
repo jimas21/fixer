@@ -193,9 +193,11 @@ final class Desktop: ObservableObject {
     /// winner is remembered for 30 s; a request that fails on it clears the memory and the next one races again.
     private nonisolated static let routeMemory = RouteMemory()
 
+    /// 11-19: when NO address answers the knock, the computer is off or out of reach: return none, so the caller fails
+    /// in seconds (and chat answers on the iPhone) instead of trying each address in turn with a 90 s timeout.
     nonisolated static func routes(_ link: PCLink) async -> [String] {
         let all = [link.home, link.away].compactMap { $0 }
-        guard all.count > 1 else { return all }
+        guard !all.isEmpty else { return all }
         if let best = await routeMemory.current(), all.contains(best) { return [best] + all.filter { $0 != best } }
         let winner: String? = await withTaskGroup(of: String?.self) { group in
             for base in all {
@@ -204,18 +206,26 @@ final class Desktop: ObservableObject {
             for await r in group where r != nil { group.cancelAll(); return r }
             return nil
         }
-        guard let winner else { return all }
+        guard let winner else { return [] }
         await routeMemory.set(winner)
         return [winner] + all.filter { $0 != winner }
     }
 
-    /// Any HTTP answer at all means the address is reachable (the content doesn't matter; nothing is sent).
+    /// Any HTTP answer below 500 means the address is reachable (the content doesn't matter; nothing is sent).
+    /// 11-19: a 5xx is Cloudflare saying the tunnel or the computer behind it is down, so it doesn't count.
     private nonisolated static func knock(_ base: String) async -> Bool {
         guard let url = URL(string: base.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + "/") else { return false }
         var req = URLRequest(url: url, timeoutInterval: 6)
         req.httpMethod = "HEAD"
-        do { _ = try await session.data(for: req); return true } catch { return false }
+        do {
+            let (_, response) = try await session.data(for: req)
+            return ((response as? HTTPURLResponse)?.statusCode ?? 0) < 500
+        } catch { return false }
     }
+
+    /// 11-19: HTTP codes that mean "the computer isn't there" (Cloudflare's own 52x pages, gateway errors), handled
+    /// like a failed connection: try the other address, then the iPhone answers. Fixer itself never sends these.
+    private nonisolated static func meansUnreachable(_ code: Int) -> Bool { (502...504).contains(code) || (520...530).contains(code) }
 
     private nonisolated static func exchange(base: String, op: String, body: Data, key: SymmetricKey, link: PCLink,
                                              into out: AsyncThrowingStream<[String: Any], Error>.Continuation,
@@ -234,6 +244,7 @@ final class Desktop: ObservableObject {
         let (bytes, response) = try await session.bytes(for: req)
         guard let http = response as? HTTPURLResponse else { throw PCError.bad }
         if http.statusCode == 401 { throw PCError.refused }
+        if meansUnreachable(http.statusCode) { throw URLError(.cannotConnectToHost) }
         guard http.statusCode == 200 else { throw PCError.server("HTTP \(http.statusCode)") }
 
         var it = bytes.makeAsyncIterator()
@@ -744,15 +755,50 @@ final class Desktop: ObservableObject {
     func warmUp(force: Bool = false) {
         guard isOn, let link, force || leaveSent || (lastWarmUp.map { Date().timeIntervalSince($0) > 60 } ?? true)
         else { return }
+        // 11-19: away longer than the "free after" time: the computer has given its chat model back by now.
+        if let left = leftAt, freeAfterMinutes > 0, Date().timeIntervalSince(left) > Double(freeAfterMinutes * 60) - 30 {
+            brainReadyAt = nil
+        }
+        leftAt = nil
         lastWarmUp = Date()
         leaveSent = false                   // 11-18: coming back always tells the computer, cancelling a pending free
         let frames = call("warm", ["for": "chat", "brain": Rules.shared.pcBrainID,
                                    "free_after_min": freeAfterMinutes], link: link)
-        Task.detached(priority: .userInitiated) { for try await _ in frames {} }
+        Task.detached(priority: .userInitiated) {
+            // 11-19: the first frame says at once whether the chat model is up; the last one comes when it is.
+            // Until "ready" the phone answers on itself, so its own model loads now (only if it is already here).
+            do {
+                for try await f in frames {
+                    if let s = f["brain_state"] as? String {
+                        await MainActor.run { Desktop.shared.noteBrain(ready: s == "ready") }
+                    } else if f["warm"] as? Bool == true {        // a computer from before 11-19: up after the warm
+                        await MainActor.run { Desktop.shared.noteBrain(ready: true) }
+                    }
+                }
+            } catch {
+                await MainActor.run { Desktop.shared.noteBrain(ready: false) }
+            }
+        }
         Task { await refreshConfig() }
     }
 
     private var leaveSent = false
+    private var leftAt: Date?
+
+    /// 11-19: when the computer last said its chat model is up (or last answered a chat). Chat goes to the computer
+    /// only while this is fresh; otherwise this iPhone answers at once and the computer takes over when it's ready.
+    private var brainReadyAt: Date?
+
+    /// True when a chat sent now should go to the computer: its model was up within the last 15 minutes (it unloads
+    /// after 20 idle). False -> answer on this iPhone (see `Chat.think`), unless the iPhone has no model of its own.
+    var pcBrainReady: Bool { brainReadyAt.map { Date().timeIntervalSince($0) < 15 * 60 } ?? false }
+
+    /// Records what the computer said about its chat model. Not ready: the iPhone's own model loads in the
+    /// background (only one already downloaded and loaded before, never a download), so the first answer is quick.
+    func noteBrain(ready: Bool) {
+        brainReadyAt = ready ? Date() : nil
+        if !ready, Brain.shared.hasLocalModel { Task { try? await Brain.shared.load() } }
+    }
 
     /// 11-18: the owner changed "free after" in Settings: tells the computer the number and nothing else. ("for":
     /// "settings" loads no model and does not start a queue job; an older computer ignores the unknown value.)
@@ -774,6 +820,7 @@ final class Desktop: ObservableObject {
     func leave() {
         guard isOn, let link else { return }
         leaveSent = true
+        leftAt = Date()
         let app = UIApplication.shared
         let box = BackgroundTaskBox()
         box.id = app.beginBackgroundTask(withName: "fixer.leave") { Task { @MainActor in box.end() } }

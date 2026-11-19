@@ -34,12 +34,14 @@ struct FixerApp: App {
             // Opening Fixer wakes the computer: the chat model loads now, so the first message doesn't wait.
             // 11-17: and finished work it kept for this iPhone while Fixer was closed is collected where it was asked for.
             if now == .active {
+                Rules.shared.noteBack()                  // 11-19: away 15 min or more -> Explicit back to its default
                 Desktop.shared.warmUp()
                 Task { await JobInbox.shared.sweep() }
             }
             Privacy.coverScreen(now != .active)        // the app-switcher snapshot shows nothing
             // Settings are rewritten as a new file (which drops the mark), so it's set again on leaving the app.
             if now == .background {
+                Rules.shared.noteLeft()
                 Privacy.excludeFromBackup()
                 Desktop.shared.leave()                   // 11-18: the computer may give its memory back early
                 LibraryStore.shared.lock()               // the Library opens again only with Face ID or the passcode

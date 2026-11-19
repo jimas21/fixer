@@ -3549,8 +3549,11 @@ EXPLICIT_PATTERN_DEFAULT = (r"\b(nsfw|nude|nudes|nudity|naked|topless|bottomless
 
 
 def _is_explicit(text: str) -> bool:
-    """True when the words are explicit (phone_config "explicit_pattern", editable without an app update)."""
+    """True when the words are explicit (phone_config "explicit_pattern", editable without an app update). Always
+    False inside a job the phone sent with Explicit off (11-19), so nothing explicit is picked from the words."""
     import re
+    if getattr(_TL, "safe", False):
+        return False
     try:
         cfg = json.loads(PHONE_CONFIG.read_text(encoding="utf-8"))
     except Exception:
@@ -3597,6 +3600,8 @@ def _picture_recipe(p: dict) -> dict | None:
     a = _auto_models()
     flag = p.get("explicit")                           # 11-17: the brain's own call (newer phones); old ones: the words
     explicit = flag is True or _is_explicit(p.get("prompt") or "")     # only a true flag adds to the words; false = "not said"
+    if p.get("safe") is True:                          # 11-19: Explicit off on the phone (this also runs off the job thread)
+        explicit = False
     return _first_ready(a["picture_explicit"] if explicit else a["picture"])
 
 
@@ -5826,6 +5831,28 @@ def _target(op: str, payload: dict):
     return target
 
 
+def _safe_payload(op: str, p):
+    """11-19: the phone's Explicit switch is off (it starts off every time the app opens): this job uses no explicit
+    model, editor or add-on, whatever the chat model's call, Make's menus or the words say. The words are never
+    changed. Old phones send no "safe" and keep the old behaviour."""
+    if not isinstance(p, dict) or p.get("safe") is not True:
+        return p
+    p = dict(p)
+    if op == "video":
+        p["explicit"] = "off"
+    elif op == "image":
+        p["explicit"] = False
+    vals = p.get("values")
+    if isinstance(vals, dict):
+        vals = dict(vals)
+        vals["explicit"] = "Off"
+        vals.pop("brain_explicit", None)
+        if vals.get("editor") == "qwen-explicit":
+            vals["editor"] = "qwen"
+        p["values"] = vals
+    return p
+
+
 def _record_timing(job, rec: dict, err) -> None:
     """Keeps one finished job's numbers (memory only, no words). Warm-ups, removals and stopped jobs are left out."""
     if job.hidden or job.op == "remove_model" or job.stop_reason or job.started is None:
@@ -5866,13 +5893,14 @@ async def queue_runner(app):
                     QUEUE._announce()
                     job.publish({"t": "status", "v": "Starting…"})
                     LAST_USE = time.monotonic()
-                    payload = job.payload
+                    payload = _safe_payload(job.op, job.payload)
                     err = None
                     rec = _new_timing_record(job.kind)
                     base = _target(job.op, payload)
 
                     def timed(payload_, emit_, cancel_, _base=base, _job=job, _rec=rec):
                         _TL.rec = _rec
+                        _TL.safe = isinstance(payload_, dict) and payload_.get("safe") is True
                         try:
                             if _job.op == "cutout":
                                 _timing(model=CUT_GENERAL)
@@ -5882,6 +5910,7 @@ async def queue_runner(app):
                             return _base(payload_, emit_, cancel_)
                         finally:
                             _TL.rec = None
+                            _TL.safe = False
                     try:
                         await loop.run_in_executor(None, timed, payload, job.emit, job.cancel)
                     except Exception as e:                   # noqa: BLE001

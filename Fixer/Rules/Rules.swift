@@ -166,6 +166,41 @@ final class Rules: ObservableObject {
     /// explicit, decided on the computer). the owner 11-17: a switch, so his wording is never second-guessed.
     @Published var explicitVideo: String = Rules.d.string(forKey: "rules.explicitVideo") ?? "off" {
         didSet { Self.d.set(explicitVideo, forKey: "rules.explicitVideo") } }
+    /// What a video is actually sent with: always "off" while Explicit is off for this session.
+    var videoExplicitNow: String { explicitNow ? explicitVideo : "off" }
+
+    /// 11-19 (the owner: default to safe "unless toggled each session"): Explicit is off every time Fixer opens, and
+    /// again after it has been away for `explicitAwayLimit`, unless "Always explicit" is on in Settings. While it is
+    /// off nothing explicit is used anywhere: Make hides its explicit chips, the explicit editor and add-ons are off,
+    /// and every picture or video job tells the computer "safe", so it never picks an explicit model from the words.
+    /// Never stored: a new session always starts from `alwaysExplicit`.
+    @Published var explicitNow: Bool = Rules.d.bool(forKey: "rules.alwaysExplicit")
+    @Published var alwaysExplicit: Bool = Rules.d.bool(forKey: "rules.alwaysExplicit") {
+        didSet {
+            Self.d.set(alwaysExplicit, forKey: "rules.alwaysExplicit")
+            explicitNow = alwaysExplicit
+        } }
+    static let explicitAwayLimit: TimeInterval = 15 * 60
+    private var leftAt: Date?
+
+    /// The app went to the background.
+    func noteLeft() { leftAt = Date() }
+
+    /// The app is back: a long absence starts a new session, so Explicit goes back to its default.
+    func noteBack() {
+        defer { leftAt = nil }
+        guard let leftAt, Date().timeIntervalSince(leftAt) >= Self.explicitAwayLimit else { return }
+        if explicitNow != alwaysExplicit { explicitNow = alwaysExplicit }
+        if !explicitNow { resetExplicitChoices() }
+    }
+
+    /// The explicit settings Make keeps go back to off, so turning Explicit on later starts from nothing explicit
+    /// (not from whatever an earlier session left switched on).
+    func resetExplicitChoices() {
+        if explicitVideo != "off" { explicitVideo = "off" }
+        Self.d.set("Off", forKey: "make.explicitAddon")
+        if Self.d.string(forKey: "make.editor") == "qwen-explicit" { Self.d.set("auto", forKey: "make.editor") }
+    }
     @Published var pcSteps: Int = Rules.d.object(forKey: "rules.pcSteps") as? Int ?? 4 {
         didSet { Self.d.set(pcSteps, forKey: "rules.pcSteps") } }
     @Published var pcGuidance: Double = Rules.double("rules.pcGuidance", 1.0) {
@@ -204,5 +239,7 @@ final class Rules: ObservableObject {
     var editFilter: FilterSetting { FilterSetting(revealing: editRevealing, explicit: min(editExplicit, Self.editExplicitCap)) }
     var newFilter: FilterSetting { FilterSetting(revealing: newRevealing, explicit: newExplicit) }
 
-    private init() {}
+    private init() {
+        if !explicitNow { resetExplicitChoices() }       // 11-19: every launch starts safe unless "Always explicit"
+    }
 }

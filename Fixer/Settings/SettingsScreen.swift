@@ -11,7 +11,6 @@ struct SettingsScreen: View {
     @State private var connection: String?
     @EnvironmentObject private var router: AppRouter
     @AppStorage("pc.freeAfterMinutes") private var freeAfter = 5     // 11-18: minutes after leaving the app (0 = never)
-    @AppStorage("make.explicit") private var makeExplicit = false   // shows the explicit chips in Make (11-18)
 
     private var chatSlot: ModelSlot { ModelSlot.chat() }
     private var imageSlot: ModelSlot { ModelSlot.image() }
@@ -56,11 +55,13 @@ struct SettingsScreen: View {
                 }
 
                 Section {
-                    Toggle("Explicit options in Make", isOn: $makeExplicit)
+                    Toggle("Explicit", isOn: $rules.explicitNow)
+                    Toggle("Always explicit", isOn: $rules.alwaysExplicit)
                 } footer: {
-                    Text("On: Make adds explicit models and words as their own chips, kept apart from the everyday "
-                         + "ones. Off: they stay out of sight. This only changes what Make offers — it is not a content "
-                         + "filter.")
+                    Text("Explicit is off each time Fixer opens, and after 15 minutes away: pictures and videos use "
+                         + "only the everyday models and settings, and Make hides its explicit chips. Turn it on for "
+                         + "this session here, from the + in the chat, or at the top of Make. Always explicit starts "
+                         + "every session with it on.")
                 }
 
                 TidyFreeSection()

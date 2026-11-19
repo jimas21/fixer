@@ -129,7 +129,7 @@ enum Agent {
             s.queued = r.queued
             s.preview = r.preview
             if creative {
-                s.explicit = plan.explicit
+                s.explicit = Rules.shared.explicitNow ? plan.explicit : false   // 11-19: off this session = never
                 s.enhance = enhance && remote
             }
             return s
@@ -250,7 +250,8 @@ enum Agent {
                 if fromPhoto, start == nil { throw noPhoto() }
                 r.status("Creating video…")
                 // The chat model's own call when it made one; otherwise the computer decides from the words.
-                let explicitWord = plan.explicit.map { $0 ? "on" : "off" } ?? "auto"
+                // 11-19: always "off" while Explicit is off this session.
+                let explicitWord = !Rules.shared.explicitNow ? "off" : (plan.explicit.map { $0 ? "on" : "off" } ?? "auto")
                 let data = try await Desktop.shared.video(prompt: prompt.isEmpty ? "natural, gentle motion" : prompt,
                                                           start: start, explicit: explicitWord, slot: r.slot, queued: r.queued,
                                                           status: { msg in Task { @MainActor in r.status(msg) } },

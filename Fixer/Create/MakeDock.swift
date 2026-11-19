@@ -290,13 +290,18 @@ extension CreateScreen {
             .photosPicker(isPresented: $showVideoPhotos, selection: $videoPhotoPick, matching: .images)
             .accessibilityLabel("Start photo: \(videoPhoto == nil ? "none" : "added")")
             Menu {
-                Picker("Explicit videos", selection: $rules.explicitVideo) {
-                    Text("Off").tag("off")
-                    Text("On").tag("on")
-                    Text("Auto").tag("auto")
+                if makeExplicit {
+                    Picker("Explicit videos", selection: $rules.explicitVideo) {
+                        Text("Off").tag("off")
+                        Text("On").tag("on")
+                        Text("Auto").tag("auto")
+                    }
+                } else {
+                    Text("Explicit is off for this session")
+                    Button { rules.explicitNow = true } label: { Label("Turn Explicit on", systemImage: "flame") }
                 }
-            } label: { MakeTile(caption: "Explicit", value: rules.explicitVideo.capitalized) }
-                .accessibilityLabel("Explicit videos: \(rules.explicitVideo)")
+            } label: { MakeTile(caption: "Explicit", value: rules.videoExplicitNow.capitalized) }
+                .accessibilityLabel("Explicit videos: \(rules.videoExplicitNow)")
         }
     }
 
@@ -308,10 +313,10 @@ extension CreateScreen {
                 Picker("Editor", selection: $editor) {
                     Text("Auto").tag("auto")
                     Text("Qwen Edit").tag("qwen")
-                    Text("Qwen Edit Explicit").tag("qwen-explicit")
+                    if makeExplicit { Text("Qwen Edit Explicit").tag("qwen-explicit") }
                     if hasQwen21 { Text("Qwen-Image 2.1").tag("qwen21") }
                 }
-                if editor == "qwen21" {
+                if editor == "qwen21", makeExplicit {
                     if addonOptions.count > 1 {
                         Picker("Explicit add-on", selection: Binding(get: { addonValue }, set: { explicitAddon = $0 })) {
                             ForEach(addonOptions, id: \.self) { Text($0).tag($0) }
@@ -433,7 +438,7 @@ extension CreateScreen {
         startTick += 1
         Self.hideKeyboard()
         let style = applied?.kind == "video" ? applied?.id : nil
-        store.startVideo(prompt: assembledVideoPrompt, start: videoPhoto, explicit: rules.explicitVideo,
+        store.startVideo(prompt: assembledVideoPrompt, start: videoPhoto, explicit: rules.videoExplicitNow,
                          parent: videoPhotoID, action: videoPhoto == nil ? "video" : "animate",
                          style: style,
                          loras: activeLoras.map { LoraSetting(name: $0.name, strength: $0.strength, triggers: loraSendTriggers($0.name)) },

@@ -75,7 +75,9 @@ struct ModelCardSheet: View {
     @State private var loaded = false
 
     private var cards: [ModelCard] {
-        [ModelCard(id: "auto", name: "Auto", note: "Picks by your words: explicit or not, new picture or edit.")]
+        [ModelCard(id: "auto", name: "Auto", note: rules.explicitNow
+                   ? "Picks by your words: explicit or not, new picture or edit."
+                   : "Picks by your words: new picture or edit. Explicit is off for this session.")]
             + recipes.map { ModelCard(id: $0.id, name: $0.name, note: $0.note ?? "Used for every picture you ask for in the chat.") }
     }
 
@@ -115,7 +117,9 @@ struct ModelCardSheet: View {
                     Section {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Wan 2.2 14B")
-                            Text("The explicit add-on is decided by your words.").font(.footnote).foregroundStyle(.secondary)
+                            Text(rules.explicitNow ? "The explicit add-on is decided by your words."
+                                 : "No explicit add-on: Explicit is off for this session.")
+                                .font(.footnote).foregroundStyle(.secondary)
                         }
                     } header: {
                         Text("Video")

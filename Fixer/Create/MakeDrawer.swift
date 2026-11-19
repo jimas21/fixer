@@ -22,7 +22,9 @@ extension CreateScreen {
 
     @ViewBuilder
     func pictureSettingsPage(_ r: CreateRecipe) -> some View {
-        let settings = r.controls.filter { !$0.advanced && !["prompt", "shape", "count"].contains($0.key) }
+        // 11-19: the model's own Explicit add-on menu only shows while Explicit is on this session.
+        let settings = r.controls.filter { !$0.advanced && !["prompt", "shape", "count"].contains($0.key)
+                                           && (makeExplicit || $0.key != "explicit") }
         if !settings.isEmpty {
             drawerSection(nil) {
                 ForEach(settings) { c in
@@ -428,7 +430,7 @@ extension CreateScreen {
         VStack(alignment: .leading, spacing: 10) {
             DisclosureGroup("Advanced") {
                 VStack(alignment: .leading, spacing: 12) {
-                    ForEach(r.controls.filter { $0.advanced }) { c in advancedControl(c) }
+                    ForEach(r.controls.filter { $0.advanced && (makeExplicit || $0.key != "explicit") }) { c in advancedControl(c) }
                 }
                 .padding(.top, 8)
             }
@@ -517,15 +519,17 @@ extension CreateScreen {
             Text("Longer videos are made five seconds at a time, each part continuing from the last, so a 30-second video takes about six times as long as a 5-second one.")
                 .font(.caption).foregroundStyle(Fx.secondaryText)
         }
-        drawerSection("Explicit videos") {
-            Picker("Explicit videos", selection: $rules.explicitVideo) {
-                Text("Off").tag("off")
-                Text("On").tag("on")
-                Text("Auto").tag("auto")
+        if makeExplicit {
+            drawerSection("Explicit videos") {
+                Picker("Explicit videos", selection: $rules.explicitVideo) {
+                    Text("Off").tag("off")
+                    Text("On").tag("on")
+                    Text("Auto").tag("auto")
+                }
+                .pickerStyle(.segmented)
+                Text("Off never uses the explicit add-on. On always does. Auto decides from your words. This is for videos made here; the chat always decides by your words.")
+                    .font(.caption).foregroundStyle(Fx.secondaryText)
             }
-            .pickerStyle(.segmented)
-            Text("Off never uses the explicit add-on. On always does. Auto decides from your words. This is for videos made here; the chat always decides by your words.")
-                .font(.caption).foregroundStyle(Fx.secondaryText)
         }
         recipeWords
         drawerSection(nil) {

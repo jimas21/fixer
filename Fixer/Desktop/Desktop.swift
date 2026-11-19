@@ -829,6 +829,9 @@ final class Desktop: ObservableObject {
         var p = payload
         if let slot { p["slot"] = slot }
         p["ack"] = true
+        // 11-19: every picture, change and video says whether Explicit is off this session; the computer then uses no
+        // explicit model, editor or add-on for it, whatever the words or the chat model's call.
+        if ["image", "video", "comfy_run"].contains(op) { p["safe"] = !Rules.shared.explicitNow }
         let first = call(op, p, link: link)
         let single = op != "comfy_run"
         return AsyncThrowingStream { continuation in

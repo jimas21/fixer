@@ -25,6 +25,7 @@ struct QuietComposer: View {
     private var elsewhere: Int { chat.jobs.filter { $0.conversation != chat.conversation.id }.count }
     private var showThink: Bool { desktop.isOn && rules.thinkMode }
     private var showEnhance: Bool { desktop.isOn && chatEnhance }
+    private var showExplicit: Bool { desktop.isOn && rules.explicitNow }
     private var workingImage: UIImage? { attachment ?? chat.photo }
     private var showTopLine: Bool { workingImage != nil || elsewhere > 0 }
 
@@ -123,11 +124,18 @@ struct QuietComposer: View {
                           label: "Enhance my prompt is on. Tap to turn it off") { chatEnhance = false }
                     .transition(.scale(scale: 0.9).combined(with: .opacity))
             }
+            if showExplicit {
+                StatePill(systemImage: "flame", label: "Explicit is on. Tap to turn it off", warm: true) {
+                    rules.explicitNow = false
+                }
+                .transition(.scale(scale: 0.9).combined(with: .opacity))
+            }
             Spacer(minLength: 0)
             SendStopButton(isStop: mode == .stop, enabled: mode != .idle, action: primary)
         }
         .fxAnimation(Motion.pop, value: showThink)
         .fxAnimation(Motion.pop, value: showEnhance)
+        .fxAnimation(Motion.pop, value: showExplicit)
     }
 
     private func primary() {
@@ -196,15 +204,16 @@ struct ComposerPhotoChip: View {
 struct StatePill: View {
     let systemImage: String
     let label: String
+    var warm = false                                     // Explicit: the warm colours Make's explicit chips use
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
             ZStack {
-                Circle().fill(Fx.onTint).frame(width: 36, height: 36)
+                Circle().fill(warm ? Fx.explicitFill : Fx.onTint).frame(width: 36, height: 36)
                 Image(systemName: systemImage)
                     .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(Fx.accentSoftText)
+                    .foregroundStyle(warm ? Fx.explicitText : Fx.accentSoftText)
             }
             .frame(width: 44, height: 44)
             .contentShape(Rectangle())
@@ -232,6 +241,7 @@ struct ComposerPlusMenu: View {
             if desktop.isOn {
                 Toggle(isOn: $rules.thinkMode) { Label("Think", systemImage: "brain") }
                 Toggle(isOn: $chatEnhance) { Label("Enhance my prompt", systemImage: "sparkles") }
+                Toggle(isOn: $rules.explicitNow) { Label("Explicit", systemImage: "flame") }
                 Divider()
                 Button { onQueue() } label: { Label("Queue", systemImage: "list.number") }
             }

@@ -259,8 +259,9 @@ extension CreateScreen {
 
     func explicitSwitchChanged(_ on: Bool) {
         guard !on else { return }                  // turning it on changes nothing by itself: the recipe you pick sets things
-        rules.explicitVideo = "off"
+        rules.resetExplicitChoices()
         explicitAddon = "Off"
+        if editor == "qwen-explicit" { editor = "auto" }
         if let c = recipe?.controls.first(where: { $0.key == "explicit" }), c.options.contains("Off") {
             menus["explicit"] = "Off"
         }

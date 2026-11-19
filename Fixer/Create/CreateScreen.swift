@@ -424,7 +424,7 @@ struct CreateScreen: View {
     // Make's compose sheet (11-18): recipes, quick picks and what has the keyboard.
     @ObservedObject var recipeStore = MakeRecipeStore.shared
     @EnvironmentObject var keyboard: KeyboardObserver
-    @AppStorage("make.explicit") var makeExplicit = false              // adds the explicit chips (toggled in Settings)
+    var makeExplicit: Bool { rules.explicitNow }      // 11-19: this session's Explicit switch (off each time Fixer opens)
     @FocusState var focus: MakeField?
     @State var target = MakeTarget.new                 // new: the form makes a picture. change: it changes the one on the canvas
     @State var stylePrefix = ""                        // a recipe's opening words, shown and editable
@@ -745,7 +745,7 @@ struct CreateScreen: View {
                 Section("Keep the rest of the photo") {
                     Text("Auto").tag("auto")
                     Text("Qwen Edit").tag("qwen")
-                    Text("Qwen Edit Explicit").tag("qwen-explicit")
+                    if makeExplicit { Text("Qwen Edit Explicit").tag("qwen-explicit") }
                     if hasQwen21 { Text("Qwen-Image 2.1").tag("qwen21") }
                 }
                 Section("Redraw it with") {
@@ -784,7 +784,7 @@ struct CreateScreen: View {
     /// settings; this one is for the photo editor.)
     @ViewBuilder
     var explicitAddonPicker: some View {
-        if editor == "qwen21" {
+        if editor == "qwen21", makeExplicit {
             VStack(alignment: .leading, spacing: 2) {
                 if addonOptions.count > 1 {
                     Picker("Explicit add-on", selection: Binding(get: { addonValue }, set: { explicitAddon = $0 })) {
@@ -807,7 +807,7 @@ struct CreateScreen: View {
             Picker("Editor", selection: $editor) {
                 Text("Auto").tag("auto")
                 Text("Qwen Edit").tag("qwen")
-                Text("Qwen Edit Explicit").tag("qwen-explicit")
+                if makeExplicit { Text("Qwen Edit Explicit").tag("qwen-explicit") }
                 if hasQwen21 { Text("Qwen-Image 2.1").tag("qwen21") }
             }
             .pickerStyle(.menu)
@@ -821,7 +821,9 @@ struct CreateScreen: View {
         case "qwen": "Best at following you: poses, clothes, backgrounds, and combining up to 3 photos. About 20-40 s."
         case "qwen-explicit": "The same editor trained on explicit content: nudity and adult changes come out as asked."
         case "qwen21": "The new Qwen-Image 2.1: the same model as its pictures, so it starts at once after one. Use the Explicit add-on switch below for nudity."
-        default: "Picks for you: Qwen-Image 2.1 for pictures made with it, Qwen Edit Explicit when your words are explicit or you're on an explicit model, otherwise Qwen Edit."
+        default: makeExplicit
+            ? "Picks for you: Qwen-Image 2.1 for pictures made with it, Qwen Edit Explicit when your words are explicit or you're on an explicit model, otherwise Qwen Edit."
+            : "Picks for you: Qwen-Image 2.1 for pictures made with it, otherwise Qwen Edit. Explicit is off for this session."
         }
     }
 
@@ -1090,7 +1092,7 @@ struct MakeMediaViewer: View {
         a.cancel = { store.cancelRevise() }
         a.animate = { item, words in
             guard case .memory(let ui) = item.source else { return }
-            store.startVideo(prompt: words, start: ui, explicit: Rules.shared.explicitVideo,
+            store.startVideo(prompt: words, start: ui, explicit: Rules.shared.videoExplicitNow,
                              parent: item.libraryID, action: "animate", seconds: videoSeconds)
         }
         // No "send to chat" (11-17): work made in Make stays in Make; the chat would switch models to pick it up.

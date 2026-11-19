@@ -46,9 +46,9 @@ struct QuietComposer: View {
             field
             controls
         }
-        .padding(.top, 6).padding(.horizontal, 6).padding(.bottom, 4)
+        .padding(.top, 6).padding(.horizontal, 6).padding(.bottom, 6)
         .glass(radius: Fx.composerRadius, tint: Fx.glass)
-        .padding(.horizontal, 8)
+        .padding(.horizontal, 16)                       // the same side margins as the tab bar below it
         .padding(.bottom, 8)
         .fxAnimation(Motion.pop, value: showTopLine)
         .sensoryFeedback(.impact(weight: .light), trigger: stopTick)
@@ -81,7 +81,7 @@ struct QuietComposer: View {
             }
             Spacer(minLength: 0)
         }
-        .padding(.leading, 8).padding(.trailing, 4)
+        .padding(.horizontal, 4)                        // lines up with the words and the + button
         .frame(minHeight: 48)
     }
 
@@ -95,7 +95,7 @@ struct QuietComposer: View {
             .font(.body)
             .submitLabel(.return)
             .focused(typing)
-            .padding(.horizontal, 10)
+            .padding(.horizontal, 4)
             .padding(.vertical, 8)
             .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
             .background {

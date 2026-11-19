@@ -19,15 +19,18 @@ struct ModelChip: View {
 
     var body: some View {
         Button { showCards = true } label: {
-            HStack(spacing: 3) {
-                Text(title).font(.subheadline).lineLimit(1).truncationMode(.tail)
-                Image(systemName: "chevron.down").font(.system(size: 11, weight: .bold)).foregroundStyle(Fx.secondaryText)
+            HugUpTo(limit: 170) {
+                HStack(spacing: 3) {
+                    Text(title).font(.subheadline).lineLimit(1).truncationMode(.tail)
+                    Image(systemName: "chevron.down").font(.system(size: 11, weight: .bold)).foregroundStyle(Fx.secondaryText)
+                }
+                .foregroundStyle(.primary)
+                .padding(.horizontal, 12)
+                .frame(minHeight: 36)
+                .background(Capsule().fill(Fx.tile))
             }
-            .foregroundStyle(.primary)
-            .padding(.horizontal, 12)
-            .frame(minHeight: 36)
-            .background(Capsule().fill(Fx.tile))
-            .frame(maxWidth: 170, minHeight: 44)
+            .padding(.horizontal, 4)                    // with the round buttons' own 4 pt, an even 8 pt between all
+            .frame(minHeight: 44)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -38,6 +41,22 @@ struct ModelChip: View {
             guard desktop.isOn else { return }
             recipes = await desktop.imageRecipes()
         }
+    }
+}
+
+/// Exactly as wide as its content, up to `limit`. (`.frame(maxWidth:)` would take the whole limit and float the
+/// capsule in the middle of it, pushing the composer's buttons apart.)
+private struct HugUpTo: Layout {
+    var limit: CGFloat
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard let content = subviews.first else { return .zero }
+        return content.sizeThatFits(ProposedViewSize(width: Swift.min(proposal.width ?? limit, limit), height: proposal.height))
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        subviews.first?.place(at: CGPoint(x: bounds.minX, y: bounds.midY), anchor: .leading,
+                              proposal: ProposedViewSize(width: bounds.width, height: bounds.height))
     }
 }
 

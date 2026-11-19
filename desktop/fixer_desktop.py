@@ -3928,18 +3928,79 @@ def _photo_size(img, megapixels: float = 1.0) -> tuple[int, int]:
     return max(256, int(w * scale) // 16 * 16), max(256, int(h * scale) // 16 * 16)
 
 
+def _strip_prompt_weighting(text: str) -> str:
+    r"""Remove ComfyUI emphasis/attention weighting while keeping the words: '(phrase:1.3)' -> 'phrase' (any float
+    weight), '(phrase)' / '((phrase))' emphasis -> 'phrase', '[phrase]' de-emphasis -> 'phrase'. Escaped '\(' '\)'
+    (and '\[' '\]') survive as the literal characters. Char-scan, no dependencies, robust to multiple and nested
+    groups. Used only for the Qwen text encoders, which ignore this syntax and would otherwise read the parentheses
+    and numbers as part of the prompt; CLIPTextEncode (Chroma/SDXL) honours it, so those are left alone."""
+    if not text:
+        return text
+    s = str(text)
+    out: list[str] = []
+    opens: list[int] = []                      # index in `out` where each still-open ( or [ group's content begins
+    i, n = 0, len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\" and i + 1 < n and s[i + 1] in "()[]":
+            out.append(s[i + 1])               # an escaped bracket is a literal character, not a group delimiter
+            i += 2
+            continue
+        if c in "([":
+            opens.append(len(out))             # drop the delimiter itself; remember where its content starts
+        elif c == ")":
+            if opens:
+                start = opens.pop()
+                tail = "".join(out[start:])
+                m = re.search(r":\s*[0-9]+(?:\.[0-9]+)?\s*$", tail)   # a trailing (phrase:1.3) weight, if any
+                if m:
+                    del out[start + m.start():]
+            else:
+                out.append(c)                  # an unmatched ) stays literal
+        elif c == "]":
+            if opens:
+                opens.pop()                    # [de-emphasis]: drop the brackets, keep the words
+            else:
+                out.append(c)
+        else:
+            out.append(c)
+        i += 1
+    r = "".join(out)
+    r = re.sub(r"[ \t]+", " ", r)               # collapse the doubled spaces a removed group can leave
+    r = re.sub(r"\s+,", ",", r)                 # no space before a comma
+    r = re.sub(r",\s*(?=,)", "", r)             # collapse commas doubled by an emptied group
+    r = re.sub(r",(?=\S)", ", ", r)             # one space after each comma
+    return r.strip(" \t\n,")                    # no dangling commas or space at the ends
+
+
+def _model_prompt_grammar(builder: str, prompt: str, negative: str | None) -> tuple[str, str | None]:
+    """The single place per-model prompt grammar lives. Today it only strips the ComfyUI weighting the Qwen text
+    encoders ignore (qwen21 text-to-image, and the Qwen edit encoders); SDXL/Chroma use CLIPTextEncode, which honours
+    the weighting, so they pass through untouched. Future per-model phrasing (tag-vs-prose rewriting, etc.) belongs
+    here too, keyed off `builder`."""
+    if str(builder or "").startswith("qwen"):
+        prompt = _strip_prompt_weighting(prompt)
+        if negative:
+            negative = _strip_prompt_weighting(negative)
+    return prompt, negative
+
+
 def _recipe_workflow(r: dict, v: dict, w: int, h: int, seed: int, loras: list | None = None) -> dict:
     """The ComfyUI workflow for recipe `r` with values `v` (the recipe's defaults filled in by the caller)."""
     prompt = v.get("prompt") or "high quality photo"
-    if r.get("builder") == "qwen21":
-        return _qwen21_workflow(prompt, w, h, seed, v.get("cfg", 1.0), v.get("negative") or "",
+    builder = r.get("builder", "")
+    # Builder identity and the finished prompt (after _apply_toggles and the LoRA-trigger appends upstream) meet here,
+    # just before the per-builder workflow is built, so this is where per-model grammar is applied.
+    prompt, negative = _model_prompt_grammar(builder, prompt, v.get("negative"))
+    if builder == "qwen21":
+        return _qwen21_workflow(prompt, w, h, seed, v.get("cfg", 1.0), negative or "",
                                 _qwen21_explicit(v.get("explicit"), v.get("brain_explicit"), v.get("base_recipe")),
                                 loras)
-    if r.get("builder") == "chroma":
-        return _chroma_workflow(prompt, v.get("negative") or "", w, h, seed, v["steps"], v["cfg"], v["sampler"],
+    if builder == "chroma":
+        return _chroma_workflow(prompt, negative or "", w, h, seed, v["steps"], v["cfg"], v["sampler"],
                                 v["scheduler"], v["shift"], loras)
-    if r.get("builder") == "sdxl":
-        return _sdxl_workflow(prompt, v.get("negative") or r.get("default_negative", ""), w, h, seed, v["steps"],
+    if builder == "sdxl":
+        return _sdxl_workflow(prompt, negative or r.get("default_negative", ""), w, h, seed, v["steps"],
                               v["cfg"], v["sampler"], v["scheduler"], loras, ckpt=r["ckpt"])
     raise UserFacing("That picture model isn't available.")
 
@@ -4349,7 +4410,8 @@ def _create_pictures(r, v, w, h, count, seed, loras, photo, photo_name, mode, em
                 raise UserFacing("Qwen-Image 2.1 isn't all on your computer yet, so nothing was changed.")
             eloras, etrig = _job_loras(v.get("loras"), "qwen21")
             lora = _qwen21_explicit(v.get("explicit"), None, recipe_id)
-            wf = _qwen21_edit_workflow(_with_triggers(prompt, etrig), [photo_name, *extra_names], s_i, lora,
+            eprompt, _ = _model_prompt_grammar("qwen21", _with_triggers(prompt, etrig), None)
+            wf = _qwen21_edit_workflow(eprompt, [photo_name, *extra_names], s_i, lora,
                                        loras=eloras, reference_size=(w, h) if mode == "reference" else None)
             budget = int(_tune("qwen21_edit_resolution", 1024))
             _timing(model=QWEN21_NAME, recipe=recipe_id, editor="qwen21", explicit=bool(lora), steps=8, count=count,
@@ -4366,7 +4428,8 @@ def _create_pictures(r, v, w, h, count, seed, loras, photo, photo_name, mode, em
                 raise UserFacing("Editing a photo needs a photo editor model on your computer.")
             qw, qh = _photo_size(photo) if mode == "edit" else (w, h)
             eloras, etrig = _job_loras(v.get("loras"), "qwen-edit", allow_explicit=explicit)   # plain editor: never 18+
-            wf = _qwen_edit_workflow(_with_triggers(prompt, etrig), [photo_name, *extra_names], s_i, qw, qh,
+            eprompt, _ = _model_prompt_grammar("qwen-edit", _with_triggers(prompt, etrig), None)
+            wf = _qwen_edit_workflow(eprompt, [photo_name, *extra_names], s_i, qw, qh,
                                      explicit, loras=eloras)
             _timing(model="Qwen Rapid-AIO" if explicit else "Qwen Edit 2511", recipe=recipe_id,
                     editor="qwen-explicit" if explicit else "qwen", explicit=explicit, mp=qw * qh / 1e6, steps=4,
@@ -4374,7 +4437,8 @@ def _create_pictures(r, v, w, h, count, seed, loras, photo, photo_name, mode, em
         elif photo_name:
             pw, ph = _photo_size(photo)
             if builder == "qwen21":
-                wf = _qwen21_workflow(prompt, pw, ph, s_i, v.get("cfg", 1.0), v.get("negative") or "",
+                qprompt, qneg = _model_prompt_grammar("qwen21", prompt, v.get("negative") or "")
+                wf = _qwen21_workflow(qprompt, pw, ph, s_i, v.get("cfg", 1.0), qneg or "",
                                       _qwen21_explicit(v.get("explicit"), None, recipe_id), loras,
                                       start=(photo_name, float(v.get("strength") or 0.6), pw, ph))
             else:

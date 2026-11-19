@@ -150,12 +150,10 @@ extension CreateScreen {
 
     var hasQuickPicks: Bool { recipeStore.catalog != nil && !activeGroups.isEmpty }
 
-    /// Every quick-pick row for what is being made, in its own card (they edit whichever words the sheet is showing).
-    var composeQuickCard: some View {
-        drawerSection("Quick picks") {
-            VStack(spacing: 0) { ForEach(activeGroups) { g in quickRow(g) } }
-        }
-    }
+    /// Quick picks for what is being made. No longer one flat card listing every group: it is now a stack of
+    /// collapsible, named sections that shrink away when a kind of pick isn't in the recipe (built in
+    /// MakeSections.swift as `quickSectionsCard`). Still edits whichever words the sheet is showing.
+    var composeQuickCard: some View { quickSectionsCard }
 
     // MARK: the pinned button
 

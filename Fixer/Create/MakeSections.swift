@@ -57,7 +57,8 @@ extension CreateScreen {
         MakeSectionsCard(
             sections: quickSections,
             selectedCount: { quickSelectedCount($0) },
-            row: { AnyView(quickRowTiled($0)) }
+            row: { AnyView(quickRowTiled($0)) },
+            expanded: $quickExpanded
         )
     }
 
@@ -107,16 +108,16 @@ struct QuickSection: Identifiable {
     var id: String { name }
 }
 
-/// The collapsible quick-pick sections. It holds its OWN expand state (a set of expanded section names) so the
-/// parent's large form state is untouched; because this view sits at a stable offset inside `composeStack`, SwiftUI
-/// keeps that @State across the sheet's re-renders. Everything a row draws comes in through closures, so this file
-/// never reimplements a chip.
+/// The collapsible quick-pick sections. The expand state (a set of expanded section names) is owned by CreateScreen
+/// (`quickExpanded`), NOT held here: `composeStack` identifies sections by offset, and that offset shifts when the
+/// results roll appears or the recipe row comes and goes, which would reset a local @State and snap every section
+/// shut. Everything a row draws comes in through closures, so this file never reimplements a chip.
 struct MakeSectionsCard: View {
     let sections: [QuickSection]
     let selectedCount: (QuickGroup) -> Int
     let row: (QuickGroup) -> AnyView
     /// Collapsed by default: a section name is in here only after it has been opened.
-    @State private var expanded: Set<String> = []
+    @Binding var expanded: Set<String>
 
     var body: some View {
         VStack(spacing: 10) {

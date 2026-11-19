@@ -444,6 +444,7 @@ struct CreateScreen: View {
     @State var expandedLora: String?                   // the add-on whose options dropdown is open (one at a time)
     @State var loraExtra: [String: String] = [:]       // extra activation words the user typed per add-on file
     @State var quickTick = 0                          // bumped when a quick pick is tapped (for its haptic)
+    @State var quickExpanded: Set<String> = []        // open quick-pick sections (lives here: the card's offset in composeStack shifts)
     @State var createSignature = ""                    // the form as it was when the run started
     @State var reviseSignature = ""
     @State var videoSignature = ""

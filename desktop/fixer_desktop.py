@@ -2890,6 +2890,37 @@ def _enhance_job(job) -> None:
         job.enhance_done.set()
 
 
+def _prepare_pictures(target, p: dict | None, emit, cancel) -> None:
+    """11-19: a picture job whose words are still being improved used to wait for them BEFORE starting the picture
+    engine and loading the recipe's models, so the two ran one after the other. Now, while the brain writes, the
+    engine starts and (when the recipe is known and isn't already loaded) a 1-step warm-up reads its models in.
+    Only beside the MoE brain: it shares the card with ComfyUI, while a dense brain would be stopped for pictures
+    mid-write (_room_for_pictures), and never when a picture RAM budget is set (that check may pause the brain).
+    Best effort: anything that fails here simply happens again in the job itself."""
+    if not isinstance(p, dict) or not _is_moe(LAST_BRAIN) or _tune("picture_ram_gb", 0) > 0:
+        return
+    rec, _TL.rec = getattr(_TL, "rec", None), None     # the warm-up must not count in this job's timings
+    try:
+        COMFY.ensure_current(lambda s: emit({"t": "status", "v": s}))
+        if target is job_comfy_image:
+            r = _picture_recipe(p)
+        elif target is job_comfy_run and (p.get("values") or {}).get("image_mode") not in ("edit", "reference"):
+            r = CREATE_RECIPES.get(p.get("recipe") or "")
+        else:
+            r = None                                   # edits run the editor's models: the engine start is the win
+        rid = _recipe_id(r) if r else None
+        if (not rid or rid == COMFY.last_recipe or (getattr(_TL, "safe", False) and rid in _adult_models())
+                or not _recipe_ready(CREATE_RECIPES[rid]) or cancel.is_set()):
+            return
+        asyncio.run(_comfy_run(_warmup_workflow(rid), lambda obj: None, cancel))
+        if not cancel.is_set():
+            COMFY.last_recipe = rid
+    except Exception as e:                             # noqa: BLE001
+        log.info("picture prep skipped: %s", e.__class__.__name__)
+    finally:
+        _TL.rec = rec
+
+
 def _apply_enhance(job, payload, emit):
     """At the job's start: wait for its enhancement (usually done while it queued) and draw from the enhanced words;
     if there are none, say why in plain words and draw from the original ones."""
@@ -2913,6 +2944,7 @@ class Comfy:
         self.proc: subprocess.Popen | None = None
         self.lock = threading.Lock()
         self.warmed: set[str] = set()
+        self.last_recipe: str | None = None  # 11-19: the recipe whose models ComfyUI last ran (so is holding now)
         self.paths = ""
         self.reserve = 0.0                   # --reserve-vram GB this start used (0 = none)
         self.guarded: bool | None = None     # 11-18: this start went through the proven host guard
@@ -3014,8 +3046,18 @@ class Comfy:
     def free(self):
         """Moves ComfyUI's models off the graphics card (the chat model or the diffusers helper needs it)."""
         if self.running():
+            self.last_recipe = None
             try:
                 self._post("/free", {"unload_models": True, "free_memory": True})
+            except Exception:
+                pass
+
+    def unload_card(self):
+        """11-19: moves ComfyUI's models off the graphics card but keeps them in RAM (no free_memory: that also
+        resets the node cache, so the next picture would read the disk again)."""
+        if self.running():
+            try:
+                self._post("/free", {"unload_models": True, "free_memory": False})
             except Exception:
                 pass
 
@@ -3036,6 +3078,7 @@ class Comfy:
         self.proc = None
         self.guarded = None
         self.warmed.clear()
+        self.last_recipe = None
         shutil.rmtree(COMFY_PRIVATE, ignore_errors=True)
 
     def stop(self):
@@ -4417,8 +4460,9 @@ def _has_addon(wf: dict) -> bool:
 
 def _create_pictures(r, v, w, h, count, seed, loras, photo, photo_name, mode, emit, cancel, status,
                      extra_names=(), recipe_id=None):
-    status("Loading image model…")
     recipe_id = recipe_id or _recipe_id(r)
+    if recipe_id != COMFY.last_recipe or (photo_name and mode in ("edit", "reference")):   # 11-19: only when it
+        status("Loading image model…")                                   # really loads (an edit uses the editor's)
     builder = r["builder"]
     own_explicit = recipe_id in QWEN_EXPLICIT_RECIPES
     if photo is not None and mode == "paint":
@@ -4487,6 +4531,7 @@ def _create_pictures(r, v, w, h, count, seed, loras, photo, photo_name, mode, em
         png = asyncio.run(_comfy_run(wf, part, cancel, previews=True))
         if cancel.is_set() or not png:
             return
+        COMFY.last_recipe = None if editing else recipe_id   # an edit ran the editor's models, not the recipe's
         emit({"t": "image", "v": base64.b64encode(png).decode(), "seed": s_i, "index": i})
     emit({"t": "progress", "v": 1.0})
 
@@ -4595,10 +4640,12 @@ def job_comfy_image(p: dict, emit, cancel):
     on = _has_addon(wf) or rid in QWEN_EXPLICIT_RECIPES
     _timing(model=r["name"], recipe=rid, explicit=on, mp=(w // 16 * 16) * (h // 16 * 16) / 1e6,
             steps=r["defaults"].get("steps"), count=1)
-    status("Loading image model…")
+    if rid != COMFY.last_recipe:                       # 11-19: only when it really has to load something
+        status("Loading image model…")
     png = asyncio.run(_comfy_run(wf, emit, cancel))
     if cancel.is_set() or not png:
         return
+    COMFY.last_recipe = rid
     emit({"t": "progress", "v": 1.0})
     emit({"t": "image", "v": base64.b64encode(png).decode(), "seed": seed, "recipe": rid, "explicit": on})
 
@@ -4627,6 +4674,7 @@ def job_comfy_edit(p: dict, emit, cancel):
     seed = int(p.get("seed") or int.from_bytes(os.urandom(4), "big")) % (2 ** 32)
     words = p.get("prompt") or "improve the photo"
     flag = p.get("explicit") if isinstance(p.get("explicit"), bool) else None     # the brain's call; old phones: words
+    COMFY.last_recipe = None                           # 11-19: the editor's models replace the last recipe's
     try:
         status("Loading image model…")
         if want21:
@@ -4673,7 +4721,10 @@ def _warmup_workflow(recipe: str) -> dict:
 
 def job_comfy_warm(p: dict, emit, cancel):
     """The phone opened Fixer: get the chosen ComfyUI recipe's models into memory now, so the first picture doesn't
-    wait for the disk. The chat model is left alone; ComfyUI then lets go of the card (models stay in RAM)."""
+    wait for the disk. The chat model is left alone.
+    11-19: this used to end with COMFY.free(), whose free_memory also emptied ComfyUI's RAM cache, so the warm-up
+    threw away what it had just loaded. Now, beside the MoE brain (which ComfyUI starts around with --reserve-vram)
+    the models simply stay put, as they do after a real picture; beside a dense brain they leave the card only."""
     model = RETIRED_PICTURE_IDS.get(p.get("model") or "", p.get("model") or "")
     recipe = COMFY_RECIPES.get(model)
     if p.get("safe") is True and recipe in _adult_models():
@@ -4685,7 +4736,10 @@ def job_comfy_warm(p: dict, emit, cancel):
             done = not cancel.is_set()
         except Exception:
             done = False                               # a failed warm-up costs nothing: the picture loads as before
-        COMFY.free()
+        if _is_moe(LAST_BRAIN):
+            COMFY.last_recipe = recipe if done else COMFY.last_recipe
+        else:
+            COMFY.unload_card()
         if done:
             COMFY.warmed.add(recipe)
     emit({"t": "info", "warm": True})
@@ -6166,6 +6220,9 @@ async def queue_runner(app):
                                 _timing(model=CUT_GENERAL)
                             elif _job.op == "upscale":
                                 _timing(model=UPSCALER[0])
+                            if (getattr(_job, "enhance", False) and not _job.enhance_done.is_set()
+                                    and _base in (job_comfy_image, job_comfy_run, job_comfy_edit)):
+                                _prepare_pictures(_base, payload_, emit_, cancel_)   # 11-19: alongside the words
                             payload_ = _apply_enhance(_job, payload_, emit_)
                             return _base(payload_, emit_, cancel_)
                         finally:

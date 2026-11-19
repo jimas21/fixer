@@ -178,9 +178,11 @@ final class Rules: ObservableObject {
         didSet {
             // 11-19: the chat's chosen model follows the switch silently: an 18+ model with 18+ off, or an everyday
             // one when 18+ goes on, goes back to Auto (which picks 18+ models while 18+ is on, everyday ones off).
-            guard explicitNow != oldValue, chatModelChoice != "auto",
-                  let r = Desktop.shared.recipeCache?.first(where: { $0.id == chatModelChoice }),
-                  r.adult != explicitNow else { return }
+            guard explicitNow != oldValue, chatModelChoice != "auto" else { return }
+            // Unknown model (the list isn't fetched yet): back to Auto too, so it can't stay on the wrong kind.
+            if let r = Desktop.shared.recipeCache?.first(where: { $0.id == chatModelChoice }), r.adult == explicitNow {
+                return
+            }
             chatModelChoice = "auto"
         } }
     @Published var alwaysExplicit: Bool = Rules.d.bool(forKey: "rules.alwaysExplicit") {

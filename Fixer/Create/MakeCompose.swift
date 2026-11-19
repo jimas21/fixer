@@ -141,7 +141,7 @@ extension CreateScreen {
             if hasQuickPicks { out.append(AnyView(composeQuickCard)) }
             out.append(AnyView(pictureTiles(r)))
             out.append(AnyView(drawerSection("Photo") { photoSection }))
-            if !r.toggles.isEmpty { out.append(AnyView(drawerSection("Style tips") { styleTips(r) })) }
+            if !shownToggles(r).isEmpty { out.append(AnyView(drawerSection("Style tips") { styleTips(r) })) }
             out.append(AnyView(drawerSection("Add-ons") { loraSection }))
             out.append(AnyView(pictureSettingsPage(r)))
         }

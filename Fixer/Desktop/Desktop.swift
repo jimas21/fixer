@@ -983,7 +983,8 @@ final class Desktop: ObservableObject {
         guard isOn, let link, force || (lastMakeWarmUp.map { Date().timeIntervalSince($0) > 600 } ?? true) else { return }
         lastMakeWarmUp = Date()
         let frames = call("warm", ["for": "make", "model": Rules.shared.pcImageID,
-                                   "model_choice": Rules.shared.chatModelChoice], link: link)
+                                   "model_choice": Rules.shared.chatModelChoice,
+                                   "safe": !Rules.shared.explicitNow], link: link)   // 11-19: never preload 18+ when off
         Task.detached(priority: .background) { for try await _ in frames {} }
     }
 

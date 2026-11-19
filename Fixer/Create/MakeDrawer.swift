@@ -124,9 +124,18 @@ extension CreateScreen {
     }
 
     /// The style tips, right on the page: a row of tap-on / tap-off phrasings per group.
+    /// 11-19: the style-tip groups to show: 18+ tips only while 18+ is on, and no group left empty.
+    func shownToggles(_ r: CreateRecipe) -> [PromptToggleGroup] {
+        guard !makeExplicit else { return r.toggles }
+        return r.toggles.compactMap { g in
+            let items = g.items.filter { !$0.explicit }
+            return items.isEmpty ? nil : PromptToggleGroup(name: g.name, items: items)
+        }
+    }
+
     func styleTips(_ r: CreateRecipe) -> some View {
         VStack(alignment: .leading, spacing: 2) {
-            ForEach(r.toggles) { g in
+            ForEach(shownToggles(r)) { g in
                 if !g.name.isEmpty {
                     Text(g.name).font(.caption).foregroundStyle(Fx.secondaryText).padding(.top, 4)
                 }

@@ -73,6 +73,10 @@ try:
           "own mark beats the name")
     check(fd._lora_is_explicit("y.safetensors", {"name": "Film look", "nsfw": True}), "Civitai NSFW flag: 18+")
     check(fd._lora_is_explicit("nsfw_pose-ab12.safetensors", {"name": "pose"}), "explicit word in the file name")
+    check(fd._lora_is_explicit("z.safetensors", {"name": "Film look", "source": "civitai"}),
+          "Civitai add-on not looked up yet: counted as 18+")
+    check(not fd._lora_is_explicit("z.safetensors", {"name": "Film look", "source": "civitai", "nsfw": False}),
+          "Civitai says not NSFW: everyday")
     check(not fd._lora_is_explicit("film_grain.safetensors", {"name": "Film grain", "triggers": ["grainy"]}),
           "ordinary add-on: not 18+")
     lib_rows = [{"file": "a.safetensors", "family": "sdxl", "explicit": True, "always_on": True, "strength": 1.0},
@@ -104,6 +108,28 @@ try:
         check(len(fd._job_loras(None, "qwen-edit", allow_explicit=True)[0]) == 1, "explicit editor: 18+ add-ons ok")
     finally:
         fd._lora_entries = orig_entries
+    # Style tips: 18+ ones are marked, and a safe job never applies them.
+    check(fd._toggle_is_adult({"id": "w_nude", "label": "Nude", "chroma": {"p": "completely nude"}}), "tip: Nude is 18+")
+    check(fd._toggle_is_adult({"id": "w_lingerie", "label": "Lingerie"}), "tip: Lingerie is 18+ (the list)")
+    check(not fd._toggle_is_adult({"id": "w_casual", "label": "Casual", "chroma": {"p": "a t-shirt and jeans"}}),
+          "tip: Casual is everyday")
+    check(not fd._toggle_is_adult({"id": "w_nude", "label": "Nude", "explicit": False}), "tip: own mark wins")
+    lib_t = [{"name": "Clothing", "items": [{"id": "w_nude", "label": "Nude", "chroma": {"p": "completely nude"}},
+                                            {"id": "w_casual", "label": "Casual", "chroma": {"p": "jeans"}}]}]
+    orig_lib = fd._toggle_library
+    fd._toggle_library = lambda: lib_t
+    try:
+        rc = {"builder": "chroma"}
+        v = fd._apply_toggles(rc, {"prompt": "a woman", "toggles": ["w_nude", "w_casual"]})
+        check("nude" in v["prompt"] and "jeans" in v["prompt"], "18+ on: both tips applied")
+        fd._TL.safe = True
+        try:
+            v = fd._apply_toggles(rc, {"prompt": "a woman", "toggles": ["w_nude", "w_casual"]})
+            check("nude" not in v["prompt"] and "jeans" in v["prompt"], f"safe: 18+ tip left out ({v['prompt']})")
+        finally:
+            fd._TL.safe = False
+    finally:
+        fd._toggle_library = orig_lib
     check(fd._qwen21_explicit("On", True, None) is None, "Qwen-Image 2.1: no explicit add-on even when asked")
     check(fd._adult_models() == {"chroma", "juggernaut"}, "the 18+ models are Chroma and Juggernaut")
 

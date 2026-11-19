@@ -4094,12 +4094,32 @@ def _toggle_library() -> list[dict]:
         return []
 
 
+# 11-19: style tips that are 18+ although their words don't say so outright (the explicit-words check catches the
+# rest). Hidden on the phone and never applied while 18+ is off. phone_config "adult_toggles" adds more ids; an item
+# can also carry "explicit": true / false in prompt_toggles.json (false wins over every guess).
+ADULT_TOGGLES_DEFAULT = ("e_seductive", "e_pleasure", "p_fours", "p_spread", "w_lingerie", "w_shirt", "w_stockings")
+
+
+def _toggle_is_adult(it: dict) -> bool:
+    if isinstance(it.get("explicit"), bool):
+        return it["explicit"]
+    try:
+        extra = json.loads(PHONE_CONFIG.read_text(encoding="utf-8")).get("adult_toggles") or []
+    except Exception:
+        extra = []
+    if it.get("id") in ADULT_TOGGLES_DEFAULT or it.get("id") in extra:
+        return True
+    words = " ".join([str(it.get("label") or "")]
+                     + [str((it.get(s) or {}).get("p") or "") for s in ("chroma", "sdxl", "zimage")])
+    return _words_explicit(words)
+
+
 def _recipe_toggles(r: dict) -> list[dict]:
     """The toggle groups for one recipe: label + the phrasing for its model (only items that have one)."""
     style = _prompt_style(r)
     out = []
     for g in _toggle_library():
-        items = [{"id": it["id"], "label": it["label"]} for it in g.get("items", [])
+        items = [{"id": it["id"], "label": it["label"], "explicit": _toggle_is_adult(it)} for it in g.get("items", [])
                  if (it.get(style) or {}).get("p") or (it.get(style) or {}).get("n")]
         if items:
             out.append({"name": g.get("name", ""), "items": items})
@@ -4113,9 +4133,10 @@ def _apply_toggles(r: dict, v: dict) -> dict:
         return v
     style = _prompt_style(r)
     pos, neg = [], []
+    safe = getattr(_TL, "safe", False)                   # 11-19: 18+ off -> no 18+ style tips
     for g in _toggle_library():
         for it in g.get("items", []):
-            if it.get("id") in ids:
+            if it.get("id") in ids and not (safe and _toggle_is_adult(it)):
                 phr = it.get(style) or {}
                 if phr.get("p"):
                     pos.append(phr["p"])
@@ -4139,6 +4160,7 @@ def job_comfy_recipes(p: dict, emit, cancel):
                 "toggles": _recipe_toggles(r), "adult": k in adult}          # 11-19: an 18+ model
                for k, r in CREATE_RECIPES.items() if _recipe_ready(r)]
     loras = sorted(f.name for f in COMFY_LORAS.glob("*.safetensors")) if COMFY_LORAS.is_dir() else []
+    threading.Thread(target=_lora_nsfw_backfill, daemon=True, name="lora-nsfw").start()   # 11-19: Make opened
     emit({"t": "info", "recipes": recipes, "loras": loras, "lora_library": _lora_entries()})
 
 
@@ -4183,7 +4205,17 @@ def _make_catalog() -> dict:
             item.update({"model": "video", "numbers": {}, "menus": {},
                          "explicit_video": "on" if d.get("explicit_addon") else "off"})
         else:
-            r = CREATE_RECIPES.get(d.get("model") or "")
+            model_id = d.get("model") or ""
+            if item["explicit"] and model_id not in _adult_models():
+                # 11-19: an 18+ recipe on an everyday model (always safe) moves to an 18+ model, with that model's own
+                # settings: the old model's numbers and its add-on menu would mean nothing there.
+                alt = _first_ready(_auto_models().get("picture_explicit") or [])
+                if alt is None:
+                    continue
+                model_id = _recipe_id(alt)
+                d = {k: x for k, x in d.items()
+                     if k not in ("steps", "cfg", "shift", "sampler", "scheduler", "negative", "explicit_addon")}
+            r = CREATE_RECIPES.get(model_id)
             if not r or not _recipe_ready(r):
                 continue
             dflt = r["defaults"]
@@ -4201,7 +4233,7 @@ def _make_catalog() -> dict:
                 menus["scheduler"] = _labelled([d["scheduler"]], SCHEDULE_WORDS, dflt["scheduler"])[0]
             if "explicit" in dflt:
                 menus["explicit"] = "On" if d.get("explicit_addon") else "Auto"
-            item.update({"model": d["model"], "numbers": nums, "menus": menus,
+            item.update({"model": model_id, "numbers": nums, "menus": menus,
                          "negative": (d.get("negative") or None) if r.get("negative") else None})
         recipes.append(item)
     qs = data.get("quickselect") or {}
@@ -4550,6 +4582,8 @@ def job_comfy_warm(p: dict, emit, cancel):
     wait for the disk. The chat model is left alone; ComfyUI then lets go of the card (models stay in RAM)."""
     model = RETIRED_PICTURE_IDS.get(p.get("model") or "", p.get("model") or "")
     recipe = COMFY_RECIPES.get(model)
+    if p.get("safe") is True and recipe in _adult_models():
+        recipe = None                                  # 11-19: 18+ off -> never preload an 18+ model
     if recipe and _chat_recipe(model) and recipe not in COMFY.warmed:
         COMFY.ensure_current()
         try:
@@ -4761,6 +4795,8 @@ def _lora_is_explicit(fn: str, e: dict | None) -> bool:
         return e["explicit"]
     if e.get("nsfw") is True:
         return True
+    if e.get("source") == "civitai" and "nsfw" not in e:
+        return True                                      # not looked up yet: counted as 18+ until it is (fail safe)
     words = " ".join([str(e.get("name") or ""), fn, *[str(t) for t in (e.get("triggers") or [])]])
     return _words_explicit(re.sub(r"[_\-.]+", " ", words))
 
@@ -5345,7 +5381,8 @@ def job_lora_search(p: dict, emit, cancel):
             params.append(("search", family))
         data = _api_json("https://huggingface.co/api/models?" + urllib.parse.urlencode(params))
         items = [{"source": "hf", "source_id": f"hf:{m.get('id')}", "name": m.get("id", ""),
-                  "downloads": m.get("downloads"), "thumb": None, "triggers": []} for m in (data or [])]
+                  "downloads": m.get("downloads"), "thumb": None, "triggers": []} for m in (data or [])
+                 if not (p.get("safe") is True and _words_explicit(re.sub(r"[_\-./]+", " ", m.get("id") or "")))]
         emit({"t": "info", "loras": items, "cursor": None})
         return
     # Engine-scoped: browse AND typed search both stay inside the model family's Civitai base models, so a search on
@@ -5940,7 +5977,14 @@ def _target(op: str, payload: dict):
         target = job_comfy_warm
     elif op == "warm" and _worker_alive() and getattr(WORKER, "family", None) == "video":
         target = job_warm_skip
+    if safe and op == "image" and target not in (job_comfy_image, job_comfy_edit):
+        target = _safe_no_fallback                     # 11-19: the old helper would run the saved (18+) model
     return target
+
+
+def _safe_no_fallback(p: dict, emit, cancel):
+    raise UserFacing("Your computer's picture tools aren't ready yet, and with 18+ off the older fallback can't be "
+                     "used. Try again in a moment.")
 
 
 def _safe_payload(op: str, p):

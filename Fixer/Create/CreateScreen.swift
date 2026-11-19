@@ -38,7 +38,11 @@ struct CreateControl: Identifiable {
     }
 }
 
-struct PromptToggle: Identifiable, Hashable { let id: String; let label: String }
+struct PromptToggle: Identifiable, Hashable {
+    let id: String
+    let label: String
+    var explicit = false                    // 11-19: an 18+ style tip: hidden and never used while 18+ is off
+}
 struct PromptToggleGroup: Identifiable { let name: String; let items: [PromptToggle]; var id: String { name } }
 
 struct CreateRecipe: Identifiable {
@@ -66,7 +70,8 @@ struct CreateRecipe: Identifiable {
             PromptToggleGroup(name: g["name"] as? String ?? "",
                               items: (g["items"] as? [[String: Any]] ?? []).compactMap { it in
                                   guard let id = it["id"] as? String else { return nil }
-                                  return PromptToggle(id: id, label: it["label"] as? String ?? id)
+                                  return PromptToggle(id: id, label: it["label"] as? String ?? id,
+                                                      explicit: it["explicit"] as? Bool ?? false)
                               })
         }
     }

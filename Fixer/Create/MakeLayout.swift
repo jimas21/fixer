@@ -174,7 +174,9 @@ extension CreateScreen {
         guard let c = recipeStore.catalog else { return [] }
         let defaults = mode == "video" ? ["motion"] : ["subject", "hair", "outfit", "setting", "lighting"]
         let ids = applied?.kind == (mode == "video" ? "video" : "picture") ? (appliedChips.isEmpty ? defaults : appliedChips) : defaults
+        // 11-19: with 18+ off, a row that has only 18+ options (anatomy, kink, ...) isn't shown at all.
         return ids.compactMap { id in c.groups.first { $0.id == id } }
+            .filter { makeExplicit || !$0.options.isEmpty }
     }
 
     private var appliedChips: [String] {
@@ -268,10 +270,10 @@ extension CreateScreen {
         if makeExplicit {
             if turnedOn, recipe?.adult != true,
                let r = recipes.first(where: { $0.adult && $0.id == "chroma" }) ?? recipes.first(where: \.adult) {
-                recipeID = r.id
+                swapModel(to: r.id)
             }
         } else {
-            if recipe?.adult == true || recipe == nil, let r = recipes.first(where: { !$0.adult }) { recipeID = r.id }
+            if recipe?.adult == true || recipe == nil, let r = recipes.first(where: { !$0.adult }) { swapModel(to: r.id) }
             let adultAddons = Set(loraLibrary.filter(\.explicit).map(\.file))
             if !adultAddons.isEmpty {
                 loras.removeAll { adultAddons.contains($0.name) }
@@ -280,9 +282,46 @@ extension CreateScreen {
         }
     }
 
+    /// A quiet model swap starts from the new model's own settings (one model's guidance or steps are wrong for
+    /// another); how many pictures and the shape stay. A recipe in use that was for another model is let go.
+    private func swapModel(to id: String) {
+        guard id != recipeID else { return }
+        let count = numbers["count"]
+        numbers = [:]
+        if let count { numbers["count"] = count }
+        menus = [:]
+        texts["negative"] = nil
+        if let a = applied, a.kind != "video", a.snapshot.recipeID != id { applied = nil }
+        recipeID = id
+    }
+
+    /// 11-19: 18+ off takes out what Make's own 18+ chips put in: the 18+ style tips, and the 18+ quick-pick
+    /// phrases from the words (only whole phrases a quick pick adds, the way tapping it again would).
+    func removeAdultPicks() {
+        let adultTips = Set(recipes.flatMap { $0.toggles.flatMap(\.items) }.filter(\.explicit).map(\.id))
+        if !adultTips.isDisjoint(with: chosen) { chosen.subtract(adultTips) }
+        let groups = recipeStore.catalog?.groups ?? []
+        let everyday = Set(groups.flatMap(\.options).map { $0.lowercased() })
+        let phrases = groups.flatMap(\.explicitOptions).filter { !everyday.contains($0.lowercased()) }
+        guard !phrases.isEmpty else { return }
+        func strip(_ text: String) -> String {
+            var t = text
+            for p in phrases where PhraseList.contains(t, p) { t = PhraseList.toggled(t, p) }
+            return t
+        }
+        let words = texts["prompt"] ?? ""
+        let cleaned = strip(words)
+        if cleaned != words { texts["prompt"] = cleaned }
+        let v = strip(videoPrompt)
+        if v != videoPrompt { videoPrompt = v }
+        let c = strip(changeText)
+        if c != changeText { changeText = c }
+    }
+
     func explicitSwitchChanged(_ on: Bool) {
         alignModelToExplicit(turnedOn: on)
         guard !on else { return }                  // turning it on changes nothing else: the recipe you pick sets things
+        removeAdultPicks()                         // only at the moment 18+ goes off, never on later edits
         // 11-19: an 18+ recipe in use loses its own opening and closing words (never the owner's), so the next run
         // doesn't carry them into an 18+-off session.
         if let a = applied, recipeStore.catalog?.recipes.first(where: { $0.id == a.id })?.explicit == true {

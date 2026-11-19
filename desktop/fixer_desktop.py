@@ -4581,9 +4581,11 @@ LORA_LOCK = threading.Lock()                            # one download at a time
 CIVITAI_API = "https://civitai.com/api/v1"
 CIVITAI_TOKEN = ROOT / "civitai_token"
 LORA_FAMILIES = ("sdxl", "chroma", "qwen21", "qwen-edit", "wan22")
-LORA_CIVITAI_BASE = {                                   # family -> Civitai baseModel labels to browse
-    "sdxl": ["SDXL 1.0", "Pony", "Illustrious", "NoobAI"],
-    "chroma": ["Chroma"], "qwen21": ["Qwen"], "qwen-edit": ["Qwen"], "wan22": ["Wan Video 2.2 I2V-A14B"],
+LORA_CIVITAI_BASE = {                                   # family -> Civitai baseModel labels (a superset per engine, so the
+    "sdxl": ["SDXL 1.0", "Pony", "Illustrious", "NoobAI"],   # filter scopes a search without starving it of results)
+    "chroma": ["Chroma"],
+    "qwen21": ["Qwen", "Qwen 2.1"], "qwen-edit": ["Qwen", "Qwen 2.1"],   # Civitai labels Qwen LoRAs both ways
+    "wan22": ["Wan Video 2.2 I2V-A14B", "Wan Video 2.2 T2V-A14B", "Wan Video 2.2 TI2V-5B"],   # all 2.2 experts
 }
 LORA_WARN_RELATED = "Made for a related model, may look wrong."
 LORA_NO_FIT = "This add-on doesn't fit any model on your computer."
@@ -4736,10 +4738,12 @@ def _job_loras(requested, family, extra_always_on: bool = True):
     if not family:
         return ([], [])
     lib = {e["file"]: e for e in _lora_entries()}
-    want, strengths = [], {}
+    want, strengths, trig_over = [], {}, {}
     for item in requested or []:
         if isinstance(item, dict):
             nm, st = item.get("name") or item.get("file"), item.get("strength")
+            if nm in lib and isinstance(item.get("triggers"), list):   # the phone edited this add-on's words:
+                trig_over[nm] = [str(t) for t in item["triggers"] if str(t).strip()]   # use exactly these (may be none)
         else:
             nm, st = item, None
         if nm in lib:
@@ -4771,8 +4775,8 @@ def _job_loras(requested, family, extra_always_on: bool = True):
                 add(fn)
     picked = picked[:4]
     triggers: list[str] = []
-    for _, _, e in picked:
-        for t in e.get("triggers") or []:
+    for fn, _, e in picked:
+        for t in (trig_over[fn] if fn in trig_over else (e.get("triggers") or [])):
             if t and t not in triggers:
                 triggers.append(t)
     if family == "wan22":
@@ -5103,25 +5107,32 @@ def job_lora_search(p: dict, emit, cancel):
                   "downloads": m.get("downloads"), "thumb": None, "triggers": []} for m in (data or [])]
         emit({"t": "info", "loras": items, "cursor": None})
         return
-    bases = LORA_CIVITAI_BASE.get(family, [])
+    # Engine-scoped: browse AND typed search both stay inside the model family's Civitai base models, so a search on
+    # Chroma returns Chroma add-ons, not Juggernaut. `families` (optional list from the phone) widens the scope to
+    # several engines at once; it defaults to the one in use. The strict title `query` is kept broad by a tag fallback.
+    fams = [f for f in (p.get("families") or [family]) if f in LORA_FAMILIES] or ([family] if family else [])
+    bases, seen = [], set()
+    for f in fams:
+        for b in LORA_CIVITAI_BASE.get(f, []):
+            if b not in seen:
+                seen.add(b)
+                bases.append(b)
+    famset = set(fams)
 
-    def _fits(base: str) -> bool:                          # does this result belong to the model family in use
+    def _fits(base: str) -> bool:                          # which chosen engine a result belongs to (for a badge)
         f = _resolve_family(base or "", None)[0]
-        if f == family:
+        if f in famset:
             return True
-        return bool(f and family and f.startswith("qwen") and family.startswith("qwen"))
+        return bool(f and f.startswith("qwen") and any(x.startswith("qwen") for x in famset))
 
     def _page(mode: str, term: str, cur) -> dict:
-        # A typed search reaches across every base model (Civitai's own query filter is strict, so pinning it to the
-        # family hides most concept matches); browsing with no words keeps the family filter so the default list fits.
         params = [("types", "LORA"), ("nsfw", "true"), ("limit", "20"), ("sort", "Most Downloaded")]
         if term:
             params.append((mode, term))                    # "query" matches the title, "tag" matches the concept
         if cur:
             params.append(("cursor", str(cur)))
-        if not term:
-            for b in bases:
-                params.append(("baseModels", b))
+        for b in bases:                                    # always scope to the chosen engine(s)
+            params.append(("baseModels", b))
         return _api_json(f"{CIVITAI_API}/models?" + urllib.parse.urlencode(params))
 
     def _rows(data: dict) -> list:

@@ -8,6 +8,7 @@ enum LibrarySource: String, Codable { case chat, make, added }
 struct LoraSetting: Codable, Equatable {
     var name: String
     var strength: Double
+    var triggers: [String]? = nil          // the activation words to use for this add-on (nil = its own defaults)
 }
 
 /// What is known about one Library item. It is stored encrypted next to the item. Everything beyond the first four

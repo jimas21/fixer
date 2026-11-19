@@ -405,7 +405,11 @@ final class Desktop: ObservableObject {
                                       "explicit": explicit, "seconds": seconds]
         if let style { payload["style"] = style }
         if !loras.isEmpty {
-            payload["loras"] = loras.map { l -> [String: Any] in ["name": l.name, "strength": l.strength] }
+            payload["loras"] = loras.map { l -> [String: Any] in
+                var d: [String: Any] = ["name": l.name, "strength": l.strength]
+                if let t = l.triggers { d["triggers"] = t }
+                return d
+            }
         }
         if let start {
             guard let jpeg = Self.jpeg(start, longest: 1280) else { throw PCError.bad }

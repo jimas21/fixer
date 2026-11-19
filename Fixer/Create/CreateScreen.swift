@@ -433,6 +433,9 @@ struct CreateScreen: View {
     @State var videoSuffix = ""
     @State var applied: AppliedStyle?                  // the recipe in use, with what it set
     @State var styleNote: String?                      // "That recipe's model isn't on your computer"
+    @State var removingLora: LoraEntry?                // the add-on a swipe/long-press asked to delete (confirm first)
+    @State var expandedLora: String?                   // the add-on whose options dropdown is open (one at a time)
+    @State var loraExtra: [String: String] = [:]       // extra activation words the user typed per add-on file
     @State var quickTick = 0                          // bumped when a quick pick is tapped (for its haptic)
     @State var createSignature = ""                    // the form as it was when the run started
     @State var reviseSignature = ""
@@ -901,7 +904,11 @@ struct CreateScreen: View {
             }
         }
         let picked = activeLoras                    // only the add-ons that fit what is being made
-        values["loras"] = picked.map { p -> [String: Any] in ["name": p.name, "strength": p.strength] }
+        values["loras"] = picked.map { p -> [String: Any] in
+            var d: [String: Any] = ["name": p.name, "strength": p.strength]
+            if let t = loraSendTriggers(p.name) { d["triggers"] = t }
+            return d
+        }
         let known = Set(r.toggles.flatMap(\.items).map(\.id))
         values["toggles"] = chosen.filter { known.contains($0) }.sorted()
         preview = nil
@@ -921,7 +928,7 @@ struct CreateScreen: View {
         if let explicitOverride { menusNow["explicit"] = explicitOverride }   // so a later change copies the same switch
         let formMenus = menusNow
         let formToggles = Array(chosen).sorted()
-        let formLoras = picked.map { LoraSetting(name: $0.name, strength: $0.strength) }
+        let formLoras = picked.map { LoraSetting(name: $0.name, strength: $0.strength, triggers: loraSendTriggers($0.name)) }
         let formMode = hasPhoto ? photoMode : nil
         let formStrength = hasPhoto && photoMode == "start" ? strength : nil
         running?.cancel()                                  // 11-17: a new Create replaces the one in progress

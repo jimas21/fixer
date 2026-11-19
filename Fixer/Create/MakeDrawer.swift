@@ -278,46 +278,122 @@ extension CreateScreen {
                 Text("No add-ons for \(loraModelName) on your computer yet.")
                     .font(.footnote).foregroundStyle(Fx.secondaryText)
             }
-            ForEach(fitting) { e in loraRow(e) }
+            ForEach(fitting) { e in
+                SwipeToDelete(onDelete: { removingLora = e }) { loraRow(e) }
+            }
             Button { showLoraBrowser = true } label: {
                 Label("Add a LoRA", systemImage: "plus.circle").frame(minHeight: 44)
             }
             Text("Small add-ons that teach the model one extra look, subject or detail. Strength 1 is the add-on as "
                  + "made; lower blends it in gently, above 1.5 often distorts. Only add-ons made for "
-                 + "\(loraModelName) are listed, because others would not work with it.")
+                 + "\(loraModelName) are listed, because others would not work with it. Swipe a row (or press and "
+                 + "hold it) to remove one from the computer.")
                 .font(.caption).foregroundStyle(Fx.secondaryText)
         }
         .sheet(isPresented: $showLoraBrowser) {
             LoraBrowser(family: loraFamily, modelName: loraModelName, onAdded: { e in loraAdded(e) })
         }
+        .confirmationDialog("Remove \(removingLora?.name ?? "it") from your computer?",
+                            isPresented: Binding(get: { removingLora != nil },
+                                                 set: { if !$0 { removingLora = nil } }),
+                            titleVisibility: .visible) {
+            if let l = removingLora {
+                Button("Remove from computer", role: .destructive) { removeLora(l) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Frees its space on the computer. Adding it again later downloads it again.")
+        }
     }
 
-    /// One add-on: a switch, and while it is on its strength and "always use".
+    /// Delete the add-on's file from the computer, and drop it from the picks and the library here.
+    private func removeLora(_ e: LoraEntry) {
+        loras.removeAll { $0.name == e.file }
+        videoLoras.removeAll { $0.name == e.file }
+        loraLibrary.removeAll { $0.file == e.file }
+        Task {
+            do { try await Desktop.shared.loraRemove(e.file) }
+            catch {
+                styleNote = error.localizedDescription                 // put it back if the computer refused
+                if let fresh = try? await Desktop.shared.loraList() { loraLibrary = fresh.loras }
+            }
+        }
+    }
+
+    /// The activation words to send for an add-on: nil to use its own defaults, else its own words plus any the
+    /// user typed into the "extra activation words" box (so the computer adds exactly these).
+    func loraSendTriggers(_ file: String) -> [String]? {
+        let extra = (loraExtra[file] ?? "")
+            .split(whereSeparator: { $0 == "," || $0 == ";" || $0 == "\n" })
+            .map { String($0).trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        guard !extra.isEmpty else { return nil }
+        var all = loraLibrary.first { $0.file == file }?.triggers ?? []
+        for w in extra where !all.contains(w) { all.append(w) }
+        return all
+    }
+
+    /// One add-on: an on/off switch, and a chevron that drops down its own options — strength, the extra activation
+    /// words some add-ons need, and "always use". One row is open at a time.
     private func loraRow(_ e: LoraEntry) -> some View {
-        let on = isLoraOn(e)
+        let expanded = expandedLora == e.file
         let level = loraStrength(e)
-        return VStack(alignment: .leading, spacing: 6) {
-            Toggle(isOn: Binding(get: { isLoraOn(e) }, set: { setLora(e, on: $0) })) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(e.name).lineLimit(2)
-                    if !e.triggers.isEmpty {
-                        Text("Adds: " + e.triggers.joined(separator: ", "))
-                            .font(.caption).foregroundStyle(Fx.secondaryText).lineLimit(2)
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Button {
+                    withAnimation(.snappy(duration: 0.2)) { expandedLora = expanded ? nil : e.file }
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.semibold)).foregroundStyle(Fx.secondaryText)
+                            .rotationEffect(.degrees(expanded ? 90 : 0))
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(e.name).lineLimit(2)
+                            if !e.triggers.isEmpty {
+                                Text("Adds: " + e.triggers.joined(separator: ", "))
+                                    .font(.caption).foregroundStyle(Fx.secondaryText).lineLimit(1)
+                            }
+                        }
+                        Spacer(minLength: 0)
                     }
+                    .contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
+                Toggle("", isOn: Binding(get: { isLoraOn(e) }, set: { setLora(e, on: $0) })).labelsHidden()
             }
             .frame(minHeight: 44)
-            if on {
-                HStack {
-                    Text("Strength").font(.footnote)
-                    Slider(value: level, in: 0...2, step: 0.05, onEditingChanged: { editing in
-                        if !editing, e.alwaysOn { saveLoraStrength(e) }
-                    })
-                    Text(String(format: "%.2f", level.wrappedValue))
-                        .font(.footnote).monospacedDigit().foregroundStyle(Fx.secondaryText)
+            if expanded {
+                if isLoraOn(e) {
+                    HStack {
+                        Text("Strength").font(.footnote)
+                        Slider(value: level, in: 0...2, step: 0.05, onEditingChanged: { editing in
+                            if !editing, e.alwaysOn { saveLoraStrength(e) }
+                        })
+                        Text(String(format: "%.2f", level.wrappedValue))
+                            .font(.footnote).monospacedDigit().foregroundStyle(Fx.secondaryText)
+                    }
+                } else {
+                    Text("Turn it on to set its strength.").font(.caption).foregroundStyle(Fx.secondaryText)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Extra activation words").font(.footnote).foregroundStyle(Fx.secondaryText)
+                    TextField("Words some add-ons need, comma-separated",
+                              text: Binding(get: { loraExtra[e.file] ?? "" }, set: { loraExtra[e.file] = $0 }),
+                              axis: .vertical)
+                        .lineLimit(1...3)
+                        .textFieldStyle(.roundedBorder)
+                    Text(e.triggers.isEmpty
+                         ? "This add-on lists no words of its own."
+                         : "It already adds its own: " + e.triggers.joined(separator: ", "))
+                        .font(.caption).foregroundStyle(Fx.secondaryText)
                 }
                 Toggle("Always use with this model", isOn: Binding(get: { e.alwaysOn }, set: { setLoraAlways(e, $0) }))
                     .font(.footnote)
+            }
+        }
+        .contextMenu {
+            Button(role: .destructive) { removingLora = e } label: {
+                Label("Remove from computer", systemImage: "trash")
             }
         }
     }
@@ -464,6 +540,44 @@ extension CreateScreen {
         VStack(alignment: .leading, spacing: 6) {
             Text(editorHelp).font(.caption).foregroundStyle(Fx.secondaryText)
             if changeMode == "edit", editor == "qwen21" { explicitAddonPicker }
+        }
+    }
+}
+
+/// Swipe a row left to delete it. The add-ons card is a plain stack, not a List, so SwiftUI's own
+/// `.swipeActions` isn't available here. Drag left past halfway and it asks to remove the add-on, then the row
+/// springs back (the confirmation dialog does the rest). `.gesture` is low priority, so a drag that lands on the
+/// strength slider stays with the slider — swipe from the name. Long-press still offers Remove too.
+private struct SwipeToDelete<Content: View>: View {
+    var onDelete: () -> Void
+    @ViewBuilder var content: () -> Content
+    @State private var offset: CGFloat = 0
+    private let reveal: CGFloat = 96
+
+    var body: some View {
+        ZStack(alignment: .trailing) {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(.red)
+                .overlay(alignment: .trailing) {
+                    Image(systemName: "trash")
+                        .foregroundStyle(.white)
+                        .frame(width: reveal)
+                        .opacity(offset < -8 ? 1 : 0)
+                }
+            content()
+                .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Fx.tile))
+                .offset(x: offset)
+                .gesture(
+                    DragGesture(minimumDistance: 24)
+                        .onChanged { v in
+                            guard abs(v.translation.width) > abs(v.translation.height) else { return }
+                            offset = max(-reveal, min(0, v.translation.width))
+                        }
+                        .onEnded { v in
+                            if v.translation.width < -reveal / 2 { onDelete() }
+                            withAnimation(.snappy(duration: 0.2)) { offset = 0 }
+                        }
+                )
         }
     }
 }

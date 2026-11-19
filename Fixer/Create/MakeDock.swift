@@ -436,7 +436,7 @@ extension CreateScreen {
         store.startVideo(prompt: assembledVideoPrompt, start: videoPhoto, explicit: rules.explicitVideo,
                          parent: videoPhotoID, action: videoPhoto == nil ? "video" : "animate",
                          style: style,
-                         loras: activeLoras.map { LoraSetting(name: $0.name, strength: $0.strength) },
+                         loras: activeLoras.map { LoraSetting(name: $0.name, strength: $0.strength, triggers: loraSendTriggers($0.name)) },
                          seconds: videoSeconds)
     }
 }

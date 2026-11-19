@@ -19,6 +19,8 @@ AuthKey_*
 *.mlmodelc
 *.safetensors
 *.zip
+# LoRA store (hidden, lives under FIXER_HOME / C:\FixerDesktop by default, never in the repo)
+.fixer-private/
 
 # Generated at build time (XcodeGen regenerates the project)
 *.xcodeproj

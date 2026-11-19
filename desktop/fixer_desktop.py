@@ -307,7 +307,7 @@ def ensure_files(repo: str, files: list[tuple[str, int]], status, kind: str = "m
         used = cache.size_on_disk - here
     except Exception:
         used = 0
-    used += _tree_size(MODELS / "comfy-loras") + _tree_size(MODELS / "comfy-vae")   # LoRAs and the moved VAE count too
+    used += _tree_size(COMFY_LORAS) + _tree_size(MODELS / "comfy-vae")   # LoRAs and the moved VAE count too
     if used + need > cap:
         def gb(b):
             return max(1, round(b / 1024 ** 3))
@@ -1323,7 +1323,7 @@ def job_status(p: dict, emit, cancel):
         sizes = {r.repo_id: r.size_on_disk for r in cache.repos if r.size_on_disk > 50 * 1024 ** 2}
     except Exception:
         used, repos, sizes = 0, [], {}
-    used += _tree_size(MODELS / "comfy-loras") + _tree_size(MODELS / "comfy-vae")   # LoRAs and the moved VAE count too
+    used += _tree_size(COMFY_LORAS) + _tree_size(MODELS / "comfy-vae")   # LoRAs and the moved VAE count too
     for alias, real in BRAIN_ALIASES.items():          # the phone may know a chat model by its alias
         if real in sizes:
             sizes[alias] = sizes[real]
@@ -1428,7 +1428,7 @@ def job_remove_model(p: dict, emit, cancel):
         freed += hit.size_on_disk
         cache.delete_revisions(*[rev.commit_hash for rev in hit.revisions]).execute()
     left = (scan_cache_dir(MODELS / "hub").size_on_disk
-            + _tree_size(MODELS / "comfy-loras") + _tree_size(MODELS / "comfy-vae"))
+            + _tree_size(COMFY_LORAS) + _tree_size(MODELS / "comfy-vae"))
     emit({"t": "info", "removed": entry["id"], "name": entry["name"], "freed_gb": round(freed / 1024 ** 3, 1),
           "models_gb": round(left / 1024 ** 3, 1), "cap_gb": CAP_GB})
 
@@ -2570,7 +2570,7 @@ def _comfy_paths_yaml() -> str:
     jug = _snapshot("Kandoo/Juggernaut-XL-Ragnarok")
     def block(paths):
         return "|\n" + "".join(f"    {Path(x).as_posix()}\n" for x in paths if x)
-    COMFY_LORAS.mkdir(parents=True, exist_ok=True)
+    _ensure_lora_store()
     COMFY_VAE.mkdir(parents=True, exist_ok=True)
     return ("fixer:\n"
             f"  diffusion_models: {block([ch / 'split_files' / 'diffusion_models' if ch else None, wan / 'split_files' / 'diffusion_models' if wan else None, qe, q21 / 'diffusion_models' if q21 else None])}"
@@ -3377,8 +3377,38 @@ def _sdxl_workflow(prompt: str, negative: str, w: int, h: int, seed: int, steps:
 # ---- Create screen: recipes the phone shows as a form (controls built from ComfyUI's own option lists)
 
 SHAPES = {"square": (1024, 1024), "portrait": (832, 1216), "landscape": (1216, 832), "wallpaper": (704, 1472)}
-COMFY_LORAS = MODELS / "comfy-loras"       # LoRA files ComfyUI can use (inside the capped folder)
+COMFY_LORAS = ROOT / ".fixer-private"      # LoRA files, kept in a hidden store OUTSIDE the models/HF cache so nothing
+                                           # else on this PC browses or indexes them; still size-capped (accounted below)
 COMFY_VAE = MODELS / "comfy-vae"           # ae.safetensors, copied out of the old Z-Image repo (inside the capped folder)
+
+
+def _ensure_lora_store() -> None:
+    """Create the LoRA store and lock it down on Windows, idempotently, every start:
+      - hidden+system, so it stays out of Explorer and default search;
+      - EFS-encrypted (the directory is marked, so files created in it inherit encryption): only THIS Windows
+        account can read the contents; every other account, administrators included, sees ciphertext;
+      - an ACL restricted to this account + SYSTEM, so no other account can even list it.
+    None of this blocks this account's own reads, so ComfyUI loads the files normally. Each step is best-effort:
+    a failure never stops the store working (we are its owner). EFS keys live with this user's profile — back the
+    cert up once (`cipher /x`) or a lost profile means lost LoRAs."""
+    COMFY_LORAS.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        return
+    d = str(COMFY_LORAS)
+
+    def _run(cmd: list[str]) -> None:
+        try:
+            subprocess.run(cmd, check=False, creationflags=0x08000000,     # CREATE_NO_WINDOW: no console flash
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:                                                  # noqa: BLE001
+            pass
+
+    _run(["attrib", "+h", "+s", d])
+    _run(["cipher", "/e", d])                      # mark the folder EFS-encrypted; new files inherit it
+    user = os.environ.get("USERNAME") or ""
+    if user:                                       # ACL: only this account + SYSTEM (*S-1-5-18, locale-safe)
+        _run(["icacls", d, "/inheritance:r",
+              "/grant:r", f"{user}:(OI)(CI)F", "*S-1-5-18:(OI)(CI)F"])
 
 CREATE_RECIPES = {
     "juggernaut": {
@@ -4845,7 +4875,7 @@ def _lora_lib() -> dict:
 
 
 def _lora_lib_write(lib: dict) -> None:
-    COMFY_LORAS.mkdir(parents=True, exist_ok=True)
+    _ensure_lora_store()
     tmp = COMFY_LORAS / "library.json.tmp"
     tmp.write_text(json.dumps(lib), encoding="utf-8")
     tmp.replace(COMFY_LORAS / "library.json")            # atomic
@@ -5581,7 +5611,7 @@ def job_lora_add(p: dict, emit, cancel):
         if not is_pair and len(files) > 1:
             files = files[:1]
         pair_id = secrets.token_hex(4) if is_pair else None
-        COMFY_LORAS.mkdir(parents=True, exist_ok=True)
+        _ensure_lora_store()
         lib = _lora_lib()
         added = []
         warn_out = None

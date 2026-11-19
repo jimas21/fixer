@@ -338,6 +338,7 @@ extension CreateScreen {
     private func loraRow(_ e: LoraEntry) -> some View {
         let expanded = expandedLora == e.file
         let level = loraStrength(e)
+        let pct = Int((level.wrappedValue * 100).rounded())
         return VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 Button {
@@ -369,7 +370,7 @@ extension CreateScreen {
                         Slider(value: level, in: 0...2, step: 0.05, onEditingChanged: { editing in
                             if !editing, e.alwaysOn { saveLoraStrength(e) }
                         })
-                        Text(String(format: "%.2f", level.wrappedValue))
+                        Text(pct == 100 ? "100% · Normal" : "\(pct)%")
                             .font(.footnote).monospacedDigit().foregroundStyle(Fx.secondaryText)
                     }
                 } else {

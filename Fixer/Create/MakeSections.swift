@@ -52,12 +52,19 @@ extension CreateScreen {
 
     /// Replaces the flat "Quick picks" card: one collapsible card per named section. Collapsed by default; each
     /// header shows a count of what's switched on; expanded rows reuse `quickRowTiled` (tiles where pictograph art
-    /// exists, plain chips otherwise). Callers (`composeStack`) still reach it as `composeQuickCard` in MakeCompose.
-    var quickSectionsCard: some View {
+    /// exists, plain chips otherwise). 11-19: the style tips live here too, as their own collapsible sections after
+    /// the quick picks, marked apart (wand header, dashed outline, sparkle chips) because they work differently:
+    /// they never show in the words, the server adds them on Create, worded for the model. `tips` is empty where
+    /// tips don't apply (Change, video).
+    func quickSectionsCard(tips: [PromptToggleGroup]) -> some View {
         MakeSectionsCard(
             sections: quickSections,
             selectedCount: { quickSelectedCount($0) },
             row: { AnyView(quickRowTiled($0)) },
+            tips: tips,
+            tipCount: { g in g.items.reduce(0) { $0 + (chosen.contains($1.id) ? 1 : 0) } },
+            tipRow: { AnyView(tipRow($0)) },
+            clearTips: chosen.isEmpty ? nil : { chosen.removeAll() },
             expanded: $quickExpanded
         )
     }
@@ -122,42 +129,86 @@ struct MakeSectionsCard: View {
     let sections: [QuickSection]
     let selectedCount: (QuickGroup) -> Int
     let row: (QuickGroup) -> AnyView
-    /// Collapsed by default: a section name is in here only after it has been opened.
+    /// The style-tip groups, each its own collapsible section after the quick picks (empty: none shown).
+    let tips: [PromptToggleGroup]
+    let tipCount: (PromptToggleGroup) -> Int
+    let tipRow: (PromptToggleGroup) -> AnyView
+    /// Turns every tip off; nil when none is on.
+    let clearTips: (() -> Void)?
+    /// Collapsed by default: a section key is in here only after it has been opened (tip sections: "tip:<name>").
     @Binding var expanded: Set<String>
 
     var body: some View {
         VStack(spacing: 10) {
             ForEach(sections) { section in
-                sectionCard(section)
+                card(key: section.name, name: section.name,
+                     count: section.groups.reduce(0) { $0 + selectedCount($1) }, tip: false) {
+                    AnyView(VStack(spacing: 0) { ForEach(section.groups) { g in row(g) } })
+                }
+            }
+            if !tips.isEmpty {
+                tipsLabel
+                ForEach(tips) { g in
+                    card(key: "tip:" + g.name, name: g.name, count: tipCount(g), tip: true) { tipRow(g) }
+                }
             }
         }
     }
 
-    private func sectionCard(_ section: QuickSection) -> some View {
-        let isOpen = expanded.contains(section.name)
-        let count = section.groups.reduce(0) { $0 + selectedCount($1) }
+    /// Sets the tips apart from the quick picks above them: what they are, and a way to turn them all off.
+    private var tipsLabel: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "wand.and.stars").font(.caption)
+            Text("Style tips · added when you create, worded for this model")
+                .font(.caption)
+                .lineLimit(2)
+            Spacer(minLength: 8)
+            if let clearTips {
+                Button("Clear", action: clearTips)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Fx.accent)
+                    .frame(minHeight: 44)
+            }
+        }
+        .foregroundStyle(Fx.secondaryText)
+        .padding(.horizontal, 4)
+        .padding(.top, 4)
+    }
+
+    private func card(key: String, name: String, count: Int, tip: Bool,
+                      content: () -> AnyView) -> some View {
+        let isOpen = expanded.contains(key)
+        let rows: AnyView? = isOpen ? content() : nil
         return VStack(alignment: .leading, spacing: 8) {
             Button {
-                if expanded.contains(section.name) { expanded.remove(section.name) }
-                else { expanded.insert(section.name) }
+                if expanded.contains(key) { expanded.remove(key) } else { expanded.insert(key) }
             } label: {
-                header(name: section.name, count: count, isOpen: isOpen)
+                header(name: name, count: count, isOpen: isOpen, tip: tip)
             }
             .buttonStyle(.plain)
-            .accessibilityLabel(count > 0 ? "\(section.name), \(count) selected" : section.name)
+            .accessibilityLabel((tip ? "Style tips, " : "") + (count > 0 ? "\(name), \(count) selected" : name))
             .accessibilityHint(isOpen ? "Collapse" : "Expand")
-            if isOpen {
-                VStack(spacing: 0) { ForEach(section.groups) { g in row(g) } }
-            }
+            if let rows { rows }
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(Fx.tile))
+        .overlay {
+            if tip {
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .strokeBorder(Fx.hairline, style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
+            }
+        }
         .fxAnimation(Motion.pop, value: isOpen)
     }
 
-    private func header(name: String, count: Int, isOpen: Bool) -> some View {
+    private func header(name: String, count: Int, isOpen: Bool, tip: Bool) -> some View {
         HStack(spacing: 8) {
+            if tip {
+                Image(systemName: "wand.and.stars")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Fx.secondaryText)
+            }
             Text(name).font(.footnote.weight(.semibold)).foregroundStyle(Fx.secondaryText)
             if count > 0 {
                 Text(String(count))

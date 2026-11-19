@@ -130,7 +130,7 @@ extension CreateScreen {
         out.append(AnyView(promptBox))
         if effectiveTarget == .change {
             out.append(AnyView(changeTiles))
-            if hasQuickPicks { out.append(AnyView(composeQuickCard)) }
+            if hasQuickPicks { out.append(AnyView(quickSectionsCard(tips: []))) }
             out.append(AnyView(helpPage))
         } else if mode == "video" {
             out.append(AnyView(videoTiles))
@@ -138,11 +138,11 @@ extension CreateScreen {
             out.append(AnyView(drawerSection("Add-ons") { loraSection }))
             out.append(AnyView(videoSettingsPage))
         } else if let r = recipe {
-            if hasQuickPicks { out.append(AnyView(composeQuickCard)) }
+            let tips = shownToggles(r)              // 11-19: style tips sit inside the quick-pick card now
+            if hasQuickPicks || !tips.isEmpty { out.append(AnyView(quickSectionsCard(tips: tips))) }
             if showBodyPanel { out.append(AnyView(drawerSection("Body") { bodyPanel })) }
             out.append(AnyView(pictureTiles(r)))
             out.append(AnyView(drawerSection("Photo") { photoSection }))
-            if !shownToggles(r).isEmpty { out.append(AnyView(drawerSection("Style tips") { styleTips(r) })) }
             out.append(AnyView(drawerSection("Add-ons") { loraSection }))
             out.append(AnyView(pictureSettingsPage(r)))
         }
@@ -151,10 +151,6 @@ extension CreateScreen {
 
     var hasQuickPicks: Bool { recipeStore.catalog != nil && !activeGroups.isEmpty }
 
-    /// Quick picks for what is being made. No longer one flat card listing every group: it is now a stack of
-    /// collapsible, named sections that shrink away when a kind of pick isn't in the recipe (built in
-    /// MakeSections.swift as `quickSectionsCard`). Still edits whichever words the sheet is showing.
-    var composeQuickCard: some View { quickSectionsCard }
 
     // MARK: the pinned button
 

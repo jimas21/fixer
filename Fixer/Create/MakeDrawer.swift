@@ -133,51 +133,50 @@ extension CreateScreen {
         }
     }
 
-    func styleTips(_ r: CreateRecipe) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            ForEach(shownToggles(r)) { g in
-                if !g.name.isEmpty {
-                    Text(g.name).font(.caption).foregroundStyle(Fx.secondaryText).padding(.top, 4)
-                }
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        ForEach(g.items) { t in tipChip(t) }
-                    }
-                    .padding(.trailing, 12)
-                }
-                .padding(.trailing, -12)
+    /// One style-tip group's chips: a single scrolling row (its section header carries the group name). Shown inside
+    /// the quick-pick card by `quickSectionsCard(tips:)`.
+    func tipRow(_ g: PromptToggleGroup) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(g.items) { t in tipChip(t) }
             }
-            HStack(alignment: .center, spacing: 8) {
-                Text("Tried-and-true phrasings, worded for this model, added to your prompt when you create.")
-                    .font(.caption).foregroundStyle(Fx.secondaryText)
-                Spacer(minLength: 0)
-                Button("Clear") { chosen.removeAll() }
-                    .frame(minHeight: 44)
-                    .disabled(chosen.isEmpty)
-            }
-            .padding(.top, 4)
+            .padding(.trailing, 12)
         }
+        .padding(.trailing, -12)
     }
 
+    /// A tip chip is marked apart from a quick-pick chip: a leading sparkle, and a dashed outline while off (a tip is
+    /// added on Create, not written into the words). An 18+ tip takes the warm 18+ colours, like 18+ quick picks.
     private func tipChip(_ t: PromptToggle) -> some View {
         let on = chosen.contains(t.id)
+        let tint = t.explicit ? Fx.explicitText : styleTint
+        let fill = t.explicit ? Fx.explicitFill : styleFill
+        let stroke = t.explicit ? Fx.explicitStroke : styleStroke
         return Button {
             if on { chosen.remove(t.id) } else { chosen.insert(t.id) }
             quickTick += 1
         } label: {
-            Text(t.label)
-                .font(.system(size: 14, weight: on ? .semibold : .regular))
-                .lineLimit(1)
-                .foregroundStyle(on ? styleTint : Color.primary)
-                .padding(.horizontal, 11)
-                .frame(height: 32)
-                .background(Capsule().fill(on ? styleFill : Fx.tile))
-                .overlay(Capsule().strokeBorder(on ? styleStroke : Color.clear, lineWidth: 1))
-                .frame(minHeight: 44)
-                .contentShape(Capsule())
+            HStack(spacing: 5) {
+                Image(systemName: "sparkle")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(on ? tint : Fx.secondaryText)
+                Text(t.label)
+                    .font(.system(size: 14, weight: on ? .semibold : .regular))
+                    .lineLimit(1)
+                    .foregroundStyle(on ? tint : Color.primary)
+            }
+            .padding(.horizontal, 11)
+            .frame(height: 32)
+            .background(Capsule().fill(on ? fill : Fx.tile))
+            .overlay(Capsule().strokeBorder(on ? stroke : Fx.hairline,
+                                            style: StrokeStyle(lineWidth: 1, dash: on ? [] : [3, 3])))
+            .frame(minHeight: 44)
+            .contentShape(Capsule())
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(t.label)
         .accessibilityAddTraits(on ? .isSelected : [])
+        .accessibilityHint(t.explicit ? "Style tip, explicit" : "Style tip")
     }
 
     // MARK: add-ons (LoRAs)

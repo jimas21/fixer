@@ -316,7 +316,7 @@ extension CreateScreen {
                     if makeExplicit { Text("Qwen Edit Explicit").tag("qwen-explicit") }
                     if hasQwen21 { Text("Qwen-Image 2.1").tag("qwen21") }
                 }
-                if editor == "qwen21", makeExplicit {
+                if editor == "qwen21", makeExplicit, qwen21HasAddon {
                     if addonOptions.count > 1 {
                         Picker("Explicit add-on", selection: Binding(get: { addonValue }, set: { explicitAddon = $0 })) {
                             ForEach(addonOptions, id: \.self) { Text($0).tag($0) }

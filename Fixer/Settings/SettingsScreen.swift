@@ -58,10 +58,11 @@ struct SettingsScreen: View {
                     Toggle("Explicit (18+) this session", isOn: $rules.explicitNow)
                     Toggle("Always explicit", isOn: $rules.alwaysExplicit)
                 } footer: {
-                    Text("18+ is off each time Fixer opens, and after 15 minutes away: pictures and videos use only "
-                         + "the everyday models and settings, and Make hides its explicit chips. Tap the 18+ chip in "
-                         + "the chat or at the top of Make to turn it on for this session. Always explicit starts "
-                         + "every session with it on.")
+                    Text("18+ is off each time Fixer opens, and after 15 minutes away: pictures use only the everyday "
+                         + "model (Qwen-Image 2.1), with no 18+ add-ons or chips. Turning it on moves to the 18+ "
+                         + "models (Chroma, Juggernaut). The everyday models stay safe either way. Tap the 18+ chip "
+                         + "in the chat or at the top of Make for this session; Always explicit starts every session "
+                         + "with it on.")
                 }
 
                 TidyFreeSection()

@@ -257,8 +257,32 @@ extension CreateScreen {
 
     // MARK: switches
 
+    /// 11-19: the models Make offers: the 18+ ones (Chroma, Juggernaut) only while 18+ is on.
+    var shownRecipes: [CreateRecipe] { makeExplicit ? recipes : recipes.filter { !$0.adult } }
+
+    /// 11-19 (the owner: "toggling 18+ should swap to explicit models and going to sfw should remove all explicit
+    /// models and addons silently"). Turning 18+ on moves to an 18+ model; with 18+ off an 18+ model in use moves to
+    /// the everyday one and every 18+ add-on is dropped from the picks. No notes: it just happens.
+    func alignModelToExplicit(turnedOn: Bool) {
+        guard !recipes.isEmpty else { return }
+        if makeExplicit {
+            if turnedOn, recipe?.adult != true,
+               let r = recipes.first(where: { $0.adult && $0.id == "chroma" }) ?? recipes.first(where: \.adult) {
+                recipeID = r.id
+            }
+        } else {
+            if recipe?.adult == true || recipe == nil, let r = recipes.first(where: { !$0.adult }) { recipeID = r.id }
+            let adultAddons = Set(loraLibrary.filter(\.explicit).map(\.file))
+            if !adultAddons.isEmpty {
+                loras.removeAll { adultAddons.contains($0.name) }
+                videoLoras.removeAll { adultAddons.contains($0.name) }
+            }
+        }
+    }
+
     func explicitSwitchChanged(_ on: Bool) {
-        guard !on else { return }                  // turning it on changes nothing by itself: the recipe you pick sets things
+        alignModelToExplicit(turnedOn: on)
+        guard !on else { return }                  // turning it on changes nothing else: the recipe you pick sets things
         // 11-19: an 18+ recipe in use loses its own opening and closing words (never the owner's), so the next run
         // doesn't carry them into an 18+-off session.
         if let a = applied, recipeStore.catalog?.recipes.first(where: { $0.id == a.id })?.explicit == true {

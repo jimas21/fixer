@@ -14,7 +14,10 @@ struct ModelChip: View {
             return slot.builtIn.first { $0.id == slot.current }?.name ?? ModelEntry.displayName(slot.current)
         }
         if rules.chatModelChoice == "auto" { return "Auto" }
-        return recipes.first { $0.id == rules.chatModelChoice }?.name ?? "Auto"
+        // 11-19: an 18+ model chosen earlier isn't used while 18+ is off (the computer picks the everyday one).
+        guard let r = recipes.first(where: { $0.id == rules.chatModelChoice }), rules.explicitNow || !r.adult
+        else { return "Auto" }
+        return r.name
     }
 
     var body: some View {
@@ -75,10 +78,15 @@ struct ModelCardSheet: View {
     @State private var loaded = false
 
     private var cards: [ModelCard] {
-        [ModelCard(id: "auto", name: "Auto", note: rules.explicitNow
-                   ? "Picks by your words: explicit or not, new picture or edit."
-                   : "Picks by your words: new picture or edit. 18+ is off for this session.")]
-            + recipes.map { ModelCard(id: $0.id, name: $0.name, note: $0.note ?? "Used for every picture you ask for in the chat.") }
+        let on = rules.explicitNow
+        let auto = ModelCard(id: "auto", name: "Auto", note: on
+                             ? "Uses the 18+ models, picked by your words: new picture or edit."
+                             : "Uses the everyday model. 18+ is off for this session.")
+        let shown: [CreateRecipe] = recipes.filter { on || !$0.adult }     // 11-19: 18+ models only while 18+ is on
+        let rest: [ModelCard] = shown.map {
+            ModelCard(id: $0.id, name: $0.name, note: $0.note ?? "Used for every picture you ask for in the chat.")
+        }
+        return [auto] + rest
     }
 
     var body: some View {

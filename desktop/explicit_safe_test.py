@@ -91,8 +91,21 @@ try:
             check(names == ["b.safetensors"], f"safe: only the ordinary add-on ({names})")
         finally:
             fd._TL.safe = False
+        # Everyday models are always safe, 18+ on or off: Qwen-Image 2.1 and the plain editor.
+        rows21 = [{"file": "x.safetensors", "family": "qwen21", "explicit": True, "always_on": True, "strength": 1.0},
+                  {"file": "y.safetensors", "family": "qwen21", "explicit": False, "always_on": True, "strength": 1.0}]
+        fd._lora_entries = lambda: rows21
+        got, _ = fd._job_loras(None, "qwen21")
+        check([x[0] for x in got] == ["y.safetensors"], "Qwen-Image 2.1: never an 18+ add-on, even with 18+ on")
+        rows_ed = [{"file": "e.safetensors", "family": "qwen-edit", "explicit": True, "always_on": True,
+                    "strength": 1.0}]
+        fd._lora_entries = lambda: rows_ed
+        check(fd._job_loras(None, "qwen-edit", allow_explicit=False)[0] == [], "plain editor: never an 18+ add-on")
+        check(len(fd._job_loras(None, "qwen-edit", allow_explicit=True)[0]) == 1, "explicit editor: 18+ add-ons ok")
     finally:
         fd._lora_entries = orig_entries
+    check(fd._qwen21_explicit("On", True, None) is None, "Qwen-Image 2.1: no explicit add-on even when asked")
+    check(fd._adult_models() == {"chroma", "juggernaut"}, "the 18+ models are Chroma and Juggernaut")
 
     # The chat's Auto model list: safe never takes the explicit list.
     seen = []
@@ -101,7 +114,9 @@ try:
     try:
         a = fd._auto_models()
         fd._picture_recipe({"prompt": words, "explicit": True, "safe": True})
-        check(seen[-1] == a["picture"], "safe chat picture: the everyday list")
+        check(seen[-1] == ["qwen21"], f"safe chat picture: only the everyday model ({seen[-1]})")
+        fd._picture_recipe({"prompt": "a cat", "safe": True, "model_choice": "chroma"})
+        check(seen[-1] == ["qwen21"], "safe: a chosen 18+ model is passed over for the everyday one")
         fd._picture_recipe({"prompt": words, "explicit": True})
         check(seen[-1] == a["picture_explicit"], "no safe flag: the explicit list as before")
     finally:

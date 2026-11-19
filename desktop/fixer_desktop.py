@@ -3190,7 +3190,11 @@ def _qwen21_refs(prompt: str, n: int) -> str:
 def _qwen21_explicit(mode, brain_flag=None, base_recipe=None) -> tuple[str, float] | None:
     """The add-on to load, or None. mode: Make's "Auto"/"On"/"Off" (any case; None = not sent). brain_flag: the chat
     brain's "explicit" true/false (None = not sent). Auto: the brain's flag, else (a change to a picture) the
-    explicit-model rule. Never decided from the words. Raises UserFacing when the add-on is wanted but not here."""
+    explicit-model rule. Never decided from the words. Raises UserFacing when the add-on is wanted but not here.
+    11-19: Qwen-Image 2.1 is an everyday model, so it is always safe: no add-on, unless phone_config lists it as an
+    adult model."""
+    if "qwen21" not in _adult_models():
+        return None
     m = str(mode or "auto").lower()
     want = (m == "on") or (m == "auto" and (brain_flag is True
                                             or (brain_flag is None and (base_recipe or "") in QWEN_EXPLICIT_RECIPES)))
@@ -3574,7 +3578,21 @@ def _words_explicit(text: str) -> bool:
 AUTO_MODELS_DEFAULT = {
     "picture_explicit": ["chroma", "juggernaut"],
     "picture": ["juggernaut", "chroma"],
+    "picture_safe": ["qwen21"],                         # 11-19: with 18+ off, only the everyday models
 }
+
+# 11-19 (the owner: "the sfw work models will be the non chroma or juggernaut models, so they should always be
+# safe"): the 18+ picture models. Every other model is an everyday one: it never loads an explicit add-on or an 18+
+# LoRA, whatever the switch says. phone_config "adult_models" may override the list.
+ADULT_MODELS_DEFAULT = ("chroma", "juggernaut")
+
+
+def _adult_models() -> set:
+    try:
+        cfg = json.loads(PHONE_CONFIG.read_text(encoding="utf-8")).get("adult_models")
+    except Exception:
+        cfg = None
+    return set(cfg) if isinstance(cfg, list) and cfg else set(ADULT_MODELS_DEFAULT)
 
 
 def _auto_models() -> dict:
@@ -3598,15 +3616,19 @@ def _picture_recipe(p: dict) -> dict | None:
     chosen from the brain's "explicit" flag (or, on old phones, the words): explicit -> the explicit model, anything
     else -> the default picture model. A saved choice that is gone (bigASP, FLUX klein) falls through to this."""
     choice = p.get("model_choice")
+    a = _auto_models()
+    if p.get("safe") is True:                          # 11-19: 18+ off -> an everyday model, never an 18+ one
+        if choice and choice != "auto" and choice not in _adult_models():
+            r = CREATE_RECIPES.get(choice)
+            if r and _recipe_ready(r):
+                return r
+        return _first_ready([x for x in a.get("picture_safe") or [] if x not in _adult_models()])
     if choice and choice != "auto":
         r = CREATE_RECIPES.get(choice) or _chat_recipe(choice)
         if r and _recipe_ready(r):
             return r
-    a = _auto_models()
     flag = p.get("explicit")                           # 11-17: the brain's own call (newer phones); old ones: the words
     explicit = flag is True or _is_explicit(p.get("prompt") or "")     # only a true flag adds to the words; false = "not said"
-    if p.get("safe") is True:                          # 11-19: Explicit off on the phone (this also runs off the job thread)
-        explicit = False
     return _first_ready(a["picture_explicit"] if explicit else a["picture"])
 
 
@@ -3817,8 +3839,11 @@ def _comfy_video(p: dict, emit, cancel):
         else:
             w, h = _wan14_size(16, 9) if p.get("aspect") != "portrait" else _wan14_size(9, 16)
             a = _auto_models()
-            first = (_first_ready(a["picture_explicit"]) if _explicit_video(prompt, p.get("explicit")) > 0
-                     else _first_ready(a["picture"]))
+            if p.get("safe") is True:                   # 11-19: 18+ off -> the everyday model draws the first frame
+                first = _first_ready([x for x in a.get("picture_safe") or [] if x not in _adult_models()])
+            else:
+                first = (_first_ready(a["picture_explicit"]) if _explicit_video(prompt, p.get("explicit")) > 0
+                         else _first_ready(a["picture"]))
             if first is None:
                 raise UserFacing("No picture model is on your computer to draw the first frame.")
             v = {**first["defaults"], "prompt": prompt, "detail": "Off"}
@@ -4016,7 +4041,7 @@ def _recipe_controls(r: dict) -> list[dict]:
          "help": "The starting point of a picture. Random gives a new picture each time; the same seed with the same "
                  "settings gives the same picture again, so you can change one thing and compare."},
     ]
-    if r.get("builder") == "qwen21":
+    if r.get("builder") == "qwen21" and "qwen21" in _adult_models():   # 11-19: an everyday model has no add-on menu
         lora = _qwen21_lora()
         ctl = {"key": "explicit", "label": "Explicit add-on", "kind": "menu", "options": ["Auto", "On", "Off"],
                "default": "Auto",
@@ -4108,9 +4133,10 @@ def _apply_toggles(r: dict, v: dict) -> dict:
 def job_comfy_recipes(p: dict, emit, cancel):
     """The Create screen's list: recipes whose files are on this computer, their controls, and the LoRA files."""
     COMFY.ensure()
+    adult = _adult_models()
     recipes = [{"id": k, "name": r["name"], "kind": r["kind"], "note": r.get("note"),
                 "lora_family": r.get("lora_family"), "controls": _recipe_controls(r),
-                "toggles": _recipe_toggles(r)}
+                "toggles": _recipe_toggles(r), "adult": k in adult}          # 11-19: an 18+ model
                for k, r in CREATE_RECIPES.items() if _recipe_ready(r)]
     loras = sorted(f.name for f in COMFY_LORAS.glob("*.safetensors")) if COMFY_LORAS.is_dir() else []
     emit({"t": "info", "recipes": recipes, "loras": loras, "lora_library": _lora_entries()})
@@ -4147,8 +4173,10 @@ def _make_catalog() -> dict:
         if not isinstance(d, dict) or not d.get("id"):
             continue
         kind = "video" if d.get("kind") == "video" else "picture"
+        # 11-19: a recipe on an 18+ model is an 18+ recipe too (hidden with 18+ off, like the "Explicit" group).
         item = {"id": str(d["id"]), "name": d.get("name") or d["id"], "group": d.get("group") or "", "kind": kind,
-                "explicit": d.get("group") == "Explicit" or (kind == "video" and bool(d.get("explicit_addon"))),
+                "explicit": (d.get("group") == "Explicit" or (kind == "video" and bool(d.get("explicit_addon")))
+                             or (kind != "video" and (d.get("model") or "") in _adult_models())),
                 "prefix": d.get("prompt_prefix") or "", "suffix": d.get("prompt_suffix") or "",
                 "chips": d.get("chips") or [], "note": d.get("note"), "shape": _shape_name(d.get("shape"))}
         if kind == "video":
@@ -4192,6 +4220,15 @@ def job_comfy_run(p: dict, emit, cancel):
         recipe = "juggernaut"
         vals = {k: val for k, val in (p.get("values") or {}).items()
                 if k not in ("steps", "cfg", "sampler", "scheduler", "shift", "detail")}
+        p = {**p, "recipe": recipe, "values": vals}
+    if p.get("safe") is True and recipe in _adult_models():
+        # 11-19: 18+ off -> an 18+ model is quietly swapped for the everyday one (with that model's own settings).
+        alt = _first_ready([x for x in _auto_models().get("picture_safe") or [] if x not in _adult_models()])
+        if alt is None:
+            raise UserFacing("No everyday picture model is on your computer, and 18+ is off.")
+        recipe = _recipe_id(alt)
+        vals = {k: val for k, val in (p.get("values") or {}).items()
+                if k not in ("steps", "cfg", "sampler", "scheduler", "shift", "detail", "negative", "loras")}
         p = {**p, "recipe": recipe, "values": vals}
     r = CREATE_RECIPES.get(recipe)
     if not r:
@@ -4296,7 +4333,7 @@ def _create_pictures(r, v, w, h, count, seed, loras, photo, photo_name, mode, em
             if not (explicit or _qwen_edit_ready()):
                 raise UserFacing("Editing a photo needs a photo editor model on your computer.")
             qw, qh = _photo_size(photo) if mode == "edit" else (w, h)
-            eloras, etrig = _job_loras(v.get("loras"), "qwen-edit")
+            eloras, etrig = _job_loras(v.get("loras"), "qwen-edit", allow_explicit=explicit)   # plain editor: never 18+
             wf = _qwen_edit_workflow(_with_triggers(prompt, etrig), [photo_name, *extra_names], s_i, qw, qh,
                                      explicit, loras=eloras)
             _timing(model="Qwen Rapid-AIO" if explicit else "Qwen Edit 2511", recipe=recipe_id,
@@ -4413,7 +4450,8 @@ def job_comfy_image(p: dict, emit, cancel):
     status = lambda s: emit({"t": "status", "v": s})  # noqa: E731
     r = _picture_recipe(p)
     if r is None:
-        raise UserFacing("No picture model is on your computer.")
+        raise UserFacing("No everyday picture model is on your computer, and 18+ is off." if p.get("safe") is True
+                         else "No picture model is on your computer.")
     COMFY.ensure_current(status)                        # a freshly downloaded model, add-on, reader or LoRA shows up
     _room_for_pictures()                               # dense brain: the card goes to the picture; the MoE brain stays
     if _worker_alive():
@@ -4480,7 +4518,7 @@ def job_comfy_edit(p: dict, emit, cancel):
             if not (explicit or _qwen_edit_ready()):
                 raise UserFacing("Editing a photo needs a photo editor model on your computer.")
             pw, ph = _photo_size(start, min(2.0, max(0.25, longest * longest / 1_000_000)))
-            aloras, atrig = _job_loras(None, "qwen-edit")
+            aloras, atrig = _job_loras(None, "qwen-edit", allow_explicit=explicit)            # plain editor: never 18+
             wf = _qwen_edit_workflow(_with_triggers(words, atrig), [name], seed, pw, ph, explicit, loras=aloras)
             _timing(model="Qwen Rapid-AIO" if explicit else "Qwen Edit 2511",
                     editor="qwen-explicit" if explicit else "qwen", explicit=explicit, mp=pw * ph / 1e6, steps=4,
@@ -4810,7 +4848,7 @@ def _cap_pairs(picked: list, limit: int = 4) -> list:
     return kept
 
 
-def _job_loras(requested, family, extra_always_on: bool = True):
+def _job_loras(requested, family, extra_always_on: bool = True, allow_explicit: bool | None = None):
     """The LoRAs to use for a job of `family`, plus their trigger words. `requested` is the phone's list
     ([{name, strength}] or file names). Keeps installed LoRAs of the right family (plus 'unknown' ones the user
     chose), adds the family's always-on LoRAs, caps a job at 4 and strength at 0-2. Returns (loras, triggers):
@@ -4832,7 +4870,11 @@ def _job_loras(requested, family, extra_always_on: bool = True):
                 strengths[nm] = st
     picked, seen = [], set()
 
-    safe = getattr(_TL, "safe", False)                   # 11-19: 18+ off on the phone -> no 18+ add-ons at all
+    # 11-19: no 18+ add-ons with 18+ off on the phone, nor ever on an everyday model (Qwen-Image 2.1, the plain
+    # editor: a caller passes allow_explicit=False for those, or True for the explicit editor).
+    if allow_explicit is None:
+        allow_explicit = not (family == "qwen21" and "qwen21" not in _adult_models())
+    safe = getattr(_TL, "safe", False) or not allow_explicit
 
     def add(fn):
         if fn in seen or fn not in lib:
@@ -5884,9 +5926,10 @@ def _in_worker(op: str):
 def _target(op: str, payload: dict):
     """Which function runs this request (the routing that lived inside run_streaming)."""
     target = _in_worker(op) if op in WORKER_OPS else JOBS[op]
+    safe = isinstance(payload, dict) and payload.get("safe") is True
     if (op == "image" and not payload.get("image") and COMFY.available()
-            and (_chat_recipe(payload.get("model")) or _picture_recipe(payload))):
-        target = job_comfy_image                       # ComfyUI recipes for new pictures
+            and (safe or _chat_recipe(payload.get("model")) or _picture_recipe(payload))):
+        target = job_comfy_image                       # ComfyUI recipes for new pictures (11-19: always when 18+ off)
     if op == "video" and COMFY_VIDEO and COMFY.available() and _wan14_ready():
         target = job_comfy_video                       # Wan 2.2 A14B in ComfyUI (the 5B helper is the fallback)
     if op == "image" and payload.get("image") and _comfy_edits_ready():

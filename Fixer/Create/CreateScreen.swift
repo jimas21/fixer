@@ -50,10 +50,12 @@ struct CreateRecipe: Identifiable {
     let model: String?          // the phone-side model id, when the computer sends it
     let note: String?
     let loraFamily: String?     // which LoRAs fit this model (sdxl, chroma, qwen21); nil from an older computer
+    let adult: Bool             // 11-19: an 18+ model (Chroma, Juggernaut): only offered while 18+ is on
 
     init?(_ d: [String: Any]) {
         guard let id = d["id"] as? String else { return nil }
         self.id = id
+        adult = d["adult"] as? Bool ?? false
         model = d["model"] as? String
         note = d["note"] as? String
         loraFamily = d["lora_family"] as? String
@@ -525,6 +527,7 @@ struct CreateScreen: View {
                 }
             }
             .onChange(of: makeExplicit) { _, on in explicitSwitchChanged(on) }
+            .onChange(of: recipeID) { _, _ in alignModelToExplicit(turnedOn: false) }   // e.g. Make again, 18+ off
     }
 
     /// The second half of the screen's handlers (loading, sheets, clear everything, haptics), kept apart so no single
@@ -543,7 +546,7 @@ struct CreateScreen: View {
             .onChange(of: startTick) { _, _ in noteDismissed = nil }
             .onChange(of: rawNote) { _, n in if n == nil { noteDismissed = nil } }
             .sheet(isPresented: $showQueue) { NavigationStack { QueueScreen(inSheet: true, chat: chat) } }
-            .sheet(isPresented: $showModels) { MakeModelSheet(recipes: recipes, chosen: modelChoice) }
+            .sheet(isPresented: $showModels) { MakeModelSheet(recipes: shownRecipes, chosen: modelChoice) }
             .onChange(of: router.clearedCount) { _, _ in
                 workingID = nil; changeText = ""
                 running?.cancel(); running = nil; runToken = nil
@@ -748,7 +751,7 @@ struct CreateScreen: View {
                     if hasQwen21 { Text("Qwen-Image 2.1").tag("qwen21") }
                 }
                 Section("Redraw it with") {
-                    ForEach(recipes) { r in Text(r.name).tag("recipe:" + r.id) }
+                    ForEach(shownRecipes) { r in Text(r.name).tag("recipe:" + r.id) }
                 }
             }
             .pickerStyle(.menu)
@@ -763,6 +766,11 @@ struct CreateScreen: View {
 
     /// Whether the computer has Qwen-Image 2.1 (the editor choice and its Explicit add-on only show then).
     var hasQwen21: Bool { recipes.contains { $0.id == "qwen21" } }
+
+    /// 11-19: Qwen-Image 2.1 is an everyday model, always safe, so the computer no longer offers its add-on menu.
+    var qwen21HasAddon: Bool {
+        recipes.first { $0.id == "qwen21" }?.controls.contains { $0.key == "explicit" } ?? false
+    }
 
     /// Which Enhance switch the prompt box shows: a photo being edited or used as a reference follows the changes
     /// switch (off unless turned on); everything else follows the new-pictures switch (on unless turned off).
@@ -783,7 +791,7 @@ struct CreateScreen: View {
     /// settings; this one is for the photo editor.)
     @ViewBuilder
     var explicitAddonPicker: some View {
-        if editor == "qwen21", makeExplicit {
+        if editor == "qwen21", makeExplicit, qwen21HasAddon {
             VStack(alignment: .leading, spacing: 2) {
                 if addonOptions.count > 1 {
                     Picker("Explicit add-on", selection: Binding(get: { addonValue }, set: { explicitAddon = $0 })) {
@@ -819,7 +827,7 @@ struct CreateScreen: View {
         switch editor {
         case "qwen": "Best at following you: poses, clothes, backgrounds, and combining up to 3 photos. About 20-40 s."
         case "qwen-explicit": "The same editor trained on explicit content: nudity and adult changes come out as asked."
-        case "qwen21": "The new Qwen-Image 2.1: the same model as its pictures, so it starts at once after one. Use the Explicit add-on switch below for nudity."
+        case "qwen21": "The new Qwen-Image 2.1: the same model as its pictures, so it starts at once after one. An everyday model: always safe."
         default: makeExplicit
             ? "Picks for you: Qwen-Image 2.1 for pictures made with it, Qwen Edit Explicit when your words are explicit or you're on an explicit model, otherwise Qwen Edit."
             : "Picks for you: Qwen-Image 2.1 for pictures made with it, otherwise Qwen Edit. 18+ is off for this session."
@@ -869,7 +877,8 @@ struct CreateScreen: View {
             loraFiles = r.loras
             loraLibrary = r.library
             videoLoraFamily = r.videoFamily
-            if recipe == nil { recipeID = recipes.first?.id ?? "" }
+            if recipe == nil { recipeID = shownRecipes.first?.id ?? "" }
+            alignModelToExplicit(turnedOn: false)
             if editor == "qwen21", !hasQwen21 { editor = "auto" }      // this computer doesn't have it
         } catch {
             failed = "Couldn't reach your computer. Check that Fixer Desktop is on."

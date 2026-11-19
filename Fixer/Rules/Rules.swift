@@ -174,7 +174,15 @@ final class Rules: ObservableObject {
     /// off nothing explicit is used anywhere: Make hides its explicit chips, the explicit editor and add-ons are off,
     /// and every picture or video job tells the computer "safe", so it never picks an explicit model from the words.
     /// Never stored: a new session always starts from `alwaysExplicit`.
-    @Published var explicitNow: Bool = Rules.d.bool(forKey: "rules.alwaysExplicit")
+    @Published var explicitNow: Bool = Rules.d.bool(forKey: "rules.alwaysExplicit") {
+        didSet {
+            // 11-19: the chat's chosen model follows the switch silently: an 18+ model with 18+ off, or an everyday
+            // one when 18+ goes on, goes back to Auto (which picks 18+ models while 18+ is on, everyday ones off).
+            guard explicitNow != oldValue, chatModelChoice != "auto",
+                  let r = Desktop.shared.recipeCache?.first(where: { $0.id == chatModelChoice }),
+                  r.adult != explicitNow else { return }
+            chatModelChoice = "auto"
+        } }
     @Published var alwaysExplicit: Bool = Rules.d.bool(forKey: "rules.alwaysExplicit") {
         didSet {
             Self.d.set(alwaysExplicit, forKey: "rules.alwaysExplicit")

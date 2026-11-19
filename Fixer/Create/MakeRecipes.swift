@@ -155,5 +155,16 @@ enum PhraseList {
         }
         return list.joined(separator: ", ")
     }
+
+    /// Removes every phrase in `remove` (any capitals), then appends `phrase` when non-nil. Used by the graded Body
+    /// sliders: each axis owns a set of mutually-exclusive terms and sets exactly one (or none at the low end).
+    static func replacing(_ text: String, remove: [String], with phrase: String?) -> String {
+        let drop = Set(remove.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() })
+        var list = tokens(text).filter { !drop.contains($0.lowercased()) }
+        if let p = phrase?.trimmingCharacters(in: .whitespacesAndNewlines), !p.isEmpty {
+            list.append(p)
+        }
+        return list.joined(separator: ", ")
+    }
 }
 

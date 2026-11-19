@@ -139,6 +139,7 @@ extension CreateScreen {
             out.append(AnyView(videoSettingsPage))
         } else if let r = recipe {
             if hasQuickPicks { out.append(AnyView(composeQuickCard)) }
+            if showBodyPanel { out.append(AnyView(drawerSection("Body") { bodyPanel })) }
             out.append(AnyView(pictureTiles(r)))
             out.append(AnyView(drawerSection("Photo") { photoSection }))
             if !shownToggles(r).isEmpty { out.append(AnyView(drawerSection("Style tips") { styleTips(r) })) }

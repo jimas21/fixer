@@ -126,13 +126,21 @@ extension CreateScreen {
         let mens = menus.keys.sorted().map { "\($0)=\(menus[$0] ?? "")" }.joined(separator: ",")
         let others = texts.keys.filter { $0 != "prompt" }.sorted().map { "\($0)=\(texts[$0] ?? "")" }.joined(separator: ",")
         return [assembledPrompt, recipeID, shape, photo == nil ? "nophoto" : "photo", photoMode, String(strength), editor,
-                nums, mens, others, String(fixedSeed ?? -1), String(loras.count), chosen.sorted().joined(separator: ","),
+                nums, mens, others, String(fixedSeed ?? -1), loraSignature, chosen.sorted().joined(separator: ","),
                 String(morePhotos.count)].joined(separator: "|")
     }
 
     var videoFormSignature: String {
         [assembledVideoPrompt, videoPhoto == nil ? "nophoto" : "photo", rules.explicitVideo,
-         String(videoLoras.count)].joined(separator: "|")
+         loraSignature].joined(separator: "|")
+    }
+
+    /// Each add-on in use with its strength and extra words, so changing any of them counts as a change.
+    var loraSignature: String {
+        activeLoras.map { p in
+            let words = (loraExtra[p.name] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            return "\(p.name)@\(p.strength)+\(words)"
+        }.joined(separator: ";")
     }
 
     var changeFormSignature: String { [changeText, changeMode, editor].joined(separator: "|") }

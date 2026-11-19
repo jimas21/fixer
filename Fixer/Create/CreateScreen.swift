@@ -624,6 +624,14 @@ struct CreateScreen: View {
         shape = meta.shape ?? "square"
         chosen = Set(meta.toggles ?? [])
         loras = (meta.loras ?? []).map { LoraPick(name: $0.name, strength: $0.strength) }
+        var extras: [String: String] = [:]               // saved words minus the add-on's own
+        for l in meta.loras ?? [] {
+            guard let saved = l.triggers else { continue }
+            let own = loraLibrary.first { $0.file == l.name }?.triggers ?? []
+            let more = saved.filter { !own.contains($0) }
+            if !more.isEmpty { extras[l.name] = more.joined(separator: ", ") }
+        }
+        loraExtra = extras
         fixedSeed = meta.seed
         photo = nil
         morePhotos = []

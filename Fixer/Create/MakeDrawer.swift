@@ -197,10 +197,29 @@ extension CreateScreen {
         if mode == "video" { videoLoras = picks } else { loras = picks }
     }
 
-    /// What goes with the next run: the picks that fit. (The computer adds the "always" ones itself.)
+    /// What goes with the next run: the picks that fit, then the "always use" add-ons that were never picked, so
+    /// their extra activation words are sent too.
     var activeLoras: [LoraPick] {
-        let names = Set(fittingLoras.map(\.file))
-        return loraPicks.filter { names.contains($0.name) }
+        let fitting = fittingLoras
+        let names = Set(fitting.map(\.file))
+        let picks = loraPicks.filter { names.contains($0.name) }
+        let picked = Set(picks.map(\.name))
+        let always = fitting.filter { $0.alwaysOn && !picked.contains($0.file) }
+            .map { LoraPick(name: $0.file, strength: $0.strength) }
+        return picks + always
+    }
+
+    /// The names of add-ons the computer will leave out: it uses 4 at once, a video pair counting as 2, and keeps
+    /// them in this order (the same walk as the computer's).
+    var loraLeftOut: [String] {
+        var total = 0
+        var out: [String] = []
+        for p in activeLoras {
+            let e = loraLibrary.first { $0.file == p.name }
+            let weight = (e?.pair ?? false) ? 2 : 1
+            if total + weight <= 4 { total += weight } else { out.append(e?.name ?? p.name) }
+        }
+        return out
     }
 
     func isLoraOn(_ e: LoraEntry) -> Bool {
@@ -273,7 +292,13 @@ extension CreateScreen {
 
     var loraSection: some View {
         let fitting = fittingLoras
+        let leftOut = loraLeftOut
         return VStack(alignment: .leading, spacing: 12) {
+            if !leftOut.isEmpty {
+                Text("Only 4 add-ons can be used at once (a video pair counts as 2). Left out: "
+                     + leftOut.joined(separator: ", ") + ".")
+                    .font(.caption).foregroundStyle(.orange)
+            }
             if fitting.isEmpty {
                 Text("No add-ons for \(loraModelName) on your computer yet.")
                     .font(.footnote).foregroundStyle(Fx.secondaryText)
@@ -553,32 +578,43 @@ private struct SwipeToDelete<Content: View>: View {
     var onDelete: () -> Void
     @ViewBuilder var content: () -> Content
     @State private var offset: CGFloat = 0
+    @State private var horizontal = false         // this drag is a sideways swipe, not a scroll
+    @State private var dragStart: CGPoint?        // tells a new drag from the last, even one the system cancelled
     private let reveal: CGFloat = 96
 
     var body: some View {
-        ZStack(alignment: .trailing) {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(.red)
-                .overlay(alignment: .trailing) {
-                    Image(systemName: "trash")
-                        .foregroundStyle(.white)
-                        .frame(width: reveal)
-                        .opacity(offset < -8 ? 1 : 0)
+        content()
+            .offset(x: offset)
+            .background(alignment: .trailing) {
+                // The tile is see-through, so the red is drawn only where the row has slid away.
+                if offset < 0 {
+                    Color.red
+                        .overlay(alignment: .trailing) {
+                            Image(systemName: "trash")
+                                .foregroundStyle(.white)
+                                .frame(width: reveal)
+                        }
+                        .frame(width: -offset)
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                 }
-            content()
-                .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Fx.tile))
-                .offset(x: offset)
-                .gesture(
-                    DragGesture(minimumDistance: 24)
-                        .onChanged { v in
-                            guard abs(v.translation.width) > abs(v.translation.height) else { return }
-                            offset = max(-reveal, min(0, v.translation.width))
+            }
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 24)
+                    .onChanged { v in
+                        if v.startLocation != dragStart {
+                            dragStart = v.startLocation
+                            horizontal = abs(v.translation.width) > abs(v.translation.height)
                         }
-                        .onEnded { v in
-                            if v.translation.width < -reveal / 2 { onDelete() }
-                            withAnimation(.snappy(duration: 0.2)) { offset = 0 }
-                        }
-                )
-        }
+                        guard horizontal else { return }
+                        offset = max(-reveal, min(0, v.translation.width))
+                    }
+                    .onEnded { v in
+                        if horizontal, v.translation.width < -reveal / 2 { onDelete() }
+                        dragStart = nil
+                        horizontal = false
+                        withAnimation(.snappy(duration: 0.2)) { offset = 0 }
+                    }
+            )
     }
 }

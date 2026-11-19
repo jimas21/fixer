@@ -190,6 +190,7 @@ struct LoraBrowser: View {
     @State private var searching = false
     @State private var searchNote: String?
     @State private var searchRun = 0
+    @State private var loadedKey: String?          // the facets the list on screen was loaded for
     @State private var linkText = ""
     @State private var request: LoraRequest?
 
@@ -295,7 +296,11 @@ struct LoraBrowser: View {
                 }
             }
         }
-        .task(id: facetKey) { await search(reset: true) }
+        .task(id: facetKey) {
+            if loadedKey == facetKey, !results.isEmpty { return }      // back from a details page: keep the list
+            await search(reset: true)
+            if !Task.isCancelled { loadedKey = facetKey }
+        }
     }
 
     /// A change to the engines, category, sort or source re-runs the search from the first page.

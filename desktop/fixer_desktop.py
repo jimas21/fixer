@@ -4585,10 +4585,11 @@ LORA_CIVITAI_BASE = {                                   # family -> Civitai base
     "sdxl": ["SDXL 1.0", "Pony", "Illustrious", "NoobAI"],   # filter scopes a search without starving it of results)
     "chroma": ["Chroma"],
     "qwen21": ["Qwen", "Qwen 2.1"], "qwen-edit": ["Qwen", "Qwen 2.1"],   # Civitai labels Qwen LoRAs both ways
-    "wan22": ["Wan Video 2.2 I2V-A14B", "Wan Video 2.2 T2V-A14B", "Wan Video 2.2 TI2V-5B"],   # all 2.2 experts
+    "wan22": ["Wan Video 2.2 I2V-A14B", "Wan Video 2.2 T2V-A14B"],   # the 14B experts; the 5B model is not installed
 }
 LORA_WARN_RELATED = "Made for a related model, may look wrong."
 LORA_NO_FIT = "This add-on doesn't fit any model on your computer."
+LORA_WAN_5B = "This add-on was made for a smaller Wan video model that isn't on this computer."
 
 
 def _civitai_token() -> str:
@@ -4730,6 +4731,26 @@ def _family_model_name(family: str) -> str:
     return {"qwen-edit": "Qwen photo edits", "wan22": "Wan 2.2 video"}.get(family, family)
 
 
+def _cap_pairs(picked: list, limit: int = 4) -> list:
+    """Keep add-ons in order while they fit `limit`: a video pair (both files) weighs 2 and is never split, anything
+    else weighs 1. One that does not fit is left out and the walk goes on. `picked` is [(file, strength, entry)]."""
+    kept, total, done = [], 0, set()
+    for item in picked:
+        pid = item[2].get("pair")
+        if pid:
+            if pid in done:
+                continue
+            done.add(pid)
+            group = [x for x in picked if x[2].get("pair") == pid]
+            weight = 2
+        else:
+            group, weight = [item], 1
+        if total + weight <= limit:
+            kept.extend(group)
+            total += weight
+    return kept
+
+
 def _job_loras(requested, family, extra_always_on: bool = True):
     """The LoRAs to use for a job of `family`, plus their trigger words. `requested` is the phone's list
     ([{name, strength}] or file names). Keeps installed LoRAs of the right family (plus 'unknown' ones the user
@@ -4773,7 +4794,7 @@ def _job_loras(requested, family, extra_always_on: bool = True):
         for fn, e in lib.items():
             if e.get("always_on") and e.get("family") == family:
                 add(fn)
-    picked = picked[:4]
+    picked = _cap_pairs(picked)
     triggers: list[str] = []
     for fn, _, e in picked:
         for t in (trig_over[fn] if fn in trig_over else (e.get("triggers") or [])):
@@ -4809,6 +4830,57 @@ def _with_triggers(prompt: str, triggers: list) -> str:
     return (p.rstrip(".") + ((". " if p else "") + ", ".join(extra))).strip()
 
 
+def _header_is_qwen21(header: dict | None) -> bool:
+    """True only when a parsed safetensors header positively says Qwen-Image 2.1."""
+    if not isinstance(header, dict):
+        return False
+    meta = header.get("__metadata__", {})
+    meta = meta if isinstance(meta, dict) else {}
+    kj = " ".join(k for k in header if k != "__metadata__").lower()
+    arch = str(meta.get("modelspec.architecture") or "").lower()
+    base = str(meta.get("ss_base_model_version") or "").lower()
+    return bool("qwen-image-2.1/lora" in kj or "qwen_image_21" in kj or "qwen-image-2.1" in arch
+                or ("2.1" in base and "qwen" in base))
+
+
+def _read_lora_header(path: Path) -> dict | None:
+    try:
+        with open(path, "rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            if n <= 0 or n > SAFE_HEADER_MAX:
+                return None
+            h = json.loads(f.read(n).decode("utf-8"))
+        return h if isinstance(h, dict) else None
+    except Exception:                                    # noqa: BLE001
+        return None
+
+
+def _resort_qwen_loras() -> None:
+    """Add-ons saved before the 2.1 check worked were all filed as qwen-edit. Look once at each one's file and move
+    it to qwen21 on positive evidence only. Changes nothing but family and family_checked; never raises."""
+    if not LORA_LOCK.acquire(blocking=False):
+        return
+    try:
+        lib = _lora_lib()
+        changed = False
+        for fn, e in lib.items():
+            if not isinstance(e, dict) or e.get("family") != "qwen-edit" or "family_checked" in e:
+                continue
+            path = COMFY_LORAS / fn
+            if not path.is_file():
+                continue
+            if _header_is_qwen21(_read_lora_header(path)):
+                e["family"] = "qwen21"
+            e["family_checked"] = True
+            changed = True
+        if changed:
+            _lora_lib_write(lib)
+    except Exception:                                    # noqa: BLE001
+        pass
+    finally:
+        LORA_LOCK.release()
+
+
 def _resolve_family(label: str, header: dict | None) -> tuple[str | None, str | None]:
     """(family, warning) from a source label then the file header (metadata, then key names), in that order.
     (None, reason) when it doesn't fit any model here; (None, None) when it stays unknown and the card must ask."""
@@ -4817,8 +4889,7 @@ def _resolve_family(label: str, header: dict | None) -> tuple[str | None, str | 
     kj = " ".join(keys).lower()
     arch = str(meta.get("modelspec.architecture") or "").lower()
     base = str(meta.get("ss_base_model_version") or "").lower()
-    qwen21_file = ("qwen-image-2.1/lora" in kj or "qwen_image_21" in kj or "qwen-image-2.1" in arch
-                   or ("2.1" in base and "qwen" in base))
+    qwen21_file = _header_is_qwen21(header)
     L = (label or "").strip().lower()
     if L:
         if L == "sdxl 1.0":
@@ -4828,9 +4899,11 @@ def _resolve_family(label: str, header: dict | None) -> tuple[str | None, str | 
         if L == "chroma":
             return "chroma", None
         if "wan" in L and "2.2" in L:
+            if "5b" in L:
+                return None, LORA_WAN_5B
             return "wan22", None
         if "qwen" in L:
-            return ("qwen21", None) if ("2" in L and qwen21_file) else ("qwen-edit", None)
+            return ("qwen21", None) if ("2.1" in L or qwen21_file) else ("qwen-edit", None)
         return None, LORA_NO_FIT
     if "qwen-image-2.1/lora" in kj or "qwen_image_21" in kj:
         return "qwen21", None
@@ -5027,6 +5100,7 @@ def job_lora_key(p: dict, emit, cancel):
 
 
 def job_lora_list(p: dict, emit, cancel):
+    _resort_qwen_loras()
     emit({"t": "info", "library": _lora_entries(), "civitai_key": bool(_civitai_token())})
 
 
@@ -5045,6 +5119,7 @@ def job_lora_set(p: dict, emit, cancel):
         e["always_on"] = bool(p.get("always_on"))
     if "family" in p and p.get("family") in LORA_FAMILIES:
         e["family"] = p["family"]
+        e["family_checked"] = True                       # chosen by hand: the Qwen re-sort leaves it alone
     lib[fn] = e
     pair = e.get("pair")
     if pair:                                             # keep both halves of a Wan pair in step
@@ -5227,6 +5302,8 @@ def job_lora_add(p: dict, emit, cancel):
         if "choices" in plan:
             raise UserFacing("That page has several files — choose one first.")
         files = plan["files"]
+        if _resolve_family(plan.get("base", ""), None)[1] == LORA_WAN_5B:
+            raise UserFacing(LORA_WAN_5B)
         picked = str(p.get("family") or "")              # the model the user chose on the card, if any
         is_pair = picked == "wan22" and len(files) >= 2
         if not is_pair and len(files) > 1:
@@ -5254,7 +5331,7 @@ def job_lora_add(p: dict, emit, cancel):
                 if f.get("sha256") and f["sha256"] != sha:
                     raise UserFacing("The download didn't match its checksum, so nothing was added.")
                 fam, fam_warn = _resolve_family(plan.get("base", ""), header)
-                fam = picked or fam
+                fam = "qwen21" if (fam == "qwen21" and picked == "qwen-edit") else (picked or fam)
                 if fam is None:
                     part.unlink(missing_ok=True)
                     raise UserFacing(fam_warn or "Pick the model this add-on is for, then add it again.")

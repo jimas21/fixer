@@ -5032,6 +5032,62 @@ def _civitai_file_rows(files: list) -> list[dict]:
     return rows
 
 
+def _suggested_strength(text: str) -> float | None:
+    """Best-effort guess at a LoRA's suggested weight, pulled from its Civitai description. Civitai has no
+    structured field for this, so creators write it in free text -- this scans for it and is never
+    authoritative. Returns a value in 0.1..2.0 rounded to the slider's 0.05 step, or None when nothing
+    convincing is found. Looks for the <lora:name:0.8> prompt syntax first (the most reliable signal), then a
+    number sitting next to the words "weight" or "strength"."""
+    if not text:
+        return None
+    import html as _html
+    raw = _html.unescape(str(text))                            # entities decoded; <lora:...> tags still intact
+    t = re.sub(r"<[^>]+>", " ", raw)                           # tags stripped, for the keyword scans below
+
+    def snap(x) -> float | None:
+        try:
+            v = float(x)
+        except (TypeError, ValueError):
+            return None
+        return round(round(v / 0.05) * 0.05, 2) if 0.1 <= v <= 2.0 else None
+
+    num = r"([012](?:\.\d+)?)"                                  # 0.x / 1.x / 2(.0); first digit capped so steps/CFG don't match
+    kw = r"(?:recommended\s+|suggested\s+)?(?:lora\s+)?(?:weight|strength)"
+    # 1) explicit prompt syntax, e.g. <lora:someStyle:0.8> -- scanned on raw text, before tags are stripped
+    for m in re.finditer(rf"<lora:[^:>\s]+:\s*{num}\s*>", raw, re.I):
+        v = snap(m.group(1))
+        if v is not None:
+            return v
+    # 2) a range next to the keyword, e.g. "weight 0.6-0.8" or "0.6 to 0.8 strength" -> midpoint
+    for pat in (rf"{kw}\D{{0,14}}{num}\s*(?:-|–|—|to)\s*{num}",
+                rf"{num}\s*(?:-|–|—|to)\s*{num}\D{{0,14}}{kw}"):
+        m = re.search(pat, t, re.I)
+        if m:
+            a, b = snap(m.group(1)), snap(m.group(2))
+            if a is not None and b is not None:
+                return round(round((a + b) / 2 / 0.05) * 0.05, 2)
+    # 3) a single number next to the keyword, e.g. "weight: 0.8", "strength of 0.7", "0.8 weight"
+    for pat in (rf"{kw}\D{{0,14}}{num}", rf"{num}\s*{kw}"):
+        m = re.search(pat, t, re.I)
+        if m:
+            v = snap(m.group(1))
+            if v is not None:
+                return v
+    return None
+
+
+def _civitai_description(model_id: str, v: dict) -> str:
+    """The free text where a suggested weight might live: the version notes, plus the model's own description
+    (one extra read, guarded -- a failure here must never break an add)."""
+    parts = [str(v.get("description") or "")]
+    try:
+        if model_id:
+            parts.append(str(_api_json(f"{CIVITAI_API}/models/{model_id}").get("description") or ""))
+    except Exception:
+        pass
+    return "\n".join(parts)
+
+
 def _plan_from_descriptor(d: dict) -> dict:
     """A source descriptor -> a download plan {source, source_id, name, base, triggers, files:[...]} or a
     {choices:[...]} when the user must pick one of several files."""
@@ -5050,7 +5106,8 @@ def _plan_from_descriptor(d: dict) -> dict:
             raise UserFacing("That add-on has no safetensors file.")
         name = (v.get("model") or {}).get("name") or v.get("name") or f"civitai-{version}"
         return {"source": "civitai", "source_id": f"civitai:{model}@{version}", "name": name,
-                "base": v.get("baseModel", ""), "triggers": v.get("trainedWords") or [], "files": rows}
+                "base": v.get("baseModel", ""), "triggers": v.get("trainedWords") or [], "files": rows,
+                "strength": _suggested_strength(_civitai_description(model, v))}
     if k in ("hf_repo", "hf_file"):
         repo = d["repo"]
         if k == "hf_file":
@@ -5342,9 +5399,11 @@ def job_lora_add(p: dict, emit, cancel):
                 part.unlink(missing_ok=True)
                 raise
             role = _wan_role(f["name"]) if fam == "wan22" and is_pair else None
+            seed = plan.get("strength")                  # a weight guessed from the Civitai description, if any
             lib[final.name] = {"name": plan["name"], "family": fam, "source": plan["source"],
                                "source_id": plan.get("source_id", ""), "sha256": sha, "size": size,
-                               "triggers": plan.get("triggers") or [], "strength": 1.0, "pair": pair_id,
+                               "triggers": plan.get("triggers") or [],
+                               "strength": float(seed) if seed else 1.0, "pair": pair_id,
                                "role": role, "always_on": False}
             added.append({"file": final.name, "family": fam})
         _lora_lib_write(lib)

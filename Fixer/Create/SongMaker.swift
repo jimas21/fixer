@@ -641,8 +641,10 @@ struct SongMakerView: View {
                 } else {
                     ForEach(store.entries) { e in
                         switch e {
-                        case .song(let s): songRow(s)
-                        case .album(let id, let title, let tracks): albumCard(id, title, tracks)
+                        case .song(let s): songRow(s).swipeToDelete(s.displayTitle) { store.delete(s) }
+                        case .album(let id, let title, let tracks):
+                            albumCard(id, title, tracks)
+                                .swipeToDelete(title, enabled: !openAlbums.contains(id)) { store.deleteAlbum(id) }
                         }
                     }
                 }
@@ -1131,7 +1133,7 @@ struct SongMakerView: View {
                 }
             }
             if open {
-                ForEach(tracks) { s in songRow(s, inAlbum: true) }
+                ForEach(tracks) { s in songRow(s, inAlbum: true).swipeToDelete(s.displayTitle) { store.delete(s) } }
             }
         }
         .padding(12)
@@ -1194,7 +1196,8 @@ struct SongMakerView: View {
             }
         }
         .padding(inAlbum ? 0 : 12)
-        .background { if !inAlbum { RoundedRectangle(cornerRadius: 16, style: .continuous).fill(Fx.tile) } }
+        .background(Fx.tile)                         // opaque, so a swipe slides it over the red Delete
+        .clipShape(RoundedRectangle(cornerRadius: inAlbum ? 0 : 16, style: .continuous))
     }
 
     /// The song's style and lyrics back in the form, to change and make again.
@@ -1242,5 +1245,72 @@ struct SongMakerView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(.bar)
+    }
+}
+
+
+// MARK: - Swipe to delete
+
+/// 11-20 (the owner: "need to swipe to delete songs quickly"). The song list is not a List, so this is the iOS
+/// gesture by hand: swipe left to show Delete (tap it), or swipe all the way to delete at once. Vertical scrolling
+/// is untouched: only a mostly sideways drag moves the row.
+private struct SwipeToDelete: ViewModifier {
+    let title: String
+    let enabled: Bool
+    let onDelete: () -> Void
+    @State private var offset: CGFloat = 0
+    @State private var width: CGFloat = 320
+    private let reveal: CGFloat = 88
+
+    func body(content: Content) -> some View {
+        ZStack(alignment: .trailing) {
+            if offset < 0 {
+                Button(role: .destructive) { remove() } label: {
+                    Label("Delete", systemImage: "trash")
+                        .labelStyle(.iconOnly)
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: max(reveal, -offset), alignment: .center)
+                        .frame(maxHeight: .infinity)
+                }
+                .buttonStyle(.plain)
+                .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(Fx.danger))
+                .accessibilityLabel("Delete \(title)")
+            }
+            content
+                .offset(x: offset)
+                .background(GeometryReader { g in Color.clear.onAppear { width = g.size.width } })
+                .simultaneousGesture(
+                    DragGesture(minimumDistance: 18)
+                        .onChanged { v in
+                            guard enabled, abs(v.translation.width) > abs(v.translation.height) * 1.4 else { return }
+                            let base: CGFloat = offset <= -reveal + 1 && v.translation.width > 0 ? -reveal : 0
+                            offset = min(0, base + v.translation.width)
+                        }
+                        .onEnded { v in
+                            guard enabled else { return }
+                            if offset < -width * 0.6 {
+                                remove()
+                            } else {
+                                withAnimation(Motion.pop) { offset = offset < -reveal * 0.5 ? -reveal : 0 }
+                            }
+                        }
+                )
+        }
+        .accessibilityAction(named: "Delete") { remove() }
+    }
+
+    private func remove() {
+        withAnimation(Motion.pop) { offset = -width }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+            onDelete()
+            offset = 0
+        }
+    }
+}
+
+extension View {
+    func swipeToDelete(_ title: String, enabled: Bool = true, _ onDelete: @escaping () -> Void) -> some View {
+        modifier(SwipeToDelete(title: title, enabled: enabled, onDelete: onDelete))
     }
 }

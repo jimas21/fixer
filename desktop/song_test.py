@@ -334,6 +334,25 @@ except fd.UserFacing:
     check(True, "")
 check(fd._job_kind("artwork", {}) == "artwork" and "artwork" in fd.QUEUED_OPS, "artwork is queued")
 
+# a recording's own tempo and key carry into the song (folded into 60-180 BPM)
+fd._comfy_run = fake_run
+fd._chat_llama = writer_answer(good)
+fd._analyse_audio = lambda path: (240, "F# minor")
+run({"prompt": "x", "reference": base64.b64encode(b"RIFF").decode(), "reference_ext": "wav", "seconds": 30})
+enc = ran["wf"]["3"]["inputs"]
+check(enc["bpm"] == 120 and enc["keyscale"] == "F# minor", "the recording's tempo (halved into range) and key")
+fd._analyse_audio = lambda path: (None, None)
+run({"prompt": "x", "reference": base64.b64encode(b"RIFF").decode(), "reference_ext": "wav", "seconds": 30})
+check(ran["wf"]["3"]["inputs"]["bpm"] == 180, "unreadable recording: the writer's tempo stays")
+# two-pass voice match: the second sampler redraws the first with the recording's voice
+run({"prompt": "x", "reference": base64.b64encode(b"RIFF").decode(), "reference_ext": "wav", "seconds": 30,
+     "reference_match": "revoice", "revoice": 0.55})
+wf = ran["wf"]
+check(wf["13"]["inputs"]["latent_image"] == ["6", 0] and wf["13"]["inputs"]["positive"] == ["12", 0]
+      and wf["7"]["inputs"]["samples"] == ["13", 0] and wf["13"]["inputs"]["denoise"] == 0.55
+      and wf["3"]["inputs"]["generate_audio_codes"] is True and wf["6"]["inputs"]["latent_image"] == ["5", 0],
+      "voice match: lyrics first, then re-voiced from the recording")
+
 # the voice line goes first in the tags (and never for an instrumental)
 fd._chat_llama = writer_answer(json.dumps({"tags": "country, banjo", "voice": "male, deep bass-baritone, gravelly",
                                            "lyrics": "[Verse 1]\nalong the road again tonight"}))

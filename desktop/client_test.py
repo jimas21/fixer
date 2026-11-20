@@ -87,6 +87,11 @@ def main():
     ap.add_argument("--ref", help="song: a recording to start from (cover mode)")
     ap.add_argument("--link", help="song: a link to a recording (YouTube, SoundCloud…)")
     ap.add_argument("--artist", action="append", help="song/album: an artist it should sound like (repeatable)")
+    ap.add_argument("--match", help="song with a recording: start | voice | both")
+    ap.add_argument("--keep", help="song with a recording: loose | balanced | close")
+    ap.add_argument("--asis", action="store_true", help="song: sing --tags and --lyrics as given (no writing)")
+    ap.add_argument("--seed", type=int)
+    ap.add_argument("--revoice", type=float)
     ap.add_argument("--out", help="save the image here (default: nothing is written)")
     ap.add_argument("--url", default=f"http://127.0.0.1:{pair.PORT}")
     a = ap.parse_args()
@@ -115,6 +120,16 @@ def main():
             payload["reference_url"] = a.link
         if a.artist:
             payload["artists"] = [{"name": x} for x in a.artist]
+        if a.match:
+            payload["reference_match"] = a.match
+        if a.keep:
+            payload["reference_keep"] = a.keep
+        if a.asis:
+            payload["write"] = False
+        if a.seed:
+            payload["seed"] = a.seed
+        if a.revoice:
+            payload["revoice"] = a.revoice
     else:
         op, payload = "image", {"prompt": a.text, "model": a.model, "steps": a.steps, "guidance": 1.0}
         if a.op == "edit":

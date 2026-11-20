@@ -4076,7 +4076,8 @@ def _song_ready() -> bool:
 
 
 def _song_workflow(tags: str, lyrics: str, seconds: float, seed: int, bpm: int, key: str,
-                   language: str = "en", reference: str | None = None, keep: float = 0.45) -> dict:
+                   language: str = "en", reference: str | None = None, keep: float = 0.45,
+                   match: str = "start", revoice: float = 0.6) -> dict:
     """The ComfyUI template's graph (audio_ace_step_1_5_checkpoint), saved as MP3 and read back by _comfy_run.
     11-20 `reference` (a file in ComfyUI's private input folder): the recording is the starting point. The song is
     still planned from these tags and lyrics (the model's audio codes), then drawn starting from the recording with
@@ -4089,8 +4090,23 @@ def _song_workflow(tags: str, lyrics: str, seconds: float, seed: int, bpm: int, 
         wf["10"] = {"class_type": "TrimAudioDuration", "inputs": {"audio": ["9", 0], "start_index": 0.0,
                                                                    "duration": float(seconds)}}
         wf["11"] = {"class_type": "VAEEncodeAudio", "inputs": {"audio": ["10", 0], "vae": ["1", 2]}}
-        wf["6"]["inputs"]["latent_image"] = ["11", 0]
-        wf["6"]["inputs"]["denoise"] = round(1.0 - max(0.1, min(0.8, keep)), 2)
+        if match in ("start", "both"):                 # the recording is where the song starts
+            wf["6"]["inputs"]["latent_image"] = ["11", 0]
+            wf["6"]["inputs"]["denoise"] = round(1.0 - max(0.1, min(0.8, keep)), 2)
+        if match in ("voice", "both"):                 # ACE-Step's own voice-and-sound reference
+            wf["3"]["inputs"]["generate_audio_codes"] = False   # ComfyUI drops the codes with a reference anyway
+            wf["12"] = {"class_type": "ReferenceTimbreAudio", "inputs": {"conditioning": ["3", 0], "latent": ["11", 0]}}
+            wf["6"]["inputs"]["positive"] = ["12", 0]
+        if match == "revoice":
+            # 11-20: two passes. The first sings the lyrics as planned (the audio codes on); the second redraws that
+            # song from part way with the recording's voice and sound (ACE-Step's reference), so the words stay.
+            wf["12"] = {"class_type": "ReferenceTimbreAudio", "inputs": {"conditioning": ["3", 0], "latent": ["11", 0]}}
+            wf["13"] = {"class_type": "KSampler",
+                        "inputs": {"model": ["2", 0], "positive": ["12", 0], "negative": ["4", 0],
+                                   "latent_image": ["6", 0], "seed": seed + 1, "steps": 8, "cfg": 1.0,
+                                   "sampler_name": "euler", "scheduler": "simple",
+                                   "denoise": round(max(0.2, min(0.9, revoice)), 2)}}
+            wf["7"]["inputs"]["samples"] = ["13", 0]
     return wf
 
 
@@ -4307,13 +4323,79 @@ def job_song_write(p: dict, emit, cancel):
 
 
 def _sing(tags: str, lyrics: str, seconds: int, seed: int, bpm: int, key: str, language: str, emit, cancel,
-          label: str = "Making the song…", reference: str | None = None, keep: float = 0.45) -> bytes:
-    return asyncio.run(_comfy_run(_song_workflow(tags, lyrics, seconds, seed, bpm, key, language, reference, keep),
+          label: str = "Making the song…", reference: str | None = None, keep: float = 0.45,
+          match: str = "start", revoice: float = 0.6) -> bytes:
+    return asyncio.run(_comfy_run(_song_workflow(tags, lyrics, seconds, seed, bpm, key, language, reference, keep,
+                                                 match, revoice),
                                   emit, cancel, audio=True, label=label))
 
 
 SONG_REF_MAX = 30 * 1024 * 1024                         # a reference recording: 30 MB at most
 SONG_REF_EXT = {"mp3", "m4a", "wav", "aac", "flac", "ogg", "caf", "aiff", "aif", "mp4"}
+
+
+_KEY_NAMES = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
+_MAJOR = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88]   # Krumhansl-Kessler profiles
+_MINOR = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17]
+
+
+def _analyse_audio(path: Path, seconds: float = 90.0) -> tuple[int | None, str | None]:
+    """11-20: a recording's tempo (BPM) and key ("A minor"), so a song made from it keeps them. Plain numpy on the
+    first 90 s: tempo from the autocorrelation of the onset strength, key from a chroma profile matched against
+    the major and minor key profiles. (None, None) when it can't be read."""
+    try:
+        import av
+        import numpy as np
+    except ImportError:
+        return None, None
+    sr = 22050
+    try:
+        with av.open(str(path)) as c:
+            rs = av.AudioResampler(format="s16", layout="mono", rate=sr)
+            chunks, total = [], 0
+            for frame in c.decode(audio=0):
+                for f in rs.resample(frame):
+                    a = f.to_ndarray().reshape(-1)
+                    chunks.append(a)
+                    total += a.size
+                if total >= sr * seconds:
+                    break
+        y = np.concatenate(chunks).astype(np.float32) / 32768.0 if chunks else None
+    except Exception as e:                             # noqa: BLE001
+        log.info("audio analysis skipped: %s", e.__class__.__name__)
+        return None, None
+    if y is None or y.size < sr * 8:
+        return None, None
+    n, hop = 2048, 512
+    frames = 1 + (y.size - n) // hop
+    idx = np.arange(n)[None, :] + hop * np.arange(frames)[:, None]
+    spec = np.abs(np.fft.rfft(y[idx] * np.hanning(n), axis=1))
+    # tempo: onset strength (positive spectral flux), its autocorrelation, the strongest lag in 60-180 BPM
+    flux = np.maximum(0.0, np.diff(np.log1p(spec), axis=0)).sum(axis=1)
+    flux -= flux.mean()
+    ac = np.correlate(flux, flux, mode="full")[flux.size - 1:]
+    fps = sr / hop
+    lags = np.arange(ac.size)
+    ok = (lags >= fps * 60 / 180) & (lags <= fps * 60 / 60)
+    bpm = None
+    if ok.any():
+        best = lags[ok][np.argmax(ac[ok])]
+        bpm = int(round(60 * fps / best))
+    # key: energy per pitch class from 55 Hz to 2 kHz, matched against every major and minor key
+    freqs = np.fft.rfftfreq(n, 1 / sr)
+    band = (freqs >= 55) & (freqs <= 2000)
+    pcs = (np.round(12 * np.log2(freqs[band] / 440.0)) + 9).astype(int) % 12
+    energy = spec[:, band].sum(axis=0)
+    chroma = np.bincount(pcs, weights=energy, minlength=12)
+    if chroma.sum() <= 0:
+        return bpm, None
+    best_key, best_r = None, -2.0
+    for mode, prof in (("major", _MAJOR), ("minor", _MINOR)):
+        for k in range(12):
+            r = np.corrcoef(chroma, np.roll(prof, k))[0, 1]
+            if r > best_r:
+                best_key, best_r = f"{_KEY_NAMES[k]} {mode}", r
+    return bpm, best_key if best_key in SONG_KEYS else None
 
 
 def _song_reference(p: dict) -> tuple[str, Path] | None:
@@ -4444,6 +4526,18 @@ def job_song(p: dict, emit, cancel):
         status("Getting the recording from the link…")
     ref = _song_reference(p)                           # a link sets p["reference_seconds"]
     try:
+        if ref:
+            # 11-20: the recording's own tempo and key, so the song made from it keeps them
+            status("Listening to the recording…")
+            r_bpm, r_key = _analyse_audio(ref[1])
+            while r_bpm and r_bpm > 180:
+                r_bpm //= 2
+            while r_bpm and r_bpm < 60:
+                r_bpm *= 2
+            if r_bpm:
+                bpm = r_bpm
+            if r_key:
+                key = r_key
         if not seconds:
             ref_s = _song_seconds(p.get("reference_seconds")) if ref else None
             seconds = ref_s or (SONG_AUTO_DEFAULT if lyrics == "[Instrumental]" else _lyrics_seconds(lyrics))
@@ -4457,7 +4551,9 @@ def job_song(p: dict, emit, cancel):
         status("Loading the song model…")
         mp3 = _sing(tags, lyrics, seconds, seed, bpm, key, s["language"], emit, cancel,
                     reference=ref[0] if ref else None,
-                    keep=SONG_KEEP.get(str(p.get("reference_keep") or "balanced"), SONG_KEEP["balanced"]))
+                    keep=SONG_KEEP.get(str(p.get("reference_keep") or "balanced"), SONG_KEEP["balanced"]),
+                    match=p.get("reference_match") if p.get("reference_match") in ("start", "voice", "both", "revoice")
+                    else "start", revoice=float(p.get("revoice") or 0.6))
     finally:
         if ref:
             ref[1].unlink(missing_ok=True)             # the recording never outlives the job

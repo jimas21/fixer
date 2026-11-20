@@ -12,7 +12,9 @@ enum TidyText {
 
     static let eraseTitle = "Erase everything"
     static let eraseCaption = "Deletes every chat, picture and video on this iPhone and on your computer. "
-        + "Protected Library items stay, and your songs too unless you choose otherwise. This can't be undone."
+        + "Protected Library items stay, and so do your songs while \"Keep my songs\" is on. This can't be undone."
+    /// 11-20 (the owner: "it should just be a toggle, do not ask every time"): one saved setting, on by default.
+    static let keepSongsKey = "erase.keepSongs"
     static let eraseConfirmTitle = "Erase everything?"
     static let eraseConfirmButton = "Erase everything"
 
@@ -84,7 +86,6 @@ private struct TidyEraseFlow: ViewModifier {
     var onClear: () -> Void
     var onFinished: () -> Void
     @State private var sheeted = false
-    @State private var songsToo = false
 
     private func finish() {
         sheeted = false
@@ -94,22 +95,14 @@ private struct TidyEraseFlow: ViewModifier {
     func body(content: Content) -> some View {
         content
             .confirmationDialog(TidyText.eraseConfirmTitle, isPresented: $asking, titleVisibility: .visible) {
-                // 11-20 (the owner: "toggles for content like music that we don't need to clear every time"):
-                // with songs on the phone the choice is right here, keeping them first.
-                if SongStore.shared.songs.isEmpty {
-                    Button(TidyText.eraseConfirmButton, role: .destructive) { songsToo = false; sheeted = true }
-                } else {
-                    Button("Erase everything, keep my songs", role: .destructive) { songsToo = false; sheeted = true }
-                    Button("Erase everything, songs too", role: .destructive) { songsToo = true; sheeted = true }
-                }
+                Button(TidyText.eraseConfirmButton, role: .destructive) { sheeted = true }
                 Button("Cancel", role: .cancel) {}
             } message: {
                 Text(TidyText.eraseCaption)
             }
             .sheet(isPresented: $sheeted) {
                 NavigationStack {
-                    ClearEverythingView(chat: chat, onClear: onClear, onFinished: { finish() }, startNow: true,
-                                        eraseSongs: songsToo)
+                    ClearEverythingView(chat: chat, onClear: onClear, onFinished: { finish() }, startNow: true)
                 }
             }
     }
@@ -145,6 +138,7 @@ struct TidyEraseSection: View {
     var onClear: () -> Void
     var onFinished: () -> Void = {}
     @State private var asking = false
+    @AppStorage(TidyText.keepSongsKey) private var keepSongs = true
 
     var body: some View {
         Section {
@@ -152,6 +146,7 @@ struct TidyEraseSection: View {
                 Label(TidyText.eraseTitle, systemImage: "trash").frame(maxWidth: .infinity, alignment: .leading)
             }
             .modifier(TidyEraseFlow(chat: chat, asking: $asking, onClear: onClear, onFinished: onFinished))
+            Toggle(isOn: $keepSongs) { Label("Keep my songs when erasing", systemImage: "music.note") }
         } footer: {
             Text(TidyText.eraseCaption)
         }

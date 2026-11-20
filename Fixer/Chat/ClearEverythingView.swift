@@ -7,7 +7,7 @@ struct ClearEverythingView: View {
     var onClear: () -> Void                    // the chat screen drops its draft, attachment and viewers
     var onFinished: () -> Void                 // closes History
     var startNow = false                       // already confirmed by the caller, go straight to erasing
-    var eraseSongs = false                     // 11-20: songs stay unless this erase was asked to take them too
+    @AppStorage(TidyText.keepSongsKey) private var keepSongs = true    // 11-20: the saved "Keep my songs" setting
     @ObservedObject private var desktop = Desktop.shared
     @Environment(\.dismiss) private var dismiss
 
@@ -18,8 +18,7 @@ struct ClearEverythingView: View {
     @State private var steps: [Step] = []
     @State private var confirm = false
     @State private var summary = ""
-    @State private var songsToo: Bool?
-    private var takeSongs: Bool { songsToo ?? eraseSongs }
+    private var takeSongs: Bool { !keepSongs }
     private var songCount: Int { SongStore.shared.songs.count }
 
     enum Stage { case review, erasing, finished }
@@ -57,8 +56,8 @@ struct ClearEverythingView: View {
             count("Videos", inventory.videos, "film")
             count("Pictures on the Make screen", created, "paintbrush.pointed")
             if songCount > 0 {
-                Toggle(isOn: Binding(get: { takeSongs }, set: { songsToo = $0 })) {
-                    Label("Erase my \(plural(songCount, "song", "songs")) too", systemImage: "music.note")
+                Toggle(isOn: $keepSongs) {
+                    Label("Keep my \(plural(songCount, "song", "songs"))", systemImage: "music.note")
                 }
             }
             if library.unprotected > 0 {
@@ -212,7 +211,7 @@ struct ClearEverythingView: View {
         await step("songs") {
             if takeSongs { return plural(SongStore.shared.deleteAll(), "song", "songs") + " deleted" }
             SongStore.shared.cancel()
-            return songsBefore == 0 ? "None" : plural(songsBefore, "song", "songs") + " kept, as you chose"
+            return songsBefore == 0 ? "None" : plural(songsBefore, "song", "songs") + " kept (Keep my songs is on)"
         }
         await step("scratch") {
             let n = History.scratchLeft

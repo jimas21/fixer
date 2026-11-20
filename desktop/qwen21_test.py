@@ -97,7 +97,23 @@ def class_known(cls: str) -> bool | None:
     return bool(re.search(rf'(node_id\s*=\s*"{cls}"|"{cls}"\s*:|class {cls}\b)', texts))
 
 
-def case_graphs():
+
+import contextlib
+
+
+@contextlib.contextmanager
+def adult_21():
+    """11-19 (a594535): Qwen 2.1 is the everyday model, so it never loads the explicit add-on. The add-on rules still
+    hold for a 2.1 the owner marks 18+ (phone_config "adult_models"), so those checks run with it marked so."""
+    real = fd._adult_models
+    fd._adult_models = lambda: {*real(), "qwen21"}
+    try:
+        yield
+    finally:
+        fd._adult_models = real
+
+
+def _graphs():
     install_21()
     lora = ("chatrlabs-omni-lora-v0.1-bf16.safetensors", 1.0)
     graphs = {
@@ -183,7 +199,7 @@ def case_refs():
 
 # ------------------------------------------------------------------ the explicit switch
 
-def case_switch():
+def _switch():
     install_21()
     L = ("chatrlabs-omni-lora-v0.1-bf16.safetensors", 1.0)
     ex = fd._qwen21_explicit
@@ -228,19 +244,41 @@ def case_switch():
     check(fd._qwen21_ready() and fd._qwen21_te() == fd.QWEN21_TE, "the W4A8 reader is preferred")
 
 
+
+def case_graphs():
+    with adult_21():
+        _graphs()
+
+
+def case_switch():
+    install_21()
+    check(fd._qwen21_explicit("On") is None and fd._qwen21_explicit("Auto", True) is None,
+          "everyday 2.1: never the add-on, even with On or the brain's yes")
+    with adult_21():
+        _switch()
+
+
 def case_recipe_and_lineup():
     install_21()
     r = fd.CREATE_RECIPES["qwen21"]
     check(fd._recipe_ready(r), "the 2.1 recipe is ready when its files are here")
     c = {x["key"]: x for x in fd._recipe_controls(r)}
-    check("explicit" in c and c["explicit"]["options"] == ["Auto", "On", "Off"] and c["explicit"]["default"] == "Auto",
-          "Make gets the Auto / On / Off add-on control")
+    # 11-19 (a594535): 2.1 is an everyday model, so Make shows it no add-on menu; only an 18+ 2.1 gets one.
+    check("explicit" not in c, "everyday 2.1: no explicit add-on menu")
     check("steps" not in c and "sampler" not in c and "scheduler" not in c and "shift" not in c and "detail" not in c,
           "the fixed 8 sigmas hide steps, sampler, schedule, shift and detail")
-    install_21(lora=False)
-    c = {x["key"]: x for x in fd._recipe_controls(r)}
-    check(c["explicit"]["options"] == ["Off"] and "isn't on your computer yet" in c["explicit"]["help"],
-          "no add-on file: only Off, and it says why")
+    real_adult = fd._adult_models
+    fd._adult_models = lambda: {*real_adult(), "qwen21"}
+    try:
+        c = {x["key"]: x for x in fd._recipe_controls(r)}
+        check("explicit" in c and c["explicit"]["options"] == ["Auto", "On", "Off"]
+              and c["explicit"]["default"] == "Auto", "an 18+ 2.1 gets the Auto / On / Off add-on control")
+        install_21(lora=False)
+        c = {x["key"]: x for x in fd._recipe_controls(r)}
+        check(c["explicit"]["options"] == ["Off"] and "isn't on your computer yet" in c["explicit"]["help"],
+              "no add-on file: only Off, and it says why")
+    finally:
+        fd._adult_models = real_adult
     check(all("explicit" not in {x["key"] for x in fd._recipe_controls(o)}
               for k, o in fd.CREATE_RECIPES.items() if k != "qwen21"), "other recipes have no add-on switch")
     # removed lineup
@@ -251,7 +289,8 @@ def case_recipe_and_lineup():
     check(fd.BRAIN_ALIASES[fd.DENSE_BRAIN] == fd.MOE_BRAIN, "the 27B maps to the MoE brain")
     a = fd.AUTO_MODELS_DEFAULT
     check(all(x in fd.CREATE_RECIPES for v in a.values() if isinstance(v, list) for x in v), "auto lists name only real recipes")
-    check("qwen21" not in json.dumps(a), "defaults do not change: 2.1 is not in the auto lists")
+    check(a.get("picture_safe") == ["qwen21"] and "qwen21" not in a["picture"] + a["picture_explicit"],
+          "2.1 is the everyday (18+ off) picture model only")
     cfg = json.loads((Path(__file__).resolve().parent / "phone_config.json").read_text(encoding="utf-8"))
     am = cfg["auto_models"]
     check(all(x in fd.CREATE_RECIPES for v in am.values() if isinstance(v, list) for x in v), "phone_config auto_models are real recipes")
@@ -316,6 +355,11 @@ class FakeRun:
 
 
 def case_pictures():
+    with adult_21():
+        _pictures()
+
+
+def _pictures():
     install_21()
     run = FakeRun()
     saved = (fd._comfy_run, fd._qwen_edit_ready, fd._qwen_explicit)
@@ -379,6 +423,11 @@ def case_pictures():
 
 
 def case_chat():
+    with adult_21():
+        _chat()
+
+
+def _chat():
     install_21()
     run = FakeRun()
     saved = (fd._comfy_run, fd._picture_recipe, fd.COMFY.ensure, fd.COMFY.ensure_current, fd._room_for_pictures,

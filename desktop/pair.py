@@ -32,9 +32,12 @@ def load() -> dict:
     return {"phones": {}}
 
 
+PAIR_WINDOW_S = 60          # 11-19: a new code must be used within this; the server confirms it on first use
+
+
 def save(data: dict):
     ROOT.mkdir(parents=True, exist_ok=True)
-    tmp = KEYS.with_suffix(".tmp")
+    tmp = KEYS.with_name(f"keys.{os.getpid()}.tmp")   # 11-19: per process: two windows (or the server) can't collide
     tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
     os.replace(tmp, KEYS)
 
@@ -50,10 +53,11 @@ def lan_ip() -> str:
 
 def new_pairing(name: str, url: str | None = None, remote: str | None = None) -> tuple[str, str, dict]:
     """Adds a phone with a fresh key and returns (id, the fixer://pair link, the link's fields)."""
+    import time
     data = load()
     pid = secrets.token_hex(6)
     key = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("=")
-    data["phones"][pid] = {"name": name, "key": key}
+    data["phones"][pid] = {"name": name, "key": key, "pair_by": int(time.time()) + PAIR_WINDOW_S}
     save(data)
     q = {"u": url or f"http://{lan_ip()}:{PORT}", "id": pid, "k": key, "n": name}
     try:
@@ -96,17 +100,59 @@ def show_window(name: str):
         messagebox.showerror("Pair a phone", f"Couldn't make a pairing code:\n{e}")
         root.destroy()
         return
+    import time
+    deadline = time.time() + PAIR_WINDOW_S
     pad = {"padx": 18}
-    tk.Label(root, text="Scan with the iPhone camera, then tap the Fixer banner.",
-             font=("Segoe UI", 11, "bold")).pack(pady=(16, 6), **pad)
-    tk.Label(root, image=img).pack(**pad)
+    head = tk.Label(root, text="Scan with the iPhone camera, tap the Fixer banner, then Connect.",
+                    font=("Segoe UI", 11, "bold"))
+    head.pack(pady=(16, 6), **pad)
+    code = tk.Label(root, image=img)
+    code.pack(**pad)
+    clock = tk.Label(root, text="", font=("Segoe UI", 10))
+    clock.pack(pady=(6, 0), **pad)
     where = f"At home: {q['u']}\nAway: {q['r']}" if q.get("r") else (
         f"At home: {q['u']}\nAway: not set up (away_url in local.json), so this phone pairs for home only")
-    tk.Label(root, text=where, font=("Segoe UI", 9), justify="center").pack(pady=(8, 2), **pad)
+    tk.Label(root, text=where, font=("Segoe UI", 9), justify="center").pack(pady=(6, 2), **pad)
     tk.Label(root, text=f"Saved as \"{name}\" ({pid}). The code is this phone's key: don't share a photo of it.",
              font=("Segoe UI", 9), fg="#666", wraplength=420, justify="center").pack(pady=(2, 8), **pad)
     tk.Button(root, text="Close", width=12, command=root.destroy).pack(pady=(0, 16))
     root.bind("<Escape>", lambda _e: root.destroy())
+
+    def tick():
+        """11-19: the code lasts PAIR_WINDOW_S. The server removes "pair_by" when the phone first connects (paired);
+        a code still unused at the deadline is deleted here (the server also drops it within 30 s)."""
+        try:
+            entry = load()["phones"].get(pid)
+        except Exception:                              # noqa: BLE001 - a half-written file: look again next second
+            entry = {"pair_by": deadline}
+        if entry is None:                              # the server already dropped it: expired
+            head.config(text="This code expired.")
+            code.config(image="")
+            clock.config(text="Use \"Pair a phone…\" again for a new one.", fg="#b42318")
+            return
+        if "pair_by" not in entry:
+            head.config(text=f"Paired: \"{name}\" is connected.")
+            code.config(image="")                      # the key is no longer on screen
+            clock.config(text="You can close this window.", fg="#1a7f37")
+            root.after(4000, root.destroy)
+            return
+        left = int(deadline - time.time())
+        if left <= 0:
+            try:
+                data = load()
+                if "pair_by" in (data["phones"].get(pid) or {}):
+                    data["phones"].pop(pid, None)
+                    save(data)
+            except Exception:                          # noqa: BLE001
+                pass
+            head.config(text="This code expired.")
+            code.config(image="")
+            clock.config(text="Use \"Pair a phone…\" again for a new one.", fg="#b42318")
+            return
+        clock.config(text=f"Expires in {left} s", fg="#b42318" if left <= 10 else "#333")
+        root.after(1000, tick)
+
+    tick()
     root.attributes("-topmost", True)                  # it opens from the tray: make sure it isn't hidden behind
     root.after(1500, lambda: root.attributes("-topmost", False))
     root.focus_force()

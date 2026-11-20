@@ -35,8 +35,7 @@ struct FixerApp: App {
             // 11-17: and finished work it kept for this iPhone while Fixer was closed is collected where it was asked for.
             if now == .active {
                 Rules.shared.noteBack()                  // 11-19: away 15 min or more -> Explicit back to its default
-                Desktop.shared.warmUp()
-                Task { await JobInbox.shared.sweep() }
+                Desktop.shared.warmUp()                  // 11-19: one request; it also collects held results
             }
             Privacy.coverScreen(now != .active)        // the app-switcher snapshot shows nothing
             // Settings are rewritten as a new file (which drops the mark), so it's set again on leaving the app.

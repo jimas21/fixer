@@ -132,7 +132,16 @@ final class Desktop: ObservableObject {
     /// their own (a second one arriving late would stop the chat model mid-answer).
     nonisolated static let forgetGate = ForgetGate()
 
-    func pair(_ l: PCLink) { l.save(); link = l; Rules.shared.usePC = true }
+    /// 11-19: contacts the computer at once: a new pairing code works only if it is used within 60 s, and this first
+    /// request is what confirms it (the computer then keeps the pairing for good).
+    func pair(_ l: PCLink) {
+        l.save(); link = l; Rules.shared.usePC = true
+        brainReadyAt = nil
+        Task {
+            await Self.routeMemory.clear()             // the new addresses race fresh
+            warmUp(force: true)
+        }
+    }
     func unpair() { PCLink.forget(); link = nil; Rules.shared.usePC = false }
 
     /// 11-17: set once any reply frame reached the caller, so a drop after that is never re-sent to the other address
@@ -767,8 +776,19 @@ final class Desktop: ObservableObject {
         Task.detached(priority: .userInitiated) {
             // 11-19: the first frame says at once whether the chat model is up; the last one comes when it is.
             // Until "ready" the phone answers on itself, so its own model loads now (only if it is already here).
+            // 11-19: app open is one request: that first frame also carries the config (was its own "config" call)
+            // and how many finished results the computer holds for this phone (the inbox asks only when > 0).
+            var gotConfig = false, held: Int? = nil
             do {
                 for try await f in frames {
+                    if let c = f["config"] as? [String: Any] {
+                        gotConfig = true
+                        await MainActor.run {
+                            RemoteConfig.save(c)
+                            Rules.shared.refreshDefaultPersonality()
+                        }
+                    }
+                    if let n = f["held"] as? Int { held = n }
                     if let s = f["brain_state"] as? String {
                         await MainActor.run { Desktop.shared.noteBrain(ready: s == "ready") }
                     } else if f["warm"] as? Bool == true {        // a computer from before 11-19: up after the warm
@@ -777,9 +797,11 @@ final class Desktop: ObservableObject {
                 }
             } catch {
                 await MainActor.run { Desktop.shared.noteBrain(ready: false) }
+                return
             }
+            if !gotConfig { await Desktop.shared.refreshConfig() }      // a computer from before 11-19
+            if held ?? 1 > 0 { await JobInbox.shared.sweep() }           // unknown (older computer): look anyway
         }
-        Task { await refreshConfig() }
     }
 
     private var leaveSent = false
@@ -787,11 +809,19 @@ final class Desktop: ObservableObject {
 
     /// 11-19: when the computer last said its chat model is up (or last answered a chat). Chat goes to the computer
     /// only while this is fresh; otherwise this iPhone answers at once and the computer takes over when it's ready.
-    private var brainReadyAt: Date?
+    @Published private var brainReadyAt: Date?      // published: the chat screen's "where it answers" light
 
     /// True when a chat sent now should go to the computer: its model was up within the last 15 minutes (it unloads
     /// after 20 idle). False -> answer on this iPhone (see `Chat.think`), unless the iPhone has no model of its own.
     var pcBrainReady: Bool { brainReadyAt.map { Date().timeIntervalSince($0) < 15 * 60 } ?? false }
+
+    /// 11-19: where the NEXT chat answer comes from — the same rule `Chat.send` uses, so the light never disagrees.
+    enum AnswerSource { case computer, iPhoneWarming, iPhone }
+    var answerSource: AnswerSource {
+        guard isOn else { return .iPhone }
+        if pcBrainReady || !Brain.shared.hasLocalModel { return .computer }
+        return .iPhoneWarming
+    }
 
     /// Records what the computer said about its chat model. Not ready: the iPhone's own model loads in the
     /// background (only one already downloaded and loaded before, never a download), so the first answer is quick.

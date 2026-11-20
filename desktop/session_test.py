@@ -273,9 +273,9 @@ async def case_leave_waits_for_running_job():
 
 def case_leave_free_keeps_brain_off():
     calls: list[str] = []
-    real = (fd.ENGINE.unload, fd.COMFY.stop, fd.gguf_choice)
+    real = (fd.ENGINE.unload, fd.COMFY.unload_card, fd.gguf_choice)
     fd.ENGINE.unload = lambda: calls.append("engine")
-    fd.COMFY.stop = lambda: calls.append("comfy")
+    fd.COMFY.unload_card = lambda: calls.append("comfy")   # 11-19: leave clears the card; idle stops the engine
     brain = fd.LLAMA
     brain.paused_for, brain.resume_wanted = "video", True
     fd.gguf_choice = lambda repo: calls.append("resume-start") or ([], "w", None)
@@ -303,7 +303,7 @@ def case_leave_free_keeps_brain_off():
         check(started == [1], "a normal resume still brings a paused brain back")
         brain.ensure = real_ensure
     finally:
-        fd.ENGINE.unload, fd.COMFY.stop, fd.gguf_choice = real
+        fd.ENGINE.unload, fd.COMFY.unload_card, fd.gguf_choice = real
         brain.paused_for, brain.resume_wanted = None, False
 
 

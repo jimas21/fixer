@@ -47,6 +47,9 @@ struct ChatScreen: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbarBackground(.hidden, for: .navigationBar)
             .toolbar {
+                ToolbarItem(placement: .principal) {
+                    AnswerSourceTitle(title: chat.conversation.title == "New chat" ? "Fixer" : chat.conversation.title)
+                }
                 ToolbarItem(placement: .topBarLeading) {
                     Button { showHistory = true } label: { Image(systemName: "clock.arrow.circlepath") }
                         .buttonStyle(GlassCircleButtonStyle())
@@ -574,5 +577,70 @@ extension View {
     /// Icon-only buttons get a 44 pt tap area.
     func iconButton() -> some View {
         self.frame(minWidth: 44, minHeight: 44).contentShape(Rectangle())
+    }
+}
+
+/// 11-19: the chat's title with a small light beside it showing where the NEXT answer comes from: steady accent =
+/// the computer; a slow, soft pulse = this iPhone while the computer starts (it takes over once ready); dim = this
+/// iPhone (no computer). Same rule as `Chat.send` (`Desktop.answerSource`), re-checked every 30 s because the
+/// computer's readiness goes stale on its own.
+struct AnswerSourceTitle: View {
+    let title: String
+    @ObservedObject private var desktop = Desktop.shared
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var pulse = false
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 30)) { _ in
+            let source = desktop.answerSource
+            VStack(spacing: 1) {
+                Text(title).font(.headline).lineLimit(1)
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(color(source))
+                        .frame(width: 7, height: 7)
+                        .shadow(color: source == .computer ? Fx.accent.opacity(0.7) : .clear, radius: 3)
+                        .opacity(source == .iPhoneWarming && pulse ? 0.35 : 1)
+                    Text(caption(source)).font(.caption2).foregroundStyle(Fx.secondaryText).lineLimit(1)
+                }
+            }
+            .onAppear { startPulse(source) }
+            .onChange(of: source) { _, now in startPulse(now) }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(title)
+            .accessibilityValue(spoken(source))
+        }
+    }
+
+    private func color(_ s: Desktop.AnswerSource) -> Color {
+        switch s {
+        case .computer: Fx.accent
+        case .iPhoneWarming: Fx.accentSoftText
+        case .iPhone: Fx.secondaryText.opacity(0.6)
+        }
+    }
+
+    private func caption(_ s: Desktop.AnswerSource) -> String {
+        switch s {
+        case .computer: "on computer"
+        case .iPhoneWarming: "on iPhone · computer starting"
+        case .iPhone: "on iPhone"
+        }
+    }
+
+    private func spoken(_ s: Desktop.AnswerSource) -> String {
+        switch s {
+        case .computer: "Answering on your computer"
+        case .iPhoneWarming: "Answering on this iPhone while your computer starts"
+        case .iPhone: "Answering on this iPhone"
+        }
+    }
+
+    private func startPulse(_ s: Desktop.AnswerSource) {
+        guard s == .iPhoneWarming, !reduceMotion else {
+            withTransaction(Transaction(animation: nil)) { pulse = false }   // ends the repeating pulse cleanly
+            return
+        }
+        withAnimation(.easeInOut(duration: 1.4).repeatForever(autoreverses: true)) { pulse = true }
     }
 }

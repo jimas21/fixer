@@ -190,10 +190,37 @@ class Keys:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             self.keys = {pid: b64d(p["key"]) for pid, p in data.get("phones", {}).items()}
             self.expires = {pid: float(p["expires"]) for pid, p in data.get("phones", {}).items() if p.get("expires")}
+            # 11-19: a fresh pairing code must be used within 60 s ("pair_by", written by pair.py); the phone's first
+            # request confirms it (confirm_pairing removes the deadline). Unused past it: refused, then deleted.
+            self.pair_by = {pid: float(p["pair_by"]) for pid, p in data.get("phones", {}).items() if p.get("pair_by")}
             self.mtime = m
-        if time.time() > getattr(self, "expires", {}).get(phone, float("inf")):
+        now = time.time()
+        if now > getattr(self, "expires", {}).get(phone, float("inf")):
+            return None
+        if now > getattr(self, "pair_by", {}).get(phone, float("inf")):
             return None
         return self.keys.get(phone)
+
+    def pending(self, phone: str) -> bool:
+        """11-19: True while this phone's pairing code hasn't been used yet (it still has a "pair_by")."""
+        return phone in getattr(self, "pair_by", {})
+
+
+def confirm_pairing(phone: str) -> None:
+    """11-19: the phone's first authenticated request: the pairing is complete, so its 60 s deadline goes."""
+    try:
+        data = json.loads(KEYS.read_text(encoding="utf-8"))
+        entry = data.get("phones", {}).get(phone)
+        if not entry or "pair_by" not in entry:
+            return
+        entry.pop("pair_by")
+        entry["paired_at"] = int(time.time())
+        tmp = KEYS.with_name(f"keys.{os.getpid()}.confirm.tmp")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.replace(tmp, KEYS)
+        log.warning("pairing confirmed for phone %s", phone)
+    except Exception as e:                             # noqa: BLE001
+        log.warning("couldn't confirm a pairing: %s", e.__class__.__name__)
 
 
 def b64d(s: str) -> bytes:
@@ -470,6 +497,7 @@ class LlamaBrain:
         self.epoch = 0                       # 11-18: bumped by a hard stop (leave / quit): an in-flight resume gives up
         self.key: str | None = None          # 11-18: this start's API key (never logged, never in any report)
         self.keyed: bool | None = None       # 11-18: this start proved the key is required
+        self.slots = 1                       # 11-19: llama-server slots of the running start (see _llama_args)
 
     def key_state(self) -> bool | None:
         """11-18: for /local/state: True = the running server refuses keyless requests (proven at start), False =
@@ -535,6 +563,7 @@ class LlamaBrain:
                     self.stop()
                     raise UserFacing("The model couldn't start. Try another model.")
             self.keyed = keyed
+            self.slots = int(args[args.index("-np") + 1])     # 11-19: what this start really has
             self.port, self.repo, self.vision, self.on_gpu = port, repo, bool(proj), gpu
             self.moe = moe
             try:
@@ -662,12 +691,24 @@ def _llama_key_proof(port: int, key: str):
     return f"keyless answered {keyless}, keyed {keyed}"
 
 
+CHAT_SLOT, PROMPT_SLOT = 0, 1            # 11-19: llama-server slots (see _llama_args)
+
+
+def _brain_slots() -> int:
+    """11-19: how many llama-server slots the chat model starts with (local.json "brain_slots", 1..2, default 2)."""
+    return 2 if _tune("brain_slots", 2) >= 2 else 1
+
+
 def _llama_args(repo: str, path: Path, weights: str, proj: str | None, gpu: bool, port: int,
                 keyed: bool = False) -> list[str]:
     """The llama-server command line (split out so it can be checked without starting anything). Never the key:
     that goes in the child's environment (_llama_env)."""
+    # 11-19: two slots, each with the full context: slot 0 is chat, slot 1 the prompt writer (enhance_prompt). With
+    # one shared slot a picture's prompt made the chat wait and wiped its cached conversation (the next reply re-read
+    # it all). The second slot's KV cache costs well under 1 GB. local.json "brain_slots": 1 restores the old way.
+    slots = _brain_slots()
     args = [str(LLAMA_SERVER), "-m", str(path / weights), "--host", "127.0.0.1", "--port", str(port),
-            "-fa", "on", "-c", str(BRAIN_CTX), "-ctk", "q8_0", "-ctv", "q8_0", "-np", "1",
+            "-fa", "on", "-c", str(BRAIN_CTX * slots), "-ctk", "q8_0", "-ctv", "q8_0", "-np", str(slots),
             "--no-webui", "--log-disable", "--jinja"]
     if keyed:
         args += ["--cors-origins", "localhost"]   # 11-18: this build's "same-origin only" (default is every site)
@@ -739,6 +780,8 @@ def _chat_llama_once(p: dict, emit, cancel, port: int):
             "temperature": temp, "top_p": 0.95 if think else float(p.get("top_p", 0.8)), "top_k": int(p.get("top_k", 20)),
             "presence_penalty": float(p.get("presence_penalty", 1.5)),   # Qwen3.6 card, non-thinking chat
             "cache_prompt": True, "chat_template_kwargs": {"enable_thinking": think}}
+    if isinstance(p.get("_slot"), int) and getattr(LLAMA, "slots", 1) > p["_slot"]:
+        body["id_slot"] = p["_slot"]                   # 11-19: chat and the prompt writer each keep their own slot
     conn = None
     said = False
     try:
@@ -1910,7 +1953,7 @@ def job_chat(p: dict, emit, cancel):
         tools = _phone_cfg().get("lookup_tools") or LOOKUP_TOOLS_DEFAULT
         p = {**p, "instructions": ((p.get("instructions") or "") + "\n\n" + tools).strip()}
         port = LLAMA.ensure(repo, choice, status)
-        return _chat_llama(p, emit, cancel, port)
+        return _chat_llama({**p, "_slot": CHAT_SLOT}, emit, cancel, port)
     with TRANSFORMERS_CHAT:                            # the fallback shares the card with image jobs
         _chat_transformers(repo, p, emit, cancel, status)
 
@@ -2834,7 +2877,7 @@ def enhance_prompt(prompt: str, edit: bool, image_b64: str | None, cancel) -> tu
         msg["image"] = image_b64
     out: list[str] = []
     p = {"instructions": _enhance_system(edit), "messages": [msg], "think": False, "temperature": 0.5,
-         "presence_penalty": 0.0, "max_tokens": 900}
+         "presence_penalty": 0.0, "max_tokens": 900, "_slot": PROMPT_SLOT}   # 11-19: never the chat's slot
     try:
         _chat_llama(p, lambda o: out.append(o.get("v", "")) if o.get("t") == "text" else None, cancel, port)
     except Exception:                                    # noqa: BLE001
@@ -2944,7 +2987,8 @@ class Comfy:
         self.proc: subprocess.Popen | None = None
         self.lock = threading.Lock()
         self.warmed: set[str] = set()
-        self.last_recipe: str | None = None  # 11-19: the recipe whose models ComfyUI last ran (so is holding now)
+        self._last_recipe: str | None = None  # 11-19: the recipe whose models ComfyUI last ran (so is holding now)
+        self.last_picture: str | None = None  # 11-19: the last recipe it ran at all (kept by a free / stop)
         self.paths = ""
         self.reserve = 0.0                   # --reserve-vram GB this start used (0 = none)
         self.guarded: bool | None = None     # 11-18: this start went through the proven host guard
@@ -3051,6 +3095,16 @@ class Comfy:
                 self._post("/free", {"unload_models": True, "free_memory": True})
             except Exception:
                 pass
+
+    @property
+    def last_recipe(self) -> str | None:
+        return self._last_recipe
+
+    @last_recipe.setter
+    def last_recipe(self, rid: str | None):
+        self._last_recipe = rid
+        if rid:
+            self.last_picture = rid                    # what to bring back after a video (_after_job)
 
     def unload_card(self):
         """11-19: moves ComfyUI's models off the graphics card but keeps them in RAM (no free_memory: that also
@@ -4204,15 +4258,19 @@ PROMPT_TOGGLES = ROOT / "prompt_toggles.json"     # the Create screen's prompt h
 PHONE_CONFIG = ROOT / "phone_config.json"         # texts / word lists the phone uses (no app update needed)
 
 
-def job_config(p: dict, emit, cancel):
-    """The phone's tunable texts and lists (it keeps the last copy for when the computer is off)."""
+def _phone_config_for_send() -> dict:
     try:
         cfg = json.loads(PHONE_CONFIG.read_text(encoding="utf-8"))
     except Exception:
         cfg = {}
     if SEARCH_URL:
         cfg["search_url"] = SEARCH_URL                 # the phone's own search when the computer is off
-    emit({"t": "info", "config": cfg})
+    return cfg
+
+
+def job_config(p: dict, emit, cancel):
+    """The phone's tunable texts and lists (it keeps the last copy for when the computer is off)."""
+    emit({"t": "info", "config": _phone_config_for_send()})
 
 
 def _prompt_style(r: dict) -> str:
@@ -4763,7 +4821,11 @@ def job_brain_warm(p: dict, emit, cancel):
             return "off"                               # another model is up: this one still has to load
         return s
 
-    emit({"t": "info", "brain_state": brain_state()})
+    # 11-19: app open is ONE request: this first frame also carries the phone's config (was a separate "config"
+    # call) and how many finished results are held for this phone (its inbox fetches the line only when > 0).
+    phone = p.get("_phone")
+    held = sum(1 for j in QUEUE.held() if j.state == "ready" and not j.hidden and (phone is None or j.phone == phone))
+    emit({"t": "info", "brain_state": brain_state(), "config": _phone_config_for_send(), "held": held})
     if choice is not None and not LLAMA.paused_for and (_is_moe(repo) or not VIDEO_BUSY.is_set()):
         try:
             LLAMA.ensure(repo, choice, lambda s: None)
@@ -6182,11 +6244,31 @@ def _record_timing(job, rec: dict, err) -> None:
 
 
 def _after_job(kind: str, next_kind: str | None) -> None:
-    """11-17: after a video, give its ~38 GB back unless another video is next, then bring a paused brain back."""
+    """11-17: after a video, give its ~38 GB back unless another video is next, then bring a paused brain back.
+    11-19: and when nothing else is waiting, read the last picture model back in, in the background, so the next
+    picture isn't a cold start (picture ~14 GB + brain ~20 GB fit the 64 GB the video just gave back)."""
     if kind == "video" and next_kind != "video":
         COMFY.free()                     # /free with free_memory also resets ComfyUI's node cache: the RAM goes
+        rid = COMFY.last_picture
+        if (next_kind is None and rid in CREATE_RECIPES and rid not in _adult_models() and _is_moe(LAST_BRAIN)
+                and _tune("picture_ram_gb", 0) <= 0 and _recipe_ready(CREATE_RECIPES[rid])):
+            threading.Thread(target=_rewarm_picture, args=(rid,), daemon=True, name="picture-rewarm").start()
     if LLAMA.paused_for and next_kind != "video":
         threading.Thread(target=LLAMA.resume, daemon=True, name="brain-resume").start()
+
+
+def _rewarm_picture(rid: str) -> None:
+    """11-19: after a video: a 1-step warm-up of the last picture recipe (never an 18+ one: _after_job checks). Gives
+    way to anything that lined up meanwhile; a failure costs nothing (the next picture loads as before)."""
+    try:
+        if QUEUE.busy() or QUEUE.waiting() or LEFT_AT is not None:
+            return                                     # a job is coming, or the owner has left: don't spend the load
+        COMFY.ensure_current()
+        cancel = threading.Event()
+        asyncio.run(_comfy_run(_warmup_workflow(rid), lambda obj: None, cancel))
+        COMFY.last_recipe = rid
+    except Exception as e:                             # noqa: BLE001
+        log.info("picture re-warm skipped: %s", e.__class__.__name__)
 
 
 async def queue_runner(app):
@@ -6419,10 +6501,15 @@ def _leave_free_due(now: float, left_at: float | None, grace: float, busy: bool,
 
 
 def _leave_free():
-    """What the idle unloader frees (engine + helper, chat model, ComfyUI), at once. A paused chat model stays off."""
+    """The owner LEFT: Fixer has been off screen on his phone (backgrounded, switched away or locked) for his "free my
+    computer after" time (default 5 min), nobody came back, and nothing runs or waits. 11-19: this now clears the
+    graphics card and the chat model's RAM, but keeps the picture engine running with its models in RAM, so the next
+    picture is seconds, not a cold engine start. ComfyUI itself stops (RAM returned) only after IDLE_UNLOAD (20 min)
+    with no use at all (idle_unloader). The chat model reloads in seconds on return; the iPhone answers meanwhile.
+    A paused chat model stays off."""
     ENGINE.unload()                                    # also ends the helper process
     LLAMA.stop_for_good()
-    COMFY.stop()                                       # also empties its private folder
+    COMFY.unload_card()                                # off the card, kept in RAM; the engine keeps running
 
 
 FREE_AFTER_MIN: float | None = None   # 11-18: the owner's "free my computer after" choice from the phone; None = unset
@@ -6516,12 +6603,13 @@ def _drop_expired_pairings():
         return
     now = time.time()
     phones = data.get("phones", {})
-    gone = [k for k, v in phones.items() if v.get("expires") and float(v["expires"]) < now]
+    gone = [k for k, v in phones.items() if (v.get("expires") and float(v["expires"]) < now)
+            or (v.get("pair_by") and float(v["pair_by"]) < now)]      # 11-19: a code nobody used in time
     if not gone:
         return
     for k in gone:
         phones.pop(k)
-    tmp = KEYS.with_suffix(".tmp")
+    tmp = KEYS.with_name(f"keys.{os.getpid()}.drop.tmp")
     tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
     os.replace(tmp, KEYS)
     log.warning("removed %d expired pairing(s)", len(gone))
@@ -6538,6 +6626,7 @@ async def idle_unloader(app):
         while True:
             await asyncio.sleep(30)
             QUEUE.expire()
+            _drop_expired_pairings()               # 11-19: was never called; unused 60 s pairing codes go too
             if QUEUE.has_work():                   # queued/running jobs and held results count as use: never unload under them
                 LAST_USE = time.monotonic()
             # Idle means no pictures AND no chat: a long chat between pictures no longer unloads the picture model
@@ -6602,6 +6691,8 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if not REPLAY.fresh(body[:12]):
         return _deny()
     del body
+    if KEYSTORE.pending(phone):
+        confirm_pairing(phone)                         # 11-19: first use of a fresh code: it is now a real pairing
     if op in ("leave", "warm") and isinstance(payload, dict):    # 11-18: the owner's "free my computer after" choice
         choice = _parse_free_after(payload.get("free_after_min"))
         if choice is not None:
@@ -6688,6 +6779,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
                 QUEUE.clear()                          # the line, held results and gone ids, before the rest
             if op == "chat":
                 payload.pop("_queue", None)            # private keys: never taken from the phone
+                payload.pop("_slot", None)
+            if op == "warm" and isinstance(payload, dict):
+                payload["_phone"] = phone              # 11-19: whose held results to count (never from the phone)
                 payload.pop("_eta_s", None)
                 payload["_queue"] = QUEUE.snapshot()
                 payload["_eta_s"] = QUEUE.eta_running()

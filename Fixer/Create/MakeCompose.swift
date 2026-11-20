@@ -19,9 +19,15 @@ extension CreateScreen {
                 .padding(.horizontal, 12)
                 .padding(.top, 4)
                 .padding(.bottom, 16)
+                // 11-19: pinned to exactly the screen's width. Anything inside wider than that (the chip strips run to
+                // the card edge with a negative padding) made this vertical scroll pan sideways too, so the owner could
+                // grab the whole Make page and drag it around.
+                .containerRelativeFrame(.horizontal)
+                .clipped()
             }
             .scrollDismissesKeyboard(.interactively)
             .scrollIndicators(.hidden)
+            .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
         }
         .safeAreaInset(edge: .bottom) { composeBottomBar }
     }

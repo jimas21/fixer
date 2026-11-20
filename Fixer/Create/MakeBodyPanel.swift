@@ -22,7 +22,11 @@ extension CreateScreen {
     ]
 
     /// Worth showing only when the recipe is about a person (its quick picks include a body group).
+    /// 11-19: hidden by default: every slider term is also a chip in the Body section (Build, Figure, Fitness,
+    /// Height), whose add sheet now covers them; the owner found the two duplicating each other. phone_config.json
+    /// "make_body_sliders": "on" brings the panel back without an app update.
     var showBodyPanel: Bool {
+        guard RemoteConfig.string("make_body_sliders") == "on" else { return false }
         let bodyIDs: Set<String> = ["body", "body_size", "fitness", "height"]
         return activeGroups.contains { bodyIDs.contains($0.id) }
     }

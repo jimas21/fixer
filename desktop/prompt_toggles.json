@@ -105,22 +105,6 @@
    "name": "Look",
    "items": [
     {
-     "id": "s_iphone",
-     "label": "Phone snapshot",
-     "zimage": {
-      "p": "casual iPhone snapshot",
-      "n": ""
-     },
-     "chroma": {
-      "p": "early 2010s digital phone photo",
-      "n": ""
-     },
-     "sdxl": {
-      "p": "amateur photo, flickr, candid",
-      "n": ""
-     }
-    },
-    {
      "id": "s_portra",
      "label": "Film Portra",
      "zimage": {

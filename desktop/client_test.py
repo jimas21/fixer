@@ -74,7 +74,7 @@ def b64file(p: str) -> str:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("op", choices=["status", "chat", "make", "edit", "video", "song"])
+    ap.add_argument("op", choices=["status", "chat", "make", "edit", "video", "song", "album", "write"])
     ap.add_argument("text", nargs="?", default="")
     ap.add_argument("--image")
     ap.add_argument("--model")
@@ -82,6 +82,11 @@ def main():
     ap.add_argument("--seconds", type=int, default=60)
     ap.add_argument("--lyrics", default="")
     ap.add_argument("--instrumental", action="store_true")
+    ap.add_argument("--tracks", type=int, default=3, help="album: how many tracks")
+    ap.add_argument("--tags", default="", help="song/album: the chosen sound")
+    ap.add_argument("--ref", help="song: a recording to start from (cover mode)")
+    ap.add_argument("--link", help="song: a link to a recording (YouTube, SoundCloud…)")
+    ap.add_argument("--artist", action="append", help="song/album: an artist it should sound like (repeatable)")
     ap.add_argument("--out", help="save the image here (default: nothing is written)")
     ap.add_argument("--url", default=f"http://127.0.0.1:{pair.PORT}")
     a = ap.parse_args()
@@ -97,9 +102,19 @@ def main():
         op, payload = "video", {"prompt": a.text, "model": a.model, "seconds": 5}
         if a.image:
             payload["image"] = b64file(a.image)
-    elif a.op == "song":
-        op, payload = "song", {"prompt": a.text, "seconds": a.seconds, "lyrics": a.lyrics,
-                               "instrumental": a.instrumental}
+    elif a.op == "write":
+        op, payload = "song_write", {"prompt": a.text, "seconds": 0, "lyrics": a.lyrics,
+                                     "instrumental": a.instrumental}
+    elif a.op in ("song", "album"):
+        op, payload = a.op, {"prompt": a.text, "seconds": a.seconds, "lyrics": a.lyrics,
+                             "instrumental": a.instrumental, "tracks": a.tracks, "tags": a.tags}
+        if a.ref:
+            payload["reference"] = b64file(a.ref)
+            payload["reference_ext"] = Path(a.ref).suffix.lstrip(".")
+        if a.link:
+            payload["reference_url"] = a.link
+        if a.artist:
+            payload["artists"] = [{"name": x} for x in a.artist]
     else:
         op, payload = "image", {"prompt": a.text, "model": a.model, "steps": a.steps, "guidance": 1.0}
         if a.op == "edit":
@@ -129,7 +144,7 @@ def main():
             elif f["t"] == "progress":
                 print(f"\r{int(f['v'] * 100)}%", end="", flush=True)
             else:
-                print(f"\n[{f['t']}] {json.dumps({k: v for k, v in f.items() if k != 't'})}")
+                print(f"\n[{f['t']}] {json.dumps({k: v for k, v in f.items() if k not in ('t', 'v') or f['t'] in ('text', 'status', 'note', 'error')})[:400]}")
     print(f"({time.time() - t0:.1f}s)")
 
 

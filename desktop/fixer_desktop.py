@@ -1992,7 +1992,7 @@ def _with_queue(p: dict) -> dict:
 
 
 _KIND_WORDS = {"picture": "picture", "pictures": "pictures", "edit": "photo edit", "change": "change", "video": "video",
-               "song": "song", "cutout": "cut-out", "upscale": "sharpen and enlarge", "remove": "removing a model"}
+               "song": "song", "album": "album", "cutout": "cut-out", "upscale": "sharpen and enlarge", "remove": "removing a model"}
 
 
 def _queue_note(jobs: list[dict], slot: str | None, figures=None, paused: bool = False) -> str:
@@ -4056,9 +4056,16 @@ def _comfy_video(p: dict, emit, cancel):
 SONG_REPO = "Comfy-Org/ACE-Step-1.5"
 SONG_FILE = "checkpoints/ace_step_1.5_turbo_aio.safetensors"
 SONG_CKPT = "ace_step_1.5_turbo_aio.safetensors"
-SONG_SECONDS = (15, 240)
+SONG_SECONDS = (15, 360)
+SONG_AUTO_DEFAULT = 150                                # Auto length when the writer gives none and there are no lyrics
 SONG_KEYS = [f"{root} {q}" for q in ("major", "minor")
              for root in ("C", "C#", "Db", "D", "D#", "Eb", "E", "F", "F#", "Gb", "G", "G#", "Ab", "A", "A#", "Bb", "B")]
+# The singing languages the phone offers (ACE-Step 1.5 knows more; these are the ones it sings well).
+SONG_LANGS = {"en": "English", "es": "Spanish", "fr": "French", "de": "German", "it": "Italian", "pt": "Portuguese",
+              "nl": "Dutch", "sv": "Swedish", "pl": "Polish", "ru": "Russian", "uk": "Ukrainian", "tr": "Turkish",
+              "ar": "Arabic", "hi": "Hindi", "ja": "Japanese", "ko": "Korean", "zh": "Chinese", "yue": "Cantonese",
+              "vi": "Vietnamese", "th": "Thai", "id": "Indonesian", "tl": "Tagalog"}
+ALBUM_TRACKS = (2, 12)
 
 
 def _song_ready() -> bool:
@@ -4066,14 +4073,31 @@ def _song_ready() -> bool:
     return snap is not None and (snap / SONG_FILE).is_file()
 
 
-def _song_workflow(tags: str, lyrics: str, seconds: float, seed: int, bpm: int, key: str) -> dict:
-    """The ComfyUI template's graph (audio_ace_step_1_5_checkpoint), saved as MP3 and read back by _comfy_run."""
+def _song_workflow(tags: str, lyrics: str, seconds: float, seed: int, bpm: int, key: str,
+                   language: str = "en", reference: str | None = None) -> dict:
+    """The ComfyUI template's graph (audio_ace_step_1_5_checkpoint), saved as MP3 and read back by _comfy_run.
+    11-20 `reference` (a file in ComfyUI's private input folder): ACE-Step's cover mode, the recording re-performed
+    with these tags and lyrics (its own audio codes are not used then, so the writer's step is skipped there)."""
+    wf = _song_graph(tags, lyrics, seconds, seed, bpm, key, language)
+    if reference:
+        wf["3"]["inputs"]["generate_audio_codes"] = False
+        wf["9"] = {"class_type": "LoadAudio", "inputs": {"audio": reference}}
+        wf["10"] = {"class_type": "TrimAudioDuration", "inputs": {"audio": ["9", 0], "start_index": 0.0,
+                                                                   "duration": float(seconds)}}
+        wf["11"] = {"class_type": "VAEEncodeAudio", "inputs": {"audio": ["10", 0], "vae": ["1", 2]}}
+        wf["12"] = {"class_type": "ReferenceTimbreAudio", "inputs": {"conditioning": ["3", 0], "latent": ["11", 0]}}
+        wf["6"]["inputs"]["positive"] = ["12", 0]
+    return wf
+
+
+def _song_graph(tags: str, lyrics: str, seconds: float, seed: int, bpm: int, key: str, language: str) -> dict:
     return {
         "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": SONG_CKPT}},
         "2": {"class_type": "ModelSamplingAuraFlow", "inputs": {"model": ["1", 0], "shift": 3.0}},
         "3": {"class_type": "TextEncodeAceStepAudio1.5",
               "inputs": {"clip": ["1", 1], "tags": tags, "lyrics": lyrics, "seed": seed, "bpm": bpm,
-                         "duration": float(seconds), "timesignature": "4", "language": "en", "keyscale": key,
+                         "duration": float(seconds), "timesignature": "4",
+                         "language": language if language in SONG_LANGS else "en", "keyscale": key,
                          "generate_audio_codes": True, "cfg_scale": 2.0, "temperature": 0.85, "top_p": 0.9,
                          "top_k": 0, "min_p": 0.0}},
         "4": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["3", 0]}},
@@ -4088,100 +4112,431 @@ def _song_workflow(tags: str, lyrics: str, seconds: float, seed: int, bpm: int, 
     }
 
 
-def _song_system(seconds: int, instrumental: bool, has_lyrics: bool, safe: bool) -> str:
-    lines = max(8, min(48, seconds // 4))
+def _song_seconds(v) -> int | None:
+    """The asked length in seconds, or None for Auto (0, "auto", missing)."""
+    if v in (None, "", 0, "auto"):
+        return None
+    try:
+        return max(SONG_SECONDS[0], min(SONG_SECONDS[1], int(v)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _lyrics_seconds(lyrics: str) -> int:
+    """Auto length from the lyrics: about 4 s a sung line, plus room for an intro, breaks and an outro."""
+    lines = [x for x in lyrics.splitlines() if x.strip() and not x.strip().startswith("[")]
+    return max(60, min(300, 25 + 4 * len(lines)))
+
+
+def _artists_text(artists) -> str:
+    """11-20 (the owner: artists as "inspiration and sound and voice"): the phone's picks, found on MusicBrainz, as
+    "Name (genre, genre); ..." for the writer. At most 5, plain text only."""
+    out = []
+    for a in (artists if isinstance(artists, list) else [])[:5]:
+        if isinstance(a, str):
+            a = {"name": a}
+        if not isinstance(a, dict):
+            continue
+        name = " ".join(str(a.get("name") or "").split())[:80]
+        if not name:
+            continue
+        g = [" ".join(str(x).split())[:40] for x in (a.get("genres") or [])[:6] if str(x).strip()]
+        out.append(name + (f" ({', '.join(g)})" if g else ""))
+    return "; ".join(out)
+
+
+def _inspired(artists: str) -> str:
+    return (f" Inspired by: {artists}. Capture their sound and their singers' voices in the tags in plain musical "
+            "words: genre and era, signature instruments, production, rhythm, and the vocal timbre and delivery "
+            '(e.g. "raspy male baritone, laid-back phrasing"). Never put an artist\'s name in the tags, title or '
+            "lyrics, and never copy their lyrics.") if artists else ""
+
+
+def _song_system(seconds: int | None, instrumental: bool, has_lyrics: bool, safe: bool, style: str = "",
+                 language: str = "en", album: str = "", artists: str = "") -> str:
+    lines = max(8, min(60, (seconds or 180) // 4))
     lyr = ('"[Instrumental]"' if instrumental else
            "the owner's lyrics exactly as given (only add section labels if they have none)" if has_lyrics else
-           f"new lyrics, about {lines} short singable lines in all, with section labels on their own lines "
-           "([Verse 1], [Chorus], [Verse 2], [Chorus], [Bridge], [Outro]); a chorus that repeats")
-    clean = " Keep the lyrics clean: nothing sexual or explicit." if safe else ""
-    return ("You write songs for a music model. From the owner's idea, answer with one JSON object and nothing else: "
-            '{"title": a short song title, '
-            '"tags": 8-20 comma-separated style tags: genre, era, mood, lead instruments, rhythm feel, vocal type '
-            '(e.g. "female vocal", "male vocal", "duet") and production, '
-            f'"lyrics": {lyr}, '
-            '"bpm": a whole number 60-180 that suits the style, '
-            '"key": a key like "A minor" or "Eb major"}. '
-            "Keep any names, places, phrases and lines the owner gave." + clean)
+           (f"new lyrics, about {lines} short singable lines in all" if seconds else
+            "new lyrics for a full song (two or three verses, a chorus that comes back, a bridge, an outro)") +
+           ", with section labels on their own lines ([Intro], [Verse 1], [Chorus], [Verse 2], [Bridge], [Outro])")
+    lang = SONG_LANGS.get(language, "English")
+    parts = ["You write songs for a music model. From the owner's idea, answer with one JSON object and nothing else: "
+             '{"title": a short song title, '
+             '"tags": 8-20 comma-separated style tags: genre, era, mood, lead instruments, rhythm feel, vocal type '
+             '(e.g. "female vocal", "male vocal", "duet", "choir") and production, '
+             f'"lyrics": {lyr}, '
+             '"bpm": a whole number 60-180 that suits the style, '
+             '"key": a key like "A minor" or "Eb major"'
+             + (', "seconds": the song\'s length in seconds (60-300) that suits its structure' if not seconds else "")
+             + "}. Keep any names, places, phrases and lines the owner gave."]
+    if style:
+        parts.append(f" The owner chose this sound; start the tags from it and keep all of it: {style[:600]}.")
+    if album:
+        parts.append(f" This song is one track of an album; it shares the album's sound: {album[:600]}.")
+    parts.append(_inspired(artists))
+    if not instrumental and not has_lyrics and lang != "English":
+        parts.append(f" Write the lyrics in {lang} (the title too); the tags stay in English.")
+    if safe:
+        parts.append(" Keep the lyrics clean: nothing sexual or explicit.")
+    return "".join(parts)
 
 
-def _write_song(idea: str, lyrics: str, instrumental: bool, seconds: int, safe: bool, cancel) -> dict | None:
-    """The chat model's take on the idea as {title, tags, lyrics, bpm, key}; None when it isn't available or fails."""
+def _llm_json(system: str, text: str, cancel, max_tokens: int = 1800, temperature: float = 0.8) -> dict | None:
+    """One JSON object from the chat model in the prompt writer's slot (never the chat's); None when it can't."""
     try:
         port = _enhance_port()
     except Exception:                                    # noqa: BLE001
         port = None
     if port is None:
         return None
-    text = idea[:4000] + (("\n\nMy lyrics:\n" + lyrics[:6000]) if lyrics and not instrumental else "")
-    out: list[str] = []
-    p = {"instructions": _song_system(seconds, instrumental, bool(lyrics), safe),
-         "messages": [{"role": "user", "text": text}], "think": False, "temperature": 0.8,
-         "presence_penalty": 0.0, "max_tokens": 1800, "_slot": PROMPT_SLOT}
-    try:
-        _chat_llama(p, lambda o: out.append(o.get("v", "")) if o.get("t") == "text" else None, cancel, port)
-    except Exception:                                    # noqa: BLE001
-        return None
+    p = {"instructions": system, "messages": [{"role": "user", "text": text}], "think": False,
+         "temperature": temperature, "presence_penalty": 0.0, "max_tokens": max_tokens, "_slot": PROMPT_SLOT}
+    # 11-20: right after a start the brain answers "loading" for up to a minute; wait for it rather than give up
+    # (that made a song instrumental).
+    until = time.monotonic() + 90
+    while True:
+        out: list[str] = []
+        try:
+            _chat_llama(p, lambda o: out.append(o.get("v", "")) if o.get("t") == "text" else None, cancel, port)
+            break
+        except Exception:                                # noqa: BLE001
+            if cancel.is_set() or time.monotonic() > until:
+                return None
+            time.sleep(3)
     raw = "".join(out).strip()
     a, b = raw.find("{"), raw.rfind("}")
     try:
-        d = json.loads(raw[a:b + 1]) if a >= 0 and b > a else None
+        # strict=False: the model writes real line breaks inside the lyrics string. Strict parsing refused those and
+        # every refused answer became an instrumental (the owner, 11-20: "a lot of lyric-less songs").
+        d = json.loads(raw[a:b + 1], strict=False) if a >= 0 and b > a else None
     except ValueError:
+        return None
+    return d if isinstance(d, dict) else None
+
+
+def _write_song(idea: str, lyrics: str, instrumental: bool, seconds: int | None, safe: bool, cancel,
+                style: str = "", language: str = "en", album: str = "", artists: str = "") -> dict | None:
+    """The chat model's take on the idea as {title, tags, lyrics, bpm, key, seconds}; None when it can't."""
+    text = idea[:4000] + (("\n\nMy lyrics:\n" + lyrics[:6000]) if lyrics and not instrumental else "")
+    system = _song_system(seconds, instrumental, bool(lyrics), safe, style, language, album, artists)
+    d = None
+    for _ in range(2):                                 # once more when the answer is unusable or has no lyrics
+        d = _llm_json(system, text, cancel)
+        if cancel.is_set():
+            return None
+        if (d is not None and str(d.get("tags") or "").strip()
+                and (instrumental or lyrics or len(str(d.get("lyrics") or "").strip()) > 20)):
+            break
         d = None
-    if not isinstance(d, dict) or not str(d.get("tags") or "").strip():
+    if d is None:
         return None
     try:
         bpm = max(60, min(180, int(d.get("bpm"))))
     except (TypeError, ValueError):
         bpm = None
     key = str(d.get("key") or "").strip()
-    return {"title": str(d.get("title") or "").strip()[:80], "tags": str(d["tags"]).strip()[:600],
+    tags = str(d["tags"]).strip()[:600]
+    if not instrumental and not any(w in tags.lower() for w in ("vocal", "voice", "choir", "singer", "rap")):
+        tags += ", vocals"                             # ACE-Step leaves the singing out when no voice is named
+    return {"title": str(d.get("title") or "").strip()[:80], "tags": tags,
             "lyrics": str(d.get("lyrics") or "").strip()[:8000], "bpm": bpm,
-            "key": key if key in SONG_KEYS else None}
+            "key": key if key in SONG_KEYS else None, "seconds": _song_seconds(d.get("seconds"))}
 
 
-def job_song(p: dict, emit, cancel):
-    """A song from an idea ("prompt"), with the owner's lyrics, written ones or none ("instrumental"), 15-240 s."""
-    status = lambda s: emit({"t": "status", "v": s})  # noqa: E731
-    if not _song_ready():
-        raise UserFacing("The song model isn't on your computer yet.")
+def _song_inputs(p: dict) -> dict:
     idea = str(p.get("prompt") or "").strip()
     lyrics = str(p.get("lyrics") or "").strip()
-    instrumental = p.get("instrumental") is True
-    if not idea and not lyrics:
+    instrumental = p.get("instrumental") is True or lyrics == "[Instrumental]"
+    lang = p.get("language") if p.get("language") in SONG_LANGS else "en"
+    return {"idea": idea, "lyrics": "" if instrumental else lyrics, "instrumental": instrumental,
+            "style": str(p.get("tags") or "").strip()[:600], "language": lang,
+            "seconds": _song_seconds(p.get("seconds")), "safe": p.get("safe") is True,
+            "artists": _artists_text(p.get("artists"))}
+
+
+def job_song_write(p: dict, emit, cancel):
+    """11-20: "write the lyrics first": the writer's plan only (title, style, lyrics, length), for the owner to read
+    and change before anything is sung. Uses no graphics card."""
+    s = _song_inputs(p)
+    if not s["idea"] and not s["lyrics"]:
         raise UserFacing("Say what the song should be.")
-    try:
-        seconds = max(SONG_SECONDS[0], min(SONG_SECONDS[1], int(p.get("seconds") or 120)))
-    except (TypeError, ValueError):
-        seconds = 120
-    seed = int(p.get("seed") or int.from_bytes(os.urandom(4), "big")) % (2 ** 32)
-    title, tags, bpm, key = "", idea or "pop song", 120, "C major"
-    status("Writing the song…")
-    w = _write_song(idea or "a song with these lyrics", lyrics, instrumental, seconds, p.get("safe") is True, cancel)
+    emit({"t": "status", "v": "Writing the song…"})
+    w = _write_song(s["idea"] or "a song with these lyrics", s["lyrics"], s["instrumental"], s["seconds"], s["safe"],
+                    cancel, s["style"], s["language"], artists=s["artists"])
     if cancel.is_set():
         return
-    if w:
-        title, tags = w["title"], w["tags"]
-        bpm, key = w["bpm"] or bpm, w["key"] or key
-        if not lyrics and not instrumental:
-            lyrics = w["lyrics"]
-    elif not lyrics and not instrumental:
-        emit({"t": "note", "v": "The chat model couldn't write lyrics just now, so this one is instrumental."})
-    if instrumental or not lyrics:
-        lyrics = "[Instrumental]"
+    if w is None:
+        raise UserFacing("The chat model couldn't write it just now. Try again in a moment.")
+    if s["lyrics"]:
+        w["lyrics"] = s["lyrics"]
+    if s["instrumental"]:
+        w["lyrics"] = "[Instrumental]"
+    emit({"t": "song_plan", **w})
+
+
+def _sing(tags: str, lyrics: str, seconds: int, seed: int, bpm: int, key: str, language: str, emit, cancel,
+          label: str = "Making the song…", reference: str | None = None) -> bytes:
+    return asyncio.run(_comfy_run(_song_workflow(tags, lyrics, seconds, seed, bpm, key, language, reference), emit,
+                                  cancel, audio=True, label=label))
+
+
+SONG_REF_MAX = 30 * 1024 * 1024                         # a reference recording: 30 MB at most
+SONG_REF_EXT = {"mp3", "m4a", "wav", "aac", "flac", "ogg", "caf", "aiff", "aif", "mp4"}
+
+
+def _song_reference(p: dict) -> tuple[str, Path] | None:
+    """11-20: the owner's own recording or one of their songs ("reference", base64), written to ComfyUI's private
+    input folder for this one job (job_song deletes it). None when there is none."""
+    url = str(p.get("reference_url") or "").strip()
+    if url:
+        return _song_reference_url(url, p)
+    b64 = p.get("reference")
+    if not isinstance(b64, str) or not b64:
+        return None
+    try:
+        data = base64.b64decode(b64, validate=False)
+    except (ValueError, TypeError):
+        raise UserFacing("That recording couldn't be read.")
+    if not data or len(data) > SONG_REF_MAX:
+        raise UserFacing("That recording is too large (30 MB at most).")
+    ext = str(p.get("reference_ext") or "m4a").lower().strip(".")
+    ext = ext if ext in SONG_REF_EXT else "m4a"
+    import uuid
+    folder = COMFY_PRIVATE / "input"
+    folder.mkdir(parents=True, exist_ok=True)
+    name = f"songref_{uuid.uuid4().hex}.{ext}"
+    (folder / name).write_bytes(data)
+    return name, folder / name
+
+
+SONG_URL_MAX_S = 15 * 60                                # a linked recording: 15 minutes at most
+
+
+def _song_reference_url(url: str, p: dict) -> tuple[str, Path]:
+    """11-20 (the owner: "I have stuff on YouTube ... of my old recordings, don't make me download those"): the
+    audio of a web link (YouTube and the other sites yt-dlp knows), fetched for this one job into ComfyUI's private
+    input folder and deleted after it, like a sent recording. Its length is put in p["reference_seconds"]."""
+    import urllib.parse
+    import uuid
+    u = urllib.parse.urlparse(url)
+    if u.scheme not in ("http", "https") or not u.netloc:
+        raise UserFacing("That link isn't a web address.")
+    host = (u.hostname or "").lower()
+    if host in ("localhost",) or host.endswith((".local", ".lan", ".internal")) or _is_private_host(host):
+        raise UserFacing("That link points inside your own network.")
+    try:
+        import yt_dlp
+    except ImportError:
+        raise UserFacing("Your computer needs yt-dlp for links (it's in requirements.txt).")
+    folder = COMFY_PRIVATE / "input"
+    folder.mkdir(parents=True, exist_ok=True)
+    stem = f"songref_{uuid.uuid4().hex}"
+
+    def short(info, *, incomplete):
+        d = info.get("duration")
+        return "too long" if d and d > SONG_URL_MAX_S else None
+    opts = {"format": "bestaudio[ext=m4a]/bestaudio/best", "outtmpl": str(folder / (stem + ".%(ext)s")),
+            "quiet": True, "no_warnings": True, "noplaylist": True, "max_filesize": SONG_REF_MAX,
+            "match_filter": short, "noprogress": True, "cachedir": False, "socket_timeout": 20, "retries": 2}
+    try:
+        with yt_dlp.YoutubeDL(opts) as y:
+            info = y.extract_info(url, download=True)
+    except Exception as e:                             # noqa: BLE001
+        for f in folder.glob(stem + ".*"):
+            f.unlink(missing_ok=True)
+        log.info("song link failed: %s", e.__class__.__name__)
+        raise UserFacing("Couldn't get the audio from that link. Check it opens, is public or unlisted, and is "
+                         "under 15 minutes.")
+    files = sorted(folder.glob(stem + ".*"))
+    if not files:
+        raise UserFacing("That link has no audio Fixer can use (or it's over 15 minutes).")
+    for extra in files[1:]:
+        extra.unlink(missing_ok=True)
+    if isinstance(info, dict) and info.get("duration"):
+        p["reference_seconds"] = int(info["duration"])
+    return files[0].name, files[0]
+
+
+def _is_private_host(host: str) -> bool:
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+
+
+def _song_card(status) -> None:
     if _worker_alive():
         WORKER.stop()                                  # the diffusers helper holds graphics memory too
     COMFY.ensure_current(status)
     _room_for_pictures()
-    _timing(model="ACE-Step 1.5", steps=8, count=1)
-    status("Loading the song model…")
-    mp3 = asyncio.run(_comfy_run(_song_workflow(tags, lyrics, seconds, seed, bpm, key), emit, cancel,
-                                 audio=True, label="Making the song…"))
+
+
+def job_song(p: dict, emit, cancel):
+    """A song from an idea ("prompt") and the owner's chosen sound ("tags"), with their lyrics, written ones or none
+    ("instrumental"); 15-360 s or Auto. "write": false (Another take) sings the given tags and lyrics as they are."""
+    status = lambda s: emit({"t": "status", "v": s})  # noqa: E731
+    if not _song_ready():
+        raise UserFacing("The song model isn't on your computer yet.")
+    s = _song_inputs(p)
+    if not s["idea"] and not s["lyrics"] and not s["style"]:
+        raise UserFacing("Say what the song should be.")
+    lyrics, seconds = s["lyrics"], s["seconds"]
+    seed = int(p.get("seed") or int.from_bytes(os.urandom(4), "big")) % (2 ** 32)
+    title = str(p.get("title") or "").strip()[:80]
+    tags = s["style"] or s["idea"] or "pop song"
+    try:
+        bpm = max(60, min(180, int(p.get("bpm") or 0))) if p.get("bpm") else 120
+    except (TypeError, ValueError):
+        bpm = 120
+    key = p.get("key") if p.get("key") in SONG_KEYS else "C major"
+    as_is = p.get("write") is False and bool(s["style"]) and (bool(lyrics) or s["instrumental"])
+    if not as_is:
+        status("Writing the song…")
+        w = _write_song(s["idea"] or "a song with these lyrics", lyrics, s["instrumental"], seconds, s["safe"],
+                        cancel, s["style"], s["language"], artists=s["artists"])
+        if cancel.is_set():
+            return
+        if w:
+            title, tags = title or w["title"], w["tags"]
+            bpm, key = w["bpm"] or bpm, w["key"] or key
+            if not lyrics and not s["instrumental"]:
+                lyrics = w["lyrics"]
+            seconds = seconds or w["seconds"]
+        elif not lyrics and not s["instrumental"]:
+            emit({"t": "note", "v": "The chat model couldn't write lyrics just now, so this one is instrumental."})
+    if s["instrumental"] or not lyrics:
+        lyrics = "[Instrumental]"
+    if p.get("reference_url"):
+        status("Getting the recording from the link…")
+    ref = _song_reference(p)                           # a link sets p["reference_seconds"]
+    try:
+        if not seconds:
+            ref_s = _song_seconds(p.get("reference_seconds")) if ref else None
+            seconds = ref_s or (SONG_AUTO_DEFAULT if lyrics == "[Instrumental]" else _lyrics_seconds(lyrics))
+        if cancel.is_set():
+            return
+        _song_card(status)
+        _timing(model="ACE-Step 1.5", steps=8, count=1)
+        status("Loading the song model…")
+        mp3 = _sing(tags, lyrics, seconds, seed, bpm, key, s["language"], emit, cancel,
+                    reference=ref[0] if ref else None)
+    finally:
+        if ref:
+            ref[1].unlink(missing_ok=True)             # the recording never outlives the job
     if cancel.is_set() or not mp3:
         return
     emit({"t": "progress", "v": 1.0})
     emit({"t": "audio", "v": base64.b64encode(mp3).decode(), "format": "mp3", "seconds": seconds, "seed": seed,
-          "title": title, "tags": tags, "lyrics": lyrics, "bpm": bpm, "key": key})
+          "title": title, "tags": tags, "lyrics": lyrics, "bpm": bpm, "key": key, "language": s["language"]})
+
+
+def _album_system(n: int, instrumental: bool, safe: bool, style: str, language: str, artists: str = "") -> str:
+    lang = SONG_LANGS.get(language, "English")
+    return ("You plan albums for a music model. From the owner's theme, answer with one JSON object and nothing else: "
+            '{"title": the album title, '
+            '"sound": 10-20 comma-separated style tags every track shares: genre, era, mood, instruments, vocal type '
+            '(or "instrumental") and production, '
+            '"cover": a vivid one-sentence description of the album cover picture, with no words or letters in it, '
+            f'"tracks": exactly {n} objects in running order, each {{"title": the track title, "idea": one or two '
+            'sentences: what this track is about and how it differs (tempo, energy, mood) from its neighbours}}}. '
+            "Give the album a shape: a strong opener, variety in the middle, a closer that lands."
+            + (f" The owner chose this sound; build the shared tags from it and keep all of it: {style[:600]}." if style else "")
+            + (" It is an instrumental album." if instrumental else "")
+            + _inspired(artists).replace("in the tags", 'in "sound"').replace(", title or lyrics", ", the titles or the cover")
+            + (f" Titles in {lang}." if lang != "English" and not instrumental else "")
+            + (" Keep everything clean: nothing sexual or explicit." if safe else ""))
+
+
+def _album_cover(prompt: str, seed: int, cancel) -> bytes | None:
+    """A square cover from the everyday picture model; None when there is none or it fails (the songs still come)."""
+    a = _auto_models()
+    first = _first_ready([x for x in a.get("picture_safe") or [] if x not in _adult_models()])
+    if first is None or not prompt:
+        return None
+    try:
+        v = {**first["defaults"], "prompt": prompt + ", album cover art, no text, no letters", "detail": "Off"}
+        png = asyncio.run(_comfy_run(_recipe_workflow(first, v, 1024, 1024, seed), lambda o: None, cancel))
+    except Exception as e:                             # noqa: BLE001
+        log.info("album cover skipped: %s", e.__class__.__name__)
+        return None
+    return png or None
+
+
+def job_album(p: dict, emit, cancel):
+    """11-20 (the owner: "full albums"): a theme -> the chat model plans a tracklist with one shared sound and a cover;
+    then each track is written and sung in turn, sent as it finishes, so the first ones play while the rest are made.
+    Stop ends it at once; the tracks already sent are kept."""
+    status = lambda s: emit({"t": "status", "v": s})  # noqa: E731
+    if not _song_ready():
+        raise UserFacing("The song model isn't on your computer yet.")
+    s = _song_inputs(p)
+    if not s["idea"] and not s["style"]:
+        raise UserFacing("Say what the album should be.")
+    try:
+        n = max(ALBUM_TRACKS[0], min(ALBUM_TRACKS[1], int(p.get("tracks") or 6)))
+    except (TypeError, ValueError):
+        n = 6
+    base_seed = int(p.get("seed") or int.from_bytes(os.urandom(4), "big")) % (2 ** 32)
+    status("Planning the album…")
+    plan = _llm_json(_album_system(n, s["instrumental"], s["safe"], s["style"], s["language"], s["artists"]),
+                     s["idea"] or "an album in this sound", cancel, max_tokens=2200)
+    if cancel.is_set():
+        return
+    tracks = [t for t in (plan or {}).get("tracks") or [] if isinstance(t, dict) and t.get("title")][:n]
+    if not plan or not tracks:
+        raise UserFacing("The chat model couldn't plan the album just now. Try again in a moment.")
+    album_id = secrets.token_hex(6)
+    title = str(plan.get("title") or "Album").strip()[:80]
+    sound = str(plan.get("sound") or s["style"] or s["idea"]).strip()[:600]
+    head = {"album_id": album_id, "album_title": title, "tracks": len(tracks)}
+    emit({"t": "album", **head, "sound": sound,
+          "titles": [str(t.get("title")).strip()[:80] for t in tracks]})
+    _song_card(status)
+    status("Painting the cover…")
+    cover = _album_cover(str(plan.get("cover") or "").strip()[:500], base_seed, cancel)
+    if cancel.is_set():
+        return
+    if cover:
+        emit({"t": "cover", "v": base64.b64encode(cover).decode(), **head})
+    _timing(model="ACE-Step 1.5", steps=8, count=len(tracks))
+    made = 0
+    for i, t in enumerate(tracks):
+        if cancel.is_set():
+            break
+        k = len(tracks)
+        tt = str(t.get("title")).strip()[:80]
+        status(f"Writing track {i + 1} of {k}…")
+        idea = (f'Track {i + 1} of {k} of the album "{title}" ({s["idea"]}). This track: "{tt}": '
+                f'{str(t.get("idea") or "").strip()[:600]}')
+        w = _write_song(idea, "", s["instrumental"], s["seconds"], s["safe"], cancel, s["style"], s["language"],
+                        album=sound, artists=s["artists"])
+        if cancel.is_set():
+            break
+        tags = w["tags"] if w else sound
+        lyrics = "[Instrumental]" if s["instrumental"] or not w or not w["lyrics"] else w["lyrics"]
+        bpm, key = (w["bpm"] or 120, w["key"] or "C major") if w else (120, "C major")
+        seconds = s["seconds"] or (w or {}).get("seconds") or (
+            SONG_AUTO_DEFAULT if lyrics == "[Instrumental]" else _lyrics_seconds(lyrics))
+        seed = _part_seed(base_seed, i + 1)
+
+        def part(o, _i=i, _k=k):
+            if o.get("t") == "progress":
+                emit({"t": "progress", "v": round(min(0.99, (_i + o["v"]) / _k), 3)})
+            elif o.get("t") != "status":
+                emit(o)
+        mp3 = _sing(tags, lyrics, seconds, seed, bpm, key, s["language"], part, cancel,
+                    label=f"Making track {i + 1} of {k}…")
+        if cancel.is_set() or not mp3:
+            break
+        made += 1
+        emit({"t": "audio", "v": base64.b64encode(mp3).decode(), "format": "mp3", "seconds": seconds, "seed": seed,
+              "title": tt, "tags": tags, "lyrics": lyrics, "bpm": bpm, "key": key, "language": s["language"],
+              "track": i + 1, **head})
+    if made:
+        emit({"t": "progress", "v": 1.0})
 
 
 def _photo_size(img, megapixels: float = 1.0) -> tuple[int, int]:
@@ -5971,11 +6326,13 @@ JOBS = {"status": job_status, "chat": job_chat, "image": job_image, "video": job
         "lora_search": job_lora_search, "lora_thumb": job_lora_thumb, "lora_inspect": job_lora_inspect,
         "lora_add": job_lora_add, "lora_list": job_lora_list, "lora_set": job_lora_set,
         "lora_remove": job_lora_remove, "lora_key": job_lora_key, "song": job_song,
+        "song_write": job_song_write, "album": job_album,
         "stop_all": _no_job, "queue": _no_job, "free_memory": _no_job,   # these answer on the event loop
         "leave": _no_job}
 # 11-17: never wait for the line, stream as before. (comfy_recipes never needed the card: it waited behind videos and
 # left Make on "Asking your computer..." for minutes.)
-IMMEDIATE = {"status", "search", "forget", "config", "comfy_recipes", "make_recipes", "chat", "installed"}
+IMMEDIATE = {"status", "search", "forget", "config", "comfy_recipes", "make_recipes", "chat", "installed",
+             "song_write"}
 ASYNC_OPS = {"queue", "stop_all", "free_memory", "leave"}
 
 
@@ -6008,8 +6365,8 @@ CHATS_ACTIVE = 0                      # chats answering right now (the idle stop
 LAST_SEEN = time.monotonic()          # 11-17: the last request of any kind from a phone (chat, job, warm-up, queue)
 LEFT_AT: float | None = None          # 11-18: when a phone said "leave" (app went to the background); None = someone is here
 HIDDEN_OPS = {"warm"}                 # make warm-ups: never listed, never noted, never wait
-QUEUED_OPS = {"image", "video", "cutout", "upscale", "comfy_run", "remove_model", "warm", "song"}   # warm: for "make" only
-RESULT_TYPES = {"image", "video", "mask", "audio"}
+QUEUED_OPS = {"image", "video", "cutout", "upscale", "comfy_run", "remove_model", "warm", "song", "album"}   # warm: for "make" only
+RESULT_TYPES = {"image", "video", "mask", "audio", "cover", "album"}
 STOP_TEXT = {"replaced": "Stopped: a newer request from the same place replaced it.", "cancelled": "Stopped.",
              "stop_all": "Stopped: everything on your computer was stopped.",
              "cleared": "Stopped: the work on your computer was cleared."}
@@ -6027,7 +6384,7 @@ def _job_prompt(p: dict) -> str:
 
 
 def _job_kind(op: str, p: dict) -> str:
-    if op in ("video", "cutout", "upscale", "warm", "song"):
+    if op in ("video", "cutout", "upscale", "warm", "song", "album"):
         return op
     if op == "remove_model":
         return "remove"

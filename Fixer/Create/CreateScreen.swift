@@ -206,7 +206,7 @@ final class CreateStore: ObservableObject {
 
     /// Finished work the computer held while Fixer was closed, filed into Make (11-17).
     func adopt(kind: String, words: String, frames: [[String: Any]]) async {
-        if kind == "song" { SongStore.shared.adopt(words: words, frames: frames); return }   // 11-20
+        if kind == "song" || kind == "album" { SongStore.shared.adopt(words: words, frames: frames); return }   // 11-20
         let myEpoch = epoch
         let filter = (kind == "edit" || kind == "change" || kind == "upscale") ? Rules.shared.editFilter : Rules.shared.newFilter
         for fr in frames {

@@ -33,7 +33,7 @@ final class JobInbox {
                     if t == "queued" {
                         words = f["words"] as? String ?? ""
                         slot = f["slot"] as? String ?? slot
-                    } else if t == "image" || t == "video" || t == "audio" {
+                    } else if t == "image" || t == "video" || t == "audio" || t == "cover" {
                         frames.append(f)
                     }
                 }

@@ -21,3 +21,4 @@ einops==0.8.2
 ftfy
 sentencepiece==0.2.3       # T5 tokenizer (Chroma)
 protobuf==7.36.2            # needed by the T5 tokenizer conversion
+yt-dlp==2026.10.26           # 11-20: song references from a link (the owner's own recordings on YouTube etc.)

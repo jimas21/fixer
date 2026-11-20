@@ -454,30 +454,23 @@ final class Desktop: ObservableObject {
         throw PCError.server("No video came back. Try again.")
     }
 
-    /// 11-20: a song from an idea (and optional lyrics) — the MP3 and what the computer wrote for it (title, tags,
-    /// lyrics, seconds).
-    func song(idea: String, lyrics: String, instrumental: Bool, seconds: Int, slot: String? = nil,
-              status: @escaping @Sendable (String) -> Void,
-              progress: @escaping @Sendable (Double) -> Void,
-              note: @escaping @Sendable (String) -> Void) async throws -> (Data, [String: Any]) {
+    /// 11-20: a song or an album ("song" / "album") on the computer. Every frame is handed over as it comes: status,
+    /// progress, note, album (the tracklist), cover, and one audio frame per song.
+    func music(_ op: String, _ payload: [String: Any], slot: String?,
+               frame: @escaping ([String: Any]) -> Void) async throws {
         guard let link else { throw PCError.notPaired }
-        let payload: [String: Any] = ["prompt": idea, "lyrics": lyrics, "instrumental": instrumental,
-                                      "seconds": seconds, "safe": !Rules.shared.explicitNow,
-                                      "label": idea.isEmpty ? "Song" : idea]
-        for try await f in jobStream("song", payload, slot: slot, link: link) {
-            switch f["t"] as? String {
-            case "progress": progress(f["v"] as? Double ?? 0)
-            case "status": status(f["v"] as? String ?? "")
-            case "note": note(f["v"] as? String ?? "")
-            case "audio":
-                guard let b64 = f["v"] as? String, let data = Data(base64Encoded: b64) else { throw PCError.bad }
-                var meta = f
-                meta["v"] = nil
-                return (data, meta)
-            default: break
-            }
-        }
-        throw PCError.server("No song came back. Try again.")
+        var p = payload
+        p["safe"] = !Rules.shared.explicitNow                     // 11-19: 18+ off keeps the written lyrics clean
+        for try await f in jobStream(op, p, slot: slot, link: link) { frame(f) }
+    }
+
+    /// 11-20: "write the lyrics first": the computer's plan for a song (title, tags, lyrics, length), nothing sung.
+    func songWrite(_ payload: [String: Any]) async throws -> [String: Any] {
+        guard let link else { throw PCError.notPaired }
+        var p = payload
+        p["safe"] = !Rules.shared.explicitNow
+        for try await f in call("song_write", p, link: link) where f["t"] as? String == "song_plan" { return f }
+        throw PCError.server("Nothing was written. Try again.")
     }
 
     /// What to keep for a cut-out, as a mask the size of `photo`. `boxes` (0–1) limit it to those things; none =
@@ -973,7 +966,7 @@ final class Desktop: ObservableObject {
         if let slot { p["slot"] = slot }
         p["ack"] = true
         let first = call(op, p, link: link)
-        let single = op != "comfy_run"
+        let single = op != "comfy_run" && op != "album"     // an album sends one song per track
         return AsyncThrowingStream { continuation in
             let task = Task {
                 var jobID: String?

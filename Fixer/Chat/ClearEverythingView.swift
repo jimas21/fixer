@@ -7,6 +7,7 @@ struct ClearEverythingView: View {
     var onClear: () -> Void                    // the chat screen drops its draft, attachment and viewers
     var onFinished: () -> Void                 // closes History
     var startNow = false                       // already confirmed by the caller, go straight to erasing
+    var eraseSongs = false                     // 11-20: songs stay unless this erase was asked to take them too
     @ObservedObject private var desktop = Desktop.shared
     @Environment(\.dismiss) private var dismiss
 
@@ -17,6 +18,9 @@ struct ClearEverythingView: View {
     @State private var steps: [Step] = []
     @State private var confirm = false
     @State private var summary = ""
+    @State private var songsToo: Bool?
+    private var takeSongs: Bool { songsToo ?? eraseSongs }
+    private var songCount: Int { SongStore.shared.songs.count }
 
     enum Stage { case review, erasing, finished }
     enum Mark { case waiting, working, done, warning, failed }
@@ -52,6 +56,11 @@ struct ClearEverythingView: View {
             count("Photos and pictures", inventory.pictures, "photo")
             count("Videos", inventory.videos, "film")
             count("Pictures on the Make screen", created, "paintbrush.pointed")
+            if songCount > 0 {
+                Toggle(isOn: Binding(get: { takeSongs }, set: { songsToo = $0 })) {
+                    Label("Erase my \(plural(songCount, "song", "songs")) too", systemImage: "music.note")
+                }
+            }
             if library.unprotected > 0 {
                 count("Library items", library.unprotected, "photo.stack")
             }
@@ -78,6 +87,9 @@ struct ClearEverythingView: View {
 
         Section("Stays") {
             Label("Settings and your custom instructions", systemImage: "gearshape")
+            if songCount > 0 && !takeSongs {
+                Label("Your \(plural(songCount, "song", "songs")) and albums", systemImage: "music.note")
+            }
             if library.protected > 0 {
                 Label("\(plural(library.protected, "protected Library item", "protected Library items"))", systemImage: "lock.fill")
             }
@@ -161,6 +173,7 @@ struct ClearEverythingView: View {
             Step(id: "pictures", title: "Photos and pictures"),
             Step(id: "conversations", title: "Conversations"),
             Step(id: "create", title: "Pictures on the Make screen"),
+            Step(id: "songs", title: "Songs"),
             Step(id: "scratch", title: "Temporary files and app-switcher snapshot"),
             Step(id: "brain", title: "On-phone AI memory"),
             Step(id: "check", title: "Check: nothing left on this iPhone"),
@@ -194,6 +207,12 @@ struct ClearEverythingView: View {
         await step("create") {
             CreateStore.shared.clear()
             return plural(createdBefore, "picture", "pictures") + " cleared"
+        }
+        let songsBefore = songCount
+        await step("songs") {
+            if takeSongs { return plural(SongStore.shared.deleteAll(), "song", "songs") + " deleted" }
+            SongStore.shared.cancel()
+            return songsBefore == 0 ? "None" : plural(songsBefore, "song", "songs") + " kept, as you chose"
         }
         await step("scratch") {
             let n = History.scratchLeft

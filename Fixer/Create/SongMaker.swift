@@ -64,8 +64,6 @@ struct SongDraft: Codable, Equatable {
     var artwork = true                     // 11-20: paint artwork for a song as it is made (albums always get a cover)
     var explicitLyrics = false             // 11-20: swearing allowed (and adult themes while 18+ is on); saved
     var keep = "balanced"                  // 11-20: how close a song stays to its recording: loose, balanced, close
-    var refUse = "start"                   // 11-20: use the recording as the "start", or match its "voice"
-    var voiceStrength = "medium"           // 11-20: light, medium, strong
 
     /// 11-20 (the owner: "if the app fully closes it should clear all fields but still keep the produced material"):
     /// the form lives in memory only. It survives switching apps; a full close starts it empty. The one saved choice
@@ -311,9 +309,7 @@ final class SongStore: ObservableObject {
 
     /// 11-20: "Match its voice" is a two-pass song: sung from the lyrics first, then re-voiced from the recording.
     private func refUse(_ d: SongDraft, into p: inout [String: Any]) {
-        guard d.refUse == "voice" else { p["reference_match"] = "start"; return }
-        p["reference_match"] = "revoice"
-        p["revoice"] = ["light": 0.4, "medium": 0.55, "strong": 0.7][d.voiceStrength] ?? 0.55
+        p["reference_match"] = "start"
     }
 
     func make(_ d: SongDraft, ref: SongReference?) {
@@ -993,34 +989,18 @@ struct SongMakerView: View {
                     .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Fx.canvas))
             }
             if reference != nil || !store.draft.link.trimmingCharacters(in: .whitespaces).isEmpty {
-                Picker("Use the recording to", selection: d.refUse) {
-                    Text("Start from it").tag("start")
-                    Text("Match its voice").tag("voice")
+                // 11-20: "Match its voice" was tried and taken out: the owner heard all three strengths come out as a
+                // different (male) singer from a female recording. The model can't copy a voice from audio here.
+                Picker("How close to the recording", selection: d.keep) {
+                    Text("Loose").tag("loose")
+                    Text("Balanced").tag("balanced")
+                    Text("Close").tag("close")
                 }
                 .pickerStyle(.segmented)
                 .frame(minHeight: 44)
-                if store.draft.refUse == "voice" {
-                    Picker("How much of its voice", selection: d.voiceStrength) {
-                        Text("Light").tag("light")
-                        Text("Medium").tag("medium")
-                        Text("Strong").tag("strong")
-                    }
-                    .pickerStyle(.segmented)
-                    .frame(minHeight: 44)
-                } else {
-                    Picker("How close to the recording", selection: d.keep) {
-                        Text("Loose").tag("loose")
-                        Text("Balanced").tag("balanced")
-                        Text("Close").tag("close")
-                    }
-                    .pickerStyle(.segmented)
-                    .frame(minHeight: 44)
-                }
-                Text(store.draft.refUse == "voice"
-                     ? "Your lyrics and picks are sung first, then the song is re-voiced toward the recording's voice "
-                       + "and sound. Strong sounds more like it but can blur words. Its tempo and key are matched too."
-                     : "The song is written from your lyrics, picks and artists, then made starting from the recording, "
-                       + "in its tempo and key: Close keeps more of its melody and sound, Loose changes more.")
+                Text("The song is written from your lyrics, picks and artists, then made starting from the recording, "
+                     + "in its tempo and key: Close keeps more of its melody and sound, Loose changes more. It doesn't "
+                     + "copy the singer's voice: describe the voice you want in Voice picks or Sounds like.")
                     .font(.caption).foregroundStyle(Fx.secondaryText)
                 Text("Used for this song only and deleted from your computer after.")
                     .font(.caption).foregroundStyle(Fx.secondaryText)

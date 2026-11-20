@@ -150,9 +150,13 @@ extension CreateScreen {
     /// The model the Model tile picks. Picking one makes the dock a "new picture" form again.
     var modelChoice: Binding<String> {
         Binding(get: { recipeID }, set: { id in
-            // A style is made for one model: switching models lets go of it (its words and tuned settings).
-            if id != recipeID, let a = applied, a.kind != "video", a.snapshot.recipeID != id { removeStyle() }
+            // 11-20: a style stays across a model switch (its words fit any model), re-based on the new model; an
+            // 18+ style goes when the new model is an everyday one.
+            let changed = id != recipeID
+            if changed, let a = applied, a.kind != "video", isExplicitStyle(a.id),
+               recipes.first(where: { $0.id == id })?.adult != true { removeStyle() }
             recipeID = id
+            if changed { rebaseStyle() }
             target = .new
         })
     }
@@ -165,16 +169,18 @@ extension CreateScreen {
 
     /// The recipe row. The everyday recipes are always there; the explicit ones are added after them, as their own
     /// chips, only while "Explicit options in Make" is on in Settings (11-18: additive, not a mode swap).
-    /// 11-20 (the owner: picking a style swapped the model and add-ons "from beneath me" and sat through a load): only
-    /// the styles made for the model in use are offered, so a style never changes the model. Pick another model in
-    /// the Model tile to see its styles.
+    /// 11-20 (the owner: picking a style swapped the model and add-ons "from beneath me" and sat through a load): a
+    /// style never changes the model (applyStyle). Every everyday style is offered on every model; the 18+ ones only
+    /// on an 18+ model, while 18+ is on. (Showing only the model's own styles hid every everyday style on Chroma.)
     var visibleStyles: [StyleRecipe] {
         guard let c = recipeStore.catalog else { return [] }
         let kind = mode == "video" ? "video" : "picture"
-        let all = c.recipes.filter { $0.kind == kind && (kind == "video" || $0.model == recipeID) }
+        let all = c.recipes.filter { $0.kind == kind }
         let clean = all.filter { !$0.explicit }
-        guard makeExplicit else { return clean }
-        return clean + all.filter { $0.explicit }
+        guard makeExplicit, kind == "video" || recipe?.adult == true else { return clean }
+        // the current model's own 18+ styles first
+        let adult = all.filter(\.explicit)
+        return clean + adult.filter { $0.model == recipeID } + adult.filter { $0.model != recipeID }
     }
 
     /// Quick-pick rows for the recipe in use (or the usual ones before any recipe was used).
@@ -238,13 +244,11 @@ extension CreateScreen {
             if let ev = s.explicitVideo { rules.explicitVideo = ev }
         } else {
             mode = "picture"
-            if recipes.contains(where: { $0.id == s.model }) {
-                recipeID = s.model
-            } else if !s.model.isEmpty {
-                styleNote = "That recipe's model isn't on your computer."
-            }
+            // 11-20: the model stays as it is. A style made for this model also sets its steps, guidance, sampler and
+            // "leave out"; on another model it brings only its words, quick-pick rows and shape (another model's
+            // numbers would be wrong here).
             if let sh = s.shape, shapeOptions.contains(sh) { shape = sh }
-            if let r = recipe {
+            if let r = recipe, s.model == recipeID {
                 for (k, v) in s.numbers {
                     guard let c = r.controls.first(where: { $0.key == k }), c.kind == "int" || c.kind == "float" else { continue }
                     numbers[k] = Swift.min(c.max, Swift.max(c.min, v))
@@ -319,8 +323,22 @@ extension CreateScreen {
         if let count { numbers["count"] = count }
         menus = [:]
         texts["negative"] = nil
-        if let a = applied, a.kind != "video", a.snapshot.recipeID != id { applied = nil }
+        if let a = applied, a.kind != "video", a.numberKeys.count + a.menuKeys.count > 0 {
+            applied = AppliedStyle(id: a.id, kind: a.kind, numberKeys: [], menuKeys: [], snapshot: a.snapshot)
+        }
         recipeID = id
+        rebaseStyle()                                  // 11-20: the style stays, on the new model's own settings
+    }
+
+    /// The style in use, measured again against the current model, so a model switch doesn't show it as "Custom".
+    func rebaseStyle() {
+        guard var a = applied, a.kind != "video" else { return }
+        a.snapshot = currentSnapshot(a)
+        applied = a
+    }
+
+    func isExplicitStyle(_ id: String) -> Bool {
+        recipeStore.catalog?.recipes.first { $0.id == id }?.explicit == true
     }
 
     /// 11-19: 18+ off takes out what Make's own 18+ chips put in: the 18+ style tips, and the 18+ quick-pick

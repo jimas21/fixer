@@ -44,6 +44,10 @@
 	<string>Fixer connects to Fixer Desktop on your computer to run larger models.</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>Fixer saves the photos you edit to your library.</string>
 	<key>NSFaceIDUsageDescription</key>

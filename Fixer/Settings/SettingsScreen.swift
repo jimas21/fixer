@@ -67,6 +67,7 @@ struct SettingsScreen: View {
 
                 TidyFreeSection()
                 TidyEraseSection(chat: chat, onClear: { router.clearedCount += 1 })
+                RemoveEverywhereSection(chat: chat)
 
                 Section {
                     NavigationLink("Responses") { ResponseSettings() }

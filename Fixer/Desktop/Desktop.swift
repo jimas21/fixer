@@ -464,6 +464,24 @@ final class Desktop: ObservableObject {
         for try await f in jobStream(op, p, slot: slot, link: link) { frame(f) }
     }
 
+    enum RemoveResult { case removing, unreachable, failed(String) }
+
+    /// 11-20: "Remove Fixer everywhere": the computer uninstalls Fixer Desktop (it answers, then removes itself).
+    func removeFromComputer() async -> RemoveResult {
+        guard let link else { return .unreachable }
+        do {
+            for try await f in call("uninstall", ["confirm": "remove-everything"], link: link)
+            where f["uninstalling"] as? Bool == true {
+                return .removing
+            }
+            return .failed("It didn't confirm.")
+        } catch let e as PCError where e.isUnreachable {
+            return .unreachable
+        } catch {
+            return .failed((error as? LocalizedError)?.errorDescription ?? "It didn't work.")
+        }
+    }
+
     /// 11-20: "write the lyrics first": the computer's plan for a song (title, tags, lyrics, length), nothing sung.
     func songWrite(_ payload: [String: Any]) async throws -> [String: Any] {
         guard let link else { throw PCError.notPaired }

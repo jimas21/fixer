@@ -35,7 +35,7 @@ ROOT = Path(os.environ.get("FIXER_HOME", r"C:\FixerDesktop"))
 PORT = int(os.environ.get("FIXER_PORT", "8765"))
 TRAY_MUTEX = os.environ.get("FIXER_TRAY_MUTEX", r"Global\FixerDesktopTray")
 NO_WINDOW = 0x08000000
-DEPLOY_FILES = ["fixer_desktop.py", "comfy_guard.py", "tray.py", "taehv.py", "pair.py", "fixerctl.py", "client_test.py",
+DEPLOY_FILES = ["fixer_desktop.py", "comfy_guard.py", "tray.py", "taehv.py", "pair.py", "fixerctl.py", "client_test.py", "uninstall.ps1",
                 "trace_test.py"]
 SHELLS = {"powershell.exe", "pwsh.exe", "cmd.exe", "conhost.exe", "bash.exe", "sh.exe"}
 OWN_SCRIPTS = re.compile(r"""(^|[\\/"\s])(tray|pair|fixerctl)\.py\b""")
@@ -366,6 +366,18 @@ def stop_everything(root=ROOT, port=PORT, proc=None, job=None, protect=(), wait=
 
     st = state(port)
     spid = (st or {}).get("pid")
+    # 11-20: the server on this port may be ANOTHER install's (the live one, while a test install in another folder
+    # is stopped or uninstalled). Asking it to quit stopped the owner's live server once; only this install's own.
+    if spid and pid_alive(spid) and spid not in protect and not install_owned(spid, root, protect):
+        say(f"the server on port {port} belongs to another install (pid {spid}); not touching it")
+        rep["foreign"].append(spid)
+        st = spid = None
+        for d in find_leftovers(root, protect):
+            kill(d["pid"], "swept")
+        rep["remaining"] = [d["pid"] for d in find_leftovers(root, protect)]
+        rep["port_closed"] = True                          # nothing of THIS install holds it
+        rep["ok"] = not rep["remaining"]
+        return rep
     alive = port_open(port) or (proc is not None and proc.poll() is None) or bool(spid and pid_alive(spid))
     clean = not alive
     if alive:
@@ -544,6 +556,8 @@ def cmd_deploy(args) -> int:
         return 1
     todo = [n for n in DEPLOY_FILES if (HERE / n).is_file() and _differs(HERE / n, ROOT / n)]
     for n in todo:                                       # check the new files BEFORE they replace working ones
+        if not n.endswith(".py"):
+            continue                                     # uninstall.ps1: PowerShell, not Python
         r = subprocess.run([str(py), "-c", "import sys;compile(open(sys.argv[1],'rb').read(),sys.argv[1],'exec')", str(HERE / n)], capture_output=True, text=True, timeout=60,
                            creationflags=NO_WINDOW)
         if r.returncode:

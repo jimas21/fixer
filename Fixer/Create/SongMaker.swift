@@ -1,4 +1,5 @@
 import AVFoundation
+import MediaPlayer
 import PhotosUI
 import SwiftUI
 import UniformTypeIdentifiers
@@ -45,7 +46,7 @@ struct SongItem: Codable, Identifiable, Hashable {
     var instrumental: Bool { lyrics.isEmpty || lyrics == "[Instrumental]" }
 }
 
-/// What the song form holds; kept between visits (the recording file itself is not kept).
+/// What the song form holds, in memory only (see fresh()).
 struct SongDraft: Codable, Equatable {
     enum Lyrics: String, Codable, CaseIterable { case written, mine, none }
     var album = false
@@ -62,13 +63,15 @@ struct SongDraft: Codable, Equatable {
     var link = ""
     var artwork = true                     // 11-20: paint artwork for a song as it is made (albums always get a cover)
 
-    static let key = "song.draft"
-    static func load() -> SongDraft {
-        guard let d = UserDefaults.standard.data(forKey: key), let s = try? JSONDecoder().decode(SongDraft.self, from: d)
-        else { return SongDraft() }
-        return s
+    /// 11-20 (the owner: "if the app fully closes it should clear all fields but still keep the produced material"):
+    /// the form lives in memory only. It survives switching apps; a full close starts it empty. The one saved choice
+    /// is "Make artwork" (a preference, not a prompt). Anything an older build saved is dropped.
+    static func fresh() -> SongDraft {
+        UserDefaults.standard.removeObject(forKey: "song.draft")
+        var d = SongDraft()
+        d.artwork = UserDefaults.standard.object(forKey: "song.artwork") as? Bool ?? true
+        return d
     }
-    func save() { if let d = try? JSONEncoder().encode(self) { UserDefaults.standard.set(d, forKey: Self.key) } }
 
     /// The picked sound as style tags, then the typed style line.
     var tags: String {
@@ -165,7 +168,9 @@ final class SongStore: ObservableObject {
     @Published var progress: Double = 0
     @Published var note: String?
     @Published var albumPlan: (title: String, titles: [String])?
-    @Published var draft = SongDraft.load() { didSet { if draft != oldValue { draft.save() } } }
+    @Published var draft = SongDraft.fresh() {
+        didSet { if draft.artwork != oldValue.artwork { UserDefaults.standard.set(draft.artwork, forKey: "song.artwork") } }
+    }
     @Published var writing = false
     private var job: Task<Void, Never>?
     private var token: UUID?
@@ -422,39 +427,82 @@ final class SongStore: ObservableObject {
     }
 }
 
+/// 11-20 (the owner: opening Fixer silenced his music and podcasts; Fixer songs stopped when he left the app).
+/// Fixer mixes with other apps' audio and never interrupts it, except while one of its own songs is playing; when
+/// that stops, the other app is told it can carry on.
+enum AudioFocus {
+    /// The everyday setting (set at launch): mix with whatever else is playing, never take over.
+    static func mix() {
+        let s = AVAudioSession.sharedInstance()
+        try? s.setCategory(.ambient, mode: .default, options: [.mixWithOthers])
+    }
+
+    /// A song is playing: Fixer is the music now (keeps playing in the background and on the lock screen).
+    static func take() {
+        let s = AVAudioSession.sharedInstance()
+        try? s.setCategory(.playback, mode: .default, options: [])
+        try? s.setActive(true)
+    }
+
+    /// Done: hand the audio back, so the music or podcast that was playing resumes.
+    static func release() {
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        mix()
+    }
+}
+
 @MainActor
 final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     static let shared = SongPlayer()
     @Published private(set) var playing: UUID?
+    @Published private(set) var paused = false
     @Published var position: Double = 0
     private var player: AVAudioPlayer?
     private var timer: Timer?
     private var queue: [SongItem] = []
+    private var played: [SongItem] = []                       // for "previous track"
+    private var current: SongItem?
+    private var commandsReady = false
 
     func toggle(_ s: SongItem) {
-        if playing == s.id { stop(); return }
+        if playing == s.id { if paused { resume() } else { stop() }; return }
         play([s])
     }
 
     /// Plays the songs one after another (an album's Play all).
     func play(_ list: [SongItem]) {
-        stop()
+        stop(release: false)
         queue = list
+        played = []
         next()
     }
 
     private func next() {
         guard !queue.isEmpty else { stop(); return }
-        let s = queue.removeFirst()
+        if let c = current { played.append(c) }
+        start(queue.removeFirst())
+    }
+
+    private func previous() {
+        if let p = player, p.currentTime > 3 { p.currentTime = 0; updateNowPlaying(); return }
+        guard let last = played.popLast() else { player?.currentTime = 0; return }
+        if let c = current { queue.insert(c, at: 0) }
+        start(last)
+    }
+
+    private func start(_ s: SongItem) {
         player?.stop()
-        try? AVAudioSession.sharedInstance().setCategory(.playback)
-        try? AVAudioSession.sharedInstance().setActive(true)
-        guard let p = try? AVAudioPlayer(contentsOf: SongStore.shared.url(of: s)) else { next(); return }
+        AudioFocus.take()
+        setUpCommands()
+        guard let p = try? AVAudioPlayer(contentsOf: SongStore.shared.url(of: s)) else { current = nil; next(); return }
         p.delegate = self
         p.play()
         player = p
+        current = s
         playing = s.id
+        paused = false
         position = 0
+        updateNowPlaying()
         if timer == nil {
             timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
                 Task { @MainActor in
@@ -465,11 +513,86 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         }
     }
 
-    func stop() {
+    func pause() {
+        guard let p = player, !paused else { return }
+        p.pause()
+        paused = true
+        updateNowPlaying()
+    }
+
+    func resume() {
+        guard let p = player, paused else { return }
+        AudioFocus.take()
+        p.play()
+        paused = false
+        updateNowPlaying()
+    }
+
+    func stop() { stop(release: true) }
+
+    private func stop(release: Bool) {
+        let wasPlaying = player != nil
         queue = []
+        played = []
+        current = nil
         player?.stop(); player = nil
         timer?.invalidate(); timer = nil
-        playing = nil; position = 0
+        playing = nil; paused = false; position = 0
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        if release && wasPlaying { AudioFocus.release() }
+    }
+
+    // MARK: lock screen and Control Center
+
+    private func updateNowPlaying() {
+        guard let s = current, let p = player else { return }
+        var info: [String: Any] = [
+            MPMediaItemPropertyTitle: s.displayTitle,
+            MPMediaItemPropertyArtist: "Fixer",
+            MPMediaItemPropertyPlaybackDuration: p.duration,
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: p.currentTime,
+            MPNowPlayingInfoPropertyPlaybackRate: paused ? 0.0 : 1.0,
+        ]
+        if let a = s.albumTitle { info[MPMediaItemPropertyAlbumTitle] = a }
+        if let n = s.track { info[MPMediaItemPropertyAlbumTrackNumber] = n }
+        if let img = SongStore.shared.cover(s.artKey) {
+            info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: img.size) { _ in img }
+        }
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+    }
+
+    private func setUpCommands() {
+        guard !commandsReady else { return }
+        commandsReady = true
+        let c = MPRemoteCommandCenter.shared()
+        c.playCommand.addTarget { [weak self] _ in
+            MainActor.assumeIsolated { self?.resume() }
+            return .success
+        }
+        c.pauseCommand.addTarget { [weak self] _ in
+            MainActor.assumeIsolated { self?.pause() }
+            return .success
+        }
+        c.togglePlayPauseCommand.addTarget { [weak self] _ in
+            MainActor.assumeIsolated { if self?.paused == true { self?.resume() } else { self?.pause() } }
+            return .success
+        }
+        c.nextTrackCommand.addTarget { [weak self] _ in
+            MainActor.assumeIsolated { self?.next() }
+            return .success
+        }
+        c.previousTrackCommand.addTarget { [weak self] _ in
+            MainActor.assumeIsolated { self?.previous() }
+            return .success
+        }
+        c.changePlaybackPositionCommand.addTarget { [weak self] e in
+            guard let e = e as? MPChangePlaybackPositionCommandEvent else { return .commandFailed }
+            MainActor.assumeIsolated {
+                self?.player?.currentTime = e.positionTime
+                self?.updateNowPlaying()
+            }
+            return .success
+        }
     }
 
     nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {

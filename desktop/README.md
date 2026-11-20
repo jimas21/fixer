@@ -3,6 +3,30 @@
 The computer half of Fixer. When **Use my computer** is on in the app, chat runs on a larger vision model and
 images are made and edited on the computer's graphics card. Remove, cut out and upscale stay on the phone.
 
+## Install
+
+In PowerShell on the computer with the NVIDIA card:
+
+```
+irm https://raw.githubusercontent.com/jimas21/fixer/main/desktop/install.ps1 | iex
+```
+
+It installs into `C:\FixerDesktop`: Python 3.12 and the server's libraries exactly as locked in
+`requirements-lock.txt`, llama.cpp b12443 for chat, ComfyUI v0.45.5 (`comfyui-lock.txt`) for pictures, video and songs,
+and the tray at login, then starts it. About 25 GB; models are fetched later, from the phone. Re-run it to repair or
+update. Then pair: right-click the Fixer icon by the clock, **Pair a phone**, and scan the code in the app.
+
+Your styles (`recipes.json`) are private and are not in this repo; a fresh install starts without them.
+
+## Remove
+
+From the phone: **Settings → Remove Fixer everywhere**. The computer uninstalls Fixer Desktop and the iPhone wipes
+everything Fixer holds; then remove the app's icon (iOS apps can't delete themselves). Nothing is kept on either side.
+
+On the computer alone: `powershell -ExecutionPolicy Bypass -File C:\FixerDesktop\uninstall.ps1`. It stops the tray
+and server, removes the Startup shortcut and deletes `C:\FixerDesktop` with everything in it (models, styles,
+settings, pairings). Shared tools (uv, its cache and its Python) are left alone.
+
 ## What it keeps
 
 Nothing about a request. Requests and results exist in memory only and are dropped when the reply is sent:

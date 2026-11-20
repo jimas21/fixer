@@ -10,6 +10,7 @@ struct FixerApp: App {
         Privacy.forgetOldInstallKey()
         Privacy.excludeFromBackup()
         LibraryVault.sweepOrphans()               // half-saved Library files nobody can read; before any save starts
+        AudioFocus.mix()                          // 11-20: never silence the music or podcast already playing
     }
 
     var body: some Scene {

@@ -60,6 +60,8 @@ import re
 import logging
 import os
 import secrets
+import shutil
+import tempfile
 import struct
 import subprocess
 import sys
@@ -5422,6 +5424,40 @@ def job_warm(p: dict, emit, cancel):
     emit({"t": "info", "warm": True})
 
 
+def _schedule_uninstall(tmp_script: Path, task: str) -> None:
+    """Runs the uninstaller as a one-off scheduled task: Task Scheduler starts it outside this server's job object,
+    so it lives on when it stops the tray and this server, which it does first."""
+    # A task's command is capped at 261 characters: a short launcher beside the copy carries the long arguments.
+    launcher = tmp_script.with_name(f"fxu-{task[-8:]}.ps1")
+    launcher.write_text(f"& '{tmp_script}' -HomeDir '{ROOT}' -Wait 5 -Task '{task}'\n"
+                        f"Remove-Item -LiteralPath '{tmp_script}', $PSCommandPath -Force -ErrorAction SilentlyContinue\n",
+                        encoding="utf-8")
+    tr = f'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{launcher}"'
+    for args in (["schtasks", "/Create", "/TN", task, "/TR", tr, "/SC", "ONCE", "/ST", "23:59", "/F"],
+                 ["schtasks", "/Run", "/TN", task]):
+        r = subprocess.run(args, capture_output=True, text=True, timeout=30, creationflags=0x08000000)
+        if r.returncode != 0:
+            raise UserFacing("Windows wouldn't start the uninstaller: " + (r.stderr or r.stdout).strip()[:200])
+
+
+def job_uninstall(p: dict, emit, cancel):
+    """11-20 (the owner: "a convenient way to delete both ends when we don't want it anymore"): the phone's "Remove
+    Fixer everywhere". A clean wipe of this computer's side, nothing kept (uninstall.ps1): it answers first, then the
+    uninstaller stops everything and deletes the install. Only with the phone's explicit confirmation word."""
+    if p.get("confirm") != "remove-everything":
+        raise UserFacing("Not confirmed.")
+    src = ROOT / "uninstall.ps1"
+    if not src.is_file():
+        raise UserFacing("This computer's Fixer Desktop is too old to remove itself. Update it, or delete "
+                         f"{ROOT} by hand.")
+    tag = secrets.token_hex(4)
+    tmp = Path(os.environ.get("TEMP") or tempfile.gettempdir()) / f"fixer-uninstall-{tag}.ps1"
+    shutil.copyfile(src, tmp)
+    _schedule_uninstall(tmp, f"FixerUninstall-{tag}")
+    log.warning("uninstall requested by a paired phone; the uninstaller starts in 5 s")
+    emit({"t": "info", "uninstalling": True, "home": str(ROOT)})
+
+
 def job_forget(p: dict, emit, cancel):
     """The phone wiped its history: drop everything this PC holds in memory about it. The chat model keeps the last
     conversation in its prompt cache for as long as it runs, and the helper holds the last photo's job; stopping
@@ -6377,11 +6413,11 @@ JOBS = {"status": job_status, "chat": job_chat, "image": job_image, "video": job
         "lora_remove": job_lora_remove, "lora_key": job_lora_key, "song": job_song,
         "song_write": job_song_write, "album": job_album, "artwork": job_artwork,
         "stop_all": _no_job, "queue": _no_job, "free_memory": _no_job,   # these answer on the event loop
-        "leave": _no_job}
+        "leave": _no_job, "uninstall": job_uninstall}
 # 11-17: never wait for the line, stream as before. (comfy_recipes never needed the card: it waited behind videos and
 # left Make on "Asking your computer..." for minutes.)
 IMMEDIATE = {"status", "search", "forget", "config", "comfy_recipes", "make_recipes", "chat", "installed",
-             "song_write"}
+             "song_write", "uninstall"}
 ASYNC_OPS = {"queue", "stop_all", "free_memory", "leave"}
 
 

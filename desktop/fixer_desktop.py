@@ -4076,20 +4076,25 @@ def _song_ready() -> bool:
 
 
 def _song_workflow(tags: str, lyrics: str, seconds: float, seed: int, bpm: int, key: str,
-                   language: str = "en", reference: str | None = None) -> dict:
+                   language: str = "en", reference: str | None = None, keep: float = 0.45) -> dict:
     """The ComfyUI template's graph (audio_ace_step_1_5_checkpoint), saved as MP3 and read back by _comfy_run.
-    11-20 `reference` (a file in ComfyUI's private input folder): ACE-Step's cover mode, the recording re-performed
-    with these tags and lyrics (its own audio codes are not used then, so the writer's step is skipped there)."""
+    11-20 `reference` (a file in ComfyUI's private input folder): the recording is the starting point. The song is
+    still planned from these tags and lyrics (the model's audio codes), then drawn starting from the recording with
+    `keep` of it left (denoise 1 - keep): more keep stays closer to the recording's melody, groove and sound.
+    (The first version used ACE-Step's reference input; in ComfyUI that switches off the audio codes, so the
+    owner's lyrics, picks and artists were all ignored as soon as a link was added.)"""
     wf = _song_graph(tags, lyrics, seconds, seed, bpm, key, language)
     if reference:
-        wf["3"]["inputs"]["generate_audio_codes"] = False
         wf["9"] = {"class_type": "LoadAudio", "inputs": {"audio": reference}}
         wf["10"] = {"class_type": "TrimAudioDuration", "inputs": {"audio": ["9", 0], "start_index": 0.0,
                                                                    "duration": float(seconds)}}
         wf["11"] = {"class_type": "VAEEncodeAudio", "inputs": {"audio": ["10", 0], "vae": ["1", 2]}}
-        wf["12"] = {"class_type": "ReferenceTimbreAudio", "inputs": {"conditioning": ["3", 0], "latent": ["11", 0]}}
-        wf["6"]["inputs"]["positive"] = ["12", 0]
+        wf["6"]["inputs"]["latent_image"] = ["11", 0]
+        wf["6"]["inputs"]["denoise"] = round(1.0 - max(0.1, min(0.8, keep)), 2)
     return wf
+
+
+SONG_KEEP = {"loose": 0.3, "balanced": 0.45, "close": 0.6}   # how much of a recording a song keeps
 
 
 def _song_graph(tags: str, lyrics: str, seconds: float, seed: int, bpm: int, key: str, language: str) -> dict:
@@ -4154,7 +4159,7 @@ def _inspired(artists: str) -> str:
             "lyrics, and never copy their lyrics.") if artists else ""
 
 
-def _song_system(seconds: int | None, instrumental: bool, has_lyrics: bool, safe: bool, style: str = "",
+def _song_system(seconds: int | None, instrumental: bool, has_lyrics: bool, safe: bool | str, style: str = "",
                  language: str = "en", album: str = "", artists: str = "") -> str:
     lines = max(8, min(60, (seconds or 180) // 4))
     lyr = ('"[Instrumental]"' if instrumental else
@@ -4179,9 +4184,23 @@ def _song_system(seconds: int | None, instrumental: bool, has_lyrics: bool, safe
     parts.append(_inspired(artists))
     if not instrumental and not has_lyrics and lang != "English":
         parts.append(f" Write the lyrics in {lang} (the title too); the tags stay in English.")
-    if safe:
-        parts.append(" Keep the lyrics clean: nothing sexual or explicit.")
+    parts.append(LYRIC_RULES.get(safe if isinstance(safe, str) else ("clean" if safe else "strong"), ""))
     return "".join(parts)
+
+
+# 11-20 (the owner: "a toggle for explicit lyrics on or off"). The song form's Explicit lyrics switch, with the
+# session's 18+ switch: off = clean; on with 18+ off = strong language but nothing sexual; on with 18+ on = explicit.
+LYRIC_RULES = {
+    "clean": " Keep the lyrics clean: no swearing, nothing sexual or explicit.",
+    "strong": " Strong language and mature themes are fine where they suit the song; nothing sexual.",
+    "explicit": " Explicit lyrics are fine: strong language and adult, sexual themes where they suit the song.",
+}
+
+
+def _lyric_rating(p: dict) -> str:
+    if p.get("explicit_lyrics") is not True:
+        return "clean"
+    return "strong" if p.get("safe") is True else "explicit"
 
 
 def _llm_json(system: str, text: str, cancel, max_tokens: int = 1800, temperature: float = 0.8) -> dict | None:
@@ -4217,7 +4236,7 @@ def _llm_json(system: str, text: str, cancel, max_tokens: int = 1800, temperatur
     return d if isinstance(d, dict) else None
 
 
-def _write_song(idea: str, lyrics: str, instrumental: bool, seconds: int | None, safe: bool, cancel,
+def _write_song(idea: str, lyrics: str, instrumental: bool, seconds: int | None, safe: bool | str, cancel,
                 style: str = "", language: str = "en", album: str = "", artists: str = "") -> dict | None:
     """The chat model's take on the idea as {title, tags, lyrics, bpm, key, seconds}; None when it can't."""
     text = idea[:4000] + (("\n\nMy lyrics:\n" + lyrics[:6000]) if lyrics and not instrumental else "")
@@ -4254,7 +4273,7 @@ def _song_inputs(p: dict) -> dict:
     return {"idea": idea, "lyrics": "" if instrumental else lyrics, "instrumental": instrumental,
             "style": str(p.get("tags") or "").strip()[:600], "language": lang,
             "seconds": _song_seconds(p.get("seconds")), "safe": p.get("safe") is True,
-            "artists": _artists_text(p.get("artists"))}
+            "artists": _artists_text(p.get("artists")), "rating": _lyric_rating(p)}
 
 
 def job_song_write(p: dict, emit, cancel):
@@ -4264,7 +4283,7 @@ def job_song_write(p: dict, emit, cancel):
     if not s["idea"] and not s["lyrics"]:
         raise UserFacing("Say what the song should be.")
     emit({"t": "status", "v": "Writing the song…"})
-    w = _write_song(s["idea"] or "a song with these lyrics", s["lyrics"], s["instrumental"], s["seconds"], s["safe"],
+    w = _write_song(s["idea"] or "a song with these lyrics", s["lyrics"], s["instrumental"], s["seconds"], s["rating"],
                     cancel, s["style"], s["language"], artists=s["artists"])
     if cancel.is_set():
         return
@@ -4278,9 +4297,9 @@ def job_song_write(p: dict, emit, cancel):
 
 
 def _sing(tags: str, lyrics: str, seconds: int, seed: int, bpm: int, key: str, language: str, emit, cancel,
-          label: str = "Making the song…", reference: str | None = None) -> bytes:
-    return asyncio.run(_comfy_run(_song_workflow(tags, lyrics, seconds, seed, bpm, key, language, reference), emit,
-                                  cancel, audio=True, label=label))
+          label: str = "Making the song…", reference: str | None = None, keep: float = 0.45) -> bytes:
+    return asyncio.run(_comfy_run(_song_workflow(tags, lyrics, seconds, seed, bpm, key, language, reference, keep),
+                                  emit, cancel, audio=True, label=label))
 
 
 SONG_REF_MAX = 30 * 1024 * 1024                         # a reference recording: 30 MB at most
@@ -4397,7 +4416,7 @@ def job_song(p: dict, emit, cancel):
     as_is = p.get("write") is False and bool(s["style"]) and (bool(lyrics) or s["instrumental"])
     if not as_is:
         status("Writing the song…")
-        w = _write_song(s["idea"] or "a song with these lyrics", lyrics, s["instrumental"], seconds, s["safe"],
+        w = _write_song(s["idea"] or "a song with these lyrics", lyrics, s["instrumental"], seconds, s["rating"],
                         cancel, s["style"], s["language"], artists=s["artists"])
         if cancel.is_set():
             return
@@ -4418,13 +4437,17 @@ def job_song(p: dict, emit, cancel):
         if not seconds:
             ref_s = _song_seconds(p.get("reference_seconds")) if ref else None
             seconds = ref_s or (SONG_AUTO_DEFAULT if lyrics == "[Instrumental]" else _lyrics_seconds(lyrics))
+        ref_len = _song_seconds(p.get("reference_seconds")) if ref else None
+        if ref_len and seconds > ref_len:
+            seconds = ref_len                          # the song starts from the recording: no longer than it
         if cancel.is_set():
             return
         _song_card(status)
         _timing(model="ACE-Step 1.5", steps=8, count=1)
         status("Loading the song model…")
         mp3 = _sing(tags, lyrics, seconds, seed, bpm, key, s["language"], emit, cancel,
-                    reference=ref[0] if ref else None)
+                    reference=ref[0] if ref else None,
+                    keep=SONG_KEEP.get(str(p.get("reference_keep") or "balanced"), SONG_KEEP["balanced"]))
     finally:
         if ref:
             ref[1].unlink(missing_ok=True)             # the recording never outlives the job
@@ -4532,7 +4555,8 @@ def job_album(p: dict, emit, cancel):
         n = 6
     base_seed = int(p.get("seed") or int.from_bytes(os.urandom(4), "big")) % (2 ** 32)
     status("Planning the album…")
-    plan = _llm_json(_album_system(n, s["instrumental"], s["safe"], s["style"], s["language"], s["artists"]),
+    plan = _llm_json(_album_system(n, s["instrumental"], s["rating"] == "clean" or s["safe"], s["style"], s["language"],
+                                   s["artists"]),
                      s["idea"] or "an album in this sound", cancel, max_tokens=2200)
     if cancel.is_set():
         return
@@ -4562,7 +4586,7 @@ def job_album(p: dict, emit, cancel):
         status(f"Writing track {i + 1} of {k}…")
         idea = (f'Track {i + 1} of {k} of the album "{title}" ({s["idea"]}). This track: "{tt}": '
                 f'{str(t.get("idea") or "").strip()[:600]}')
-        w = _write_song(idea, "", s["instrumental"], s["seconds"], s["safe"], cancel, s["style"], s["language"],
+        w = _write_song(idea, "", s["instrumental"], s["seconds"], s["rating"], cancel, s["style"], s["language"],
                         album=sound, artists=s["artists"])
         if cancel.is_set():
             break

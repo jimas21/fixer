@@ -239,10 +239,15 @@ out = run({"prompt": "x", "reference": base64.b64encode(b"RIFFfake").decode(), "
 wf = ran["wf"]
 name = wf["9"]["inputs"]["audio"]
 check(seen_files == [True] and not (fd.COMFY_PRIVATE / "input" / name).exists(), "the recording exists only for the job")
-check(name.endswith(".wav") and wf["6"]["inputs"]["positive"] == ["12", 0]
-      and wf["12"]["class_type"] == "ReferenceTimbreAudio" and wf["3"]["inputs"]["generate_audio_codes"] is False,
-      "cover graph: load, trim, encode, reference into the sampler")
+check(name.endswith(".wav") and wf["6"]["inputs"]["latent_image"] == ["11", 0]
+      and wf["6"]["inputs"]["positive"] == ["3", 0] and "12" not in wf
+      and wf["3"]["inputs"]["generate_audio_codes"] is True and wf["6"]["inputs"]["denoise"] == 0.55,
+      "the recording is the starting point; lyrics and style still plan the song (codes on)")
 check(wf["5"]["inputs"]["seconds"] == 95.0 and wf["10"]["inputs"]["duration"] == 95.0, "auto length = the recording's")
+out = run({"prompt": "x", "reference": base64.b64encode(b"x").decode(), "reference_seconds": 40, "seconds": 120,
+           "reference_keep": "close"})
+check(ran["wf"]["10"]["inputs"]["duration"] == 40.0 and ran["wf"]["6"]["inputs"]["denoise"] == 0.4,
+      "no longer than the recording; Close keeps more of it")
 out = run({"prompt": "x", "reference": base64.b64encode(b"x").decode(), "reference_ext": "exe", "seconds": 60})
 check(ran["wf"]["9"]["inputs"]["audio"].endswith(".m4a"), "an odd extension becomes m4a")
 try:
@@ -290,11 +295,12 @@ for bad in ("ftp://x.com/a", "http://localhost/a", "http://192.168.1.5/a", "http
         check(False, "refused " + bad)
     except fd.UserFacing:
         check(True, "")
+before_refs = set((fd.COMFY_PRIVATE / "input").glob("songref_*"))   # a live job may hold one of its own
 try:
     run({"prompt": "x", "reference_url": "https://youtube.com/watch?v=fail"})
     check(False, "a failing link says so")
 except fd.UserFacing as e:
-    check("Couldn't get the audio" in str(e) and not list((fd.COMFY_PRIVATE / "input").glob("songref_*")),
+    check("Couldn't get the audio" in str(e) and set((fd.COMFY_PRIVATE / "input").glob("songref_*")) == before_refs,
           "a failing link says so and leaves nothing")
 fd._comfy_run = fake_run
 
@@ -327,6 +333,17 @@ try:
 except fd.UserFacing:
     check(True, "")
 check(fd._job_kind("artwork", {}) == "artwork" and "artwork" in fd.QUEUED_OPS, "artwork is queued")
+
+# explicit lyrics switch: off clean; on + 18+ off strong language only; on + 18+ on explicit
+fd._comfy_run = fake_run
+fd._song_ready = lambda: True
+fd._enhance_port = lambda: 1
+fd._chat_llama = writer_answer(good)
+for payload, want in (({}, "Keep the lyrics clean"), ({"safe": False}, "Keep the lyrics clean"),
+                      ({"explicit_lyrics": True, "safe": True}, "nothing sexual."),
+                      ({"explicit_lyrics": True, "safe": False}, "adult, sexual themes")):
+    run({"prompt": "x", "seconds": 60, **payload})
+    check(want in fd._chat_llama.last["instructions"], f"lyric rule for {payload}")
 
 print(f"{checks} checks, {fails} failed")
 raise SystemExit(1 if fails else 0)

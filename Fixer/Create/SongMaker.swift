@@ -62,6 +62,8 @@ struct SongDraft: Codable, Equatable {
     var artists: [ArtistPick] = []
     var link = ""
     var artwork = true                     // 11-20: paint artwork for a song as it is made (albums always get a cover)
+    var explicitLyrics = false             // 11-20: swearing allowed (and adult themes while 18+ is on); saved
+    var keep = "balanced"                  // 11-20: how close a song stays to its recording: loose, balanced, close
 
     /// 11-20 (the owner: "if the app fully closes it should clear all fields but still keep the produced material"):
     /// the form lives in memory only. It survives switching apps; a full close starts it empty. The one saved choice
@@ -70,6 +72,7 @@ struct SongDraft: Codable, Equatable {
         UserDefaults.standard.removeObject(forKey: "song.draft")
         var d = SongDraft()
         d.artwork = UserDefaults.standard.object(forKey: "song.artwork") as? Bool ?? true
+        d.explicitLyrics = UserDefaults.standard.bool(forKey: "song.explicitLyrics")
         return d
     }
 
@@ -169,7 +172,12 @@ final class SongStore: ObservableObject {
     @Published var note: String?
     @Published var albumPlan: (title: String, titles: [String])?
     @Published var draft = SongDraft.fresh() {
-        didSet { if draft.artwork != oldValue.artwork { UserDefaults.standard.set(draft.artwork, forKey: "song.artwork") } }
+        didSet {
+            if draft.artwork != oldValue.artwork { UserDefaults.standard.set(draft.artwork, forKey: "song.artwork") }
+            if draft.explicitLyrics != oldValue.explicitLyrics {
+                UserDefaults.standard.set(draft.explicitLyrics, forKey: "song.explicitLyrics")
+            }
+        }
     }
     @Published var writing = false
     private var job: Task<Void, Never>?
@@ -279,17 +287,19 @@ final class SongStore: ObservableObject {
                                 "tags": d.tags, "language": d.language, "seconds": d.auto ? 0 : d.seconds,
                                 "instrumental": d.lyricMode == .none,
                                 "artists": d.artists.map { ["name": $0.name, "genres": $0.genres] },
-                                "artwork": !d.album && d.artwork]
+                                "artwork": !d.album && d.artwork,
+                                "explicit_lyrics": d.explicitLyrics]
         if !d.album, d.lyricMode == .mine { p["lyrics"] = d.lyrics.trimmingCharacters(in: .whitespacesAndNewlines) }
         if d.album {
             p["tracks"] = d.tracks
         } else if let ref {
             p["reference"] = ref.data.base64EncodedString()
             p["reference_ext"] = ref.ext
+            p["reference_keep"] = d.keep
             if let s = ref.seconds { p["reference_seconds"] = s }
         } else {
             let link = d.link.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !link.isEmpty { p["reference_url"] = link }
+            if !link.isEmpty { p["reference_url"] = link; p["reference_keep"] = d.keep }
         }
         let label = d.idea.isEmpty ? (d.album ? "Album" : "Song") : d.idea
         p["label"] = String(label.prefix(60))
@@ -308,6 +318,7 @@ final class SongStore: ObservableObject {
         if let b = s.bpm { p["bpm"] = b }
         if let k = s.key { p["key"] = k }
         if let l = s.language { p["language"] = l }
+        p["explicit_lyrics"] = draft.explicitLyrics
         run("song", p, idea: s.idea)
     }
 
@@ -921,7 +932,18 @@ struct SongMakerView: View {
             case .none:
                 EmptyView()
             }
+            if store.draft.lyricMode != .none { explicitToggle }
         }
+    }
+
+    /// 11-20: written lyrics may swear (and, while 18+ is on, go adult). One saved switch.
+    private var explicitToggle: some View {
+        Toggle(isOn: d.explicitLyrics) {
+            Label("Explicit lyrics", systemImage: "e.square").font(.subheadline.weight(.semibold))
+        }
+        .tint(Fx.accent)
+        .frame(minHeight: 44)
+        .accessibilityHint("Off keeps written lyrics clean")
     }
 
     // Start from a recording
@@ -961,8 +983,16 @@ struct SongMakerView: View {
                     .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Fx.canvas))
             }
             if reference != nil || !store.draft.link.trimmingCharacters(in: .whitespaces).isEmpty {
-                Text("The recording is re-performed in the sound and lyrics above. It is used for this song only "
-                     + "and deleted from your computer after.")
+                Picker("How close to the recording", selection: d.keep) {
+                    Text("Loose").tag("loose")
+                    Text("Balanced").tag("balanced")
+                    Text("Close").tag("close")
+                }
+                .pickerStyle(.segmented)
+                .frame(minHeight: 44)
+                Text("The song is written from your lyrics, picks and artists, then made starting from the recording: "
+                     + "Close keeps more of its melody and sound, Loose changes more. Used for this song only and "
+                     + "deleted from your computer after.")
                     .font(.caption).foregroundStyle(Fx.secondaryText)
             }
         }
@@ -1000,6 +1030,7 @@ struct SongMakerView: View {
             }
             .tint(Fx.accent)
             .frame(minHeight: 44)
+            if store.draft.lyricMode != .none { explicitToggle }
             Text("Each track is written and sung in turn, with a cover; they arrive one by one, so the first ones "
                  + "play while the rest are made. About 1–2 minutes a track.")
                 .font(.caption).foregroundStyle(Fx.secondaryText)

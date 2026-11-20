@@ -149,7 +149,12 @@ extension CreateScreen {
 
     /// The model the Model tile picks. Picking one makes the dock a "new picture" form again.
     var modelChoice: Binding<String> {
-        Binding(get: { recipeID }, set: { recipeID = $0; target = .new })
+        Binding(get: { recipeID }, set: { id in
+            // A style is made for one model: switching models lets go of it (its words and tuned settings).
+            if id != recipeID, let a = applied, a.kind != "video", a.snapshot.recipeID != id { removeStyle() }
+            recipeID = id
+            target = .new
+        })
     }
 
     var shapeOptions: [String] { recipe?.controls.first { $0.kind == "shape" }?.options ?? ["square", "portrait", "landscape", "wallpaper"] }
@@ -160,10 +165,13 @@ extension CreateScreen {
 
     /// The recipe row. The everyday recipes are always there; the explicit ones are added after them, as their own
     /// chips, only while "Explicit options in Make" is on in Settings (11-18: additive, not a mode swap).
+    /// 11-20 (the owner: picking a style swapped the model and add-ons "from beneath me" and sat through a load): only
+    /// the styles made for the model in use are offered, so a style never changes the model. Pick another model in
+    /// the Model tile to see its styles.
     var visibleStyles: [StyleRecipe] {
         guard let c = recipeStore.catalog else { return [] }
         let kind = mode == "video" ? "video" : "picture"
-        let all = c.recipes.filter { $0.kind == kind }
+        let all = c.recipes.filter { $0.kind == kind && (kind == "video" || $0.model == recipeID) }
         let clean = all.filter { !$0.explicit }
         guard makeExplicit else { return clean }
         return clean + all.filter { $0.explicit }

@@ -23,16 +23,19 @@ extension CreateScreen {
         return VStack(alignment: .leading, spacing: 2) {
             if canChange { targetSwitch }
             if effectiveTarget == .new {
-                HStack(spacing: 0) {
-                    groupTag("Style")
-                    styleStrip {
-                        if styleIsCustom { customChip }
-                        ForEach(everyday) { s in styleChip(s) }
-                        if mode == "picture", let seed = fixedSeed { seedChip(seed) }
+                // 11-20: an 18+ model has no everyday styles, so its Style row can be empty: then it isn't shown.
+                if !everyday.isEmpty || styleIsCustom || (mode == "picture" && fixedSeed != nil) {
+                    HStack(spacing: 0) {
+                        groupTag("Style")
+                        styleStrip {
+                            if styleIsCustom { customChip }
+                            ForEach(everyday) { s in styleChip(s) }
+                            if mode == "picture", let seed = fixedSeed { seedChip(seed) }
+                        }
                     }
+                    .accessibilityElement(children: .contain)
+                    .accessibilityLabel("Style")
                 }
-                .accessibilityElement(children: .contain)
-                .accessibilityLabel("Style")
                 if !adult.isEmpty {
                     HStack(spacing: 0) {
                         flameTag

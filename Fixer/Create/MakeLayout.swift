@@ -172,7 +172,10 @@ extension CreateScreen {
     /// Quick-pick rows for the recipe in use (or the usual ones before any recipe was used).
     var activeGroups: [QuickGroup] {
         guard let c = recipeStore.catalog else { return [] }
-        let defaults = mode == "video" ? ["motion"] : ["subject", "hair", "outfit", "setting", "lighting"]
+        // 11-19: framing (Camera), Pose and Face were missing until a style was picked; the owner looked for full
+        // body / from behind / over the shoulder / focus and couldn't find them.
+        let defaults = mode == "video" ? ["motion"]
+            : ["subject", "hair", "outfit", "expression", "pose", "setting", "lighting", "camera"]
         let ids = applied?.kind == (mode == "video" ? "video" : "picture") ? (appliedChips.isEmpty ? defaults : appliedChips) : defaults
         // 11-19: with 18+ off, a row that has only 18+ options (anatomy, kink, ...) isn't shown at all.
         return ids.compactMap { id in c.groups.first { $0.id == id } }

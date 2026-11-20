@@ -260,6 +260,23 @@ extension CreateScreen {
         applied = a
     }
 
+    /// 11-19 (the owner: a picked style couldn't be tapped off). Lets go of the style in use: its opening and closing
+    /// words go, and the settings it tuned (steps, guidance, sampler, "leave out") go back to the model's own. The
+    /// model, the shape and the owner's own words stay.
+    func removeStyle() {
+        guard let a = applied else { return }
+        styleNote = nil
+        if a.kind == "video" {
+            videoPrefix = ""; videoSuffix = ""
+        } else {
+            stylePrefix = ""; styleSuffix = ""
+            for k in a.numberKeys { numbers[k] = nil }
+            for k in a.menuKeys { menus[k] = nil }
+            if !a.snapshot.negative.isEmpty, texts["negative"] == a.snapshot.negative { texts["negative"] = nil }
+        }
+        applied = nil
+    }
+
     // MARK: switches
 
     /// 11-19: the models Make offers: the 18+ ones (Chroma, Juggernaut) only while 18+ is on.

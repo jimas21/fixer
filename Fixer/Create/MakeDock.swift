@@ -118,17 +118,34 @@ extension CreateScreen {
 
     private func styleChip(_ s: StyleRecipe) -> some View {
         let on = applied?.id == s.id && !styleIsCustom
-        return Button { applyStyle(s) } label: { recipeChipBody(s.name, on: on, check: on, explicit: s.explicit) }
+        // Tapping the style in use lets it go (11-19); tapping another one switches to it.
+        return Button { if on { removeStyle() } else { applyStyle(s) } } label: {
+            recipeChipBody(s.name, on: on, check: on, explicit: s.explicit)
+        }
             .buttonStyle(.plain)
             .accessibilityAddTraits(on ? .isSelected : [])
-            .accessibilityHint(s.explicit ? "Explicit. \(s.note ?? "")" : (s.note ?? ""))
+            .accessibilityHint(on ? "Tap to remove this style" : (s.explicit ? "Explicit. \(s.note ?? "")" : (s.note ?? "")))
     }
 
+    /// The style was changed by hand after it was picked; tapping this lets go of it too.
     private var customChip: some View {
-        recipeChipBody("Custom", on: true, check: false)
-            .accessibilityLabel("Custom")
-            .accessibilityHint("Settings were changed by hand after the recipe")
-            .accessibilityAddTraits(.isSelected)
+        Button { removeStyle() } label: {
+            HStack(spacing: 5) {
+                Text("Custom").font(.system(size: 14, weight: .semibold)).lineLimit(1)
+                Image(systemName: "xmark").font(.system(size: 11, weight: .bold))
+            }
+            .foregroundStyle(Fx.accentSoftText)
+            .padding(.horizontal, 13)
+            .frame(height: 34)
+            .background(Capsule().fill(Fx.onTintStrong))
+            .overlay(Capsule().strokeBorder(Fx.accent, lineWidth: 1))
+            .frame(minHeight: 44)
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Custom")
+        .accessibilityHint("Settings were changed by hand after the style. Tap to remove the style")
+        .accessibilityAddTraits(.isSelected)
     }
 
     private func seedChip(_ seed: Int) -> some View {

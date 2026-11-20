@@ -59,13 +59,33 @@ extension CreateScreen {
     func quickSectionsCard(tips: [PromptToggleGroup]) -> some View {
         MakeSectionsCard(
             sections: quickSections,
-            selectedCount: { quickSelectedCount($0) },
+            selectedNames: { quickSelectedNames($0) },
             row: { AnyView(quickRowTiled($0)) },
             tips: tips,
-            tipCount: { g in g.items.reduce(0) { $0 + (chosen.contains($1.id) ? 1 : 0) } },
+            tipNames: { g in g.items.filter { chosen.contains($0.id) }.map(\.label) },
             tipRow: { AnyView(tipRow($0)) },
             clearTips: chosen.isEmpty ? nil : { chosen.removeAll() },
             expanded: $quickExpanded
+        )
+        .fxAnimation(Motion.pop, value: makeExplicit)   // 11-19: the 18+ strips slide in / out, the rest shifts
+    }
+
+    /// 11-19: the picks switched on in a group, in the group's own order (everyday first, then 18+ while it's on).
+    func quickSelectedNames(_ g: QuickGroup) -> [String] {
+        let text = quickBinding.wrappedValue
+        return (g.options + (makeExplicit ? g.explicitOptions : [])).filter { PhraseList.contains(text, $0) }
+            .reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
+    }
+
+    /// 11-19: the "see all" sheet for one group (opened from its name tag).
+    func quickPickSheet(_ g: QuickGroup) -> some View {
+        let everydaySet = Set(g.options.map { $0.lowercased() })
+        return QuickPickSheet(
+            title: g.label,
+            everyday: g.options,
+            adult: makeExplicit ? g.explicitOptions.filter { !everydaySet.contains($0.lowercased()) } : [],
+            isOn: { PhraseList.contains(quickBinding.wrappedValue, $0) },
+            toggle: { tapQuick($0) }
         )
     }
 
@@ -75,9 +95,20 @@ extension CreateScreen {
     /// it is exactly the plain chip row. Taps go through the same `tapQuick`, so selection logic is shared.
     @ViewBuilder
     func quickRowTiled(_ g: QuickGroup) -> some View {
-        let options = g.options + (makeExplicit ? g.explicitOptions : [])
-        if options.contains(where: { Pictograph.asset(groupID: g.id, option: $0) != nil }) {
-            tiledGroup(g, options: options)
+        if g.options.contains(where: { Pictograph.asset(groupID: g.id, option: $0) != nil }) {
+            // 11-19: tiles for the everyday options; 18+ ones (while on) get their own flame strip, as in quickRow.
+            let everydaySet = Set(g.options.map { $0.lowercased() })
+            let adult = makeExplicit ? g.explicitOptions.filter { !everydaySet.contains($0.lowercased()) } : []
+            VStack(alignment: .leading, spacing: 0) {
+                tiledGroup(g, options: g.options)
+                if !adult.isEmpty {
+                    HStack(spacing: 0) {
+                        flameTag
+                        chipStrip(adult, explicit: true)
+                    }
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                }
+            }
         } else {
             quickRow(g)
         }
@@ -90,7 +121,22 @@ extension CreateScreen {
         let explicitSet = Set(g.explicitOptions)
         let text = quickBinding.wrappedValue
         return VStack(alignment: .leading, spacing: 6) {
-            Text(g.label).font(.footnote).foregroundStyle(Fx.secondaryText).lineLimit(1)
+            HStack(spacing: 8) {
+                Text(g.label).font(.footnote).foregroundStyle(Fx.secondaryText).lineLimit(1)
+                Spacer(minLength: 8)
+                Button { quickSheet = g } label: {                     // 11-19: the same "see all" as chip rows
+                    HStack(spacing: 2) {
+                        Image(systemName: "square.grid.2x2").font(.system(size: 9, weight: .semibold))
+                        Text("all \(g.options.count + (makeExplicit ? g.explicitOptions.count : 0))")
+                            .font(.system(size: 11))
+                    }
+                    .foregroundStyle(Fx.accentSoftText)
+                    .frame(minHeight: 32)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("\(g.label): see all")
+            }
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(spacing: 8) {
                     ForEach(options, id: \.self) { o in
@@ -127,11 +173,12 @@ struct QuickSection: Identifiable {
 /// shut. Everything a row draws comes in through closures, so this file never reimplements a chip.
 struct MakeSectionsCard: View {
     let sections: [QuickSection]
-    let selectedCount: (QuickGroup) -> Int
+    /// 11-19: what's picked in a group, shown under the section's name (a count alone said nothing).
+    let selectedNames: (QuickGroup) -> [String]
     let row: (QuickGroup) -> AnyView
     /// The style-tip groups, each its own collapsible section after the quick picks (empty: none shown).
     let tips: [PromptToggleGroup]
-    let tipCount: (PromptToggleGroup) -> Int
+    let tipNames: (PromptToggleGroup) -> [String]
     let tipRow: (PromptToggleGroup) -> AnyView
     /// Turns every tip off; nil when none is on.
     let clearTips: (() -> Void)?
@@ -142,14 +189,15 @@ struct MakeSectionsCard: View {
         VStack(spacing: 10) {
             ForEach(sections) { section in
                 card(key: section.name, name: section.name,
-                     count: section.groups.reduce(0) { $0 + selectedCount($1) }, tip: false) {
+                     picked: section.groups.flatMap { selectedNames($0) }, tip: false) {
                     AnyView(VStack(spacing: 0) { ForEach(section.groups) { g in row(g) } })
                 }
             }
             if !tips.isEmpty {
                 tipsLabel
-                ForEach(tips) { g in
-                    card(key: "tip:" + g.name, name: g.name, count: tipCount(g), tip: true) { tipRow(g) }
+                ForEach(Array(tips.enumerated()), id: \.offset) { i, g in
+                    let name = g.name.isEmpty ? "Tips \(i + 1)" : g.name      // an unnamed group still gets a header
+                    card(key: "tip:" + name, name: name, picked: tipNames(g), tip: true) { tipRow(g) }
                 }
             }
         }
@@ -175,8 +223,9 @@ struct MakeSectionsCard: View {
         .padding(.top, 4)
     }
 
-    private func card(key: String, name: String, count: Int, tip: Bool,
+    private func card(key: String, name: String, picked: [String], tip: Bool,
                       content: () -> AnyView) -> some View {
+        let count = picked.count
         let isOpen = expanded.contains(key)
         let rows: AnyView? = isOpen ? content() : nil
         return VStack(alignment: .leading, spacing: 8) {
@@ -188,6 +237,15 @@ struct MakeSectionsCard: View {
             .buttonStyle(.plain)
             .accessibilityLabel((tip ? "Style tips, " : "") + (count > 0 ? "\(name), \(count) selected" : name))
             .accessibilityHint(isOpen ? "Collapse" : "Expand")
+            if !picked.isEmpty {
+                // 11-19: what's on, always in view: no scrolling 40 chips to remember what was picked.
+                Text(picked.joined(separator: " · "))
+                    .font(.caption)
+                    .foregroundStyle(tip ? Fx.secondaryText : Fx.accentSoftText)
+                    .lineLimit(isOpen ? 3 : 2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityHidden(true)               // the header already says how many
+            }
             if let rows { rows }
         }
         .padding(12)
@@ -303,5 +361,119 @@ struct PictographTile: View {
         Image(asset ?? "").resizable().scaledToFit()
             .foregroundStyle(selected ? tint : Color.primary)
             .accessibilityHidden(true)
+    }
+}
+
+// MARK: - "See all" sheet (11-19)
+
+/// Every option of one quick-pick group at once, wrapped instead of in one long strip: what's picked sits at the top,
+/// a search narrows the rest, and the 18+ options (only while 18+ is on) have their own flame-marked block. Taps
+/// switch picks in the words straight away (the same `tapQuick` as the strips); Done just closes.
+struct QuickPickSheet: View {
+    let title: String
+    let everyday: [String]
+    let adult: [String]
+    let isOn: (String) -> Bool
+    let toggle: (String) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var search = ""
+
+    private func matches(_ o: String) -> Bool {
+        let q = search.trimmingCharacters(in: .whitespaces)
+        return q.isEmpty || o.localizedCaseInsensitiveContains(q)
+    }
+
+    var body: some View {
+        let picked = (everyday + adult).filter(isOn).reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
+        let adultSet = Set(adult)
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    block(picked.isEmpty ? "Nothing picked yet" : "Picked (\(picked.count))",
+                          picked, adultSet: adultSet, empty: "Tap any option below.")
+                    block("Options", everyday.filter(matches), adultSet: [], empty: "No match.")
+                    if !adult.isEmpty {
+                        block("18+", adult.filter(matches), adultSet: adultSet, empty: "No match.", flame: true)
+                    }
+                }
+                .padding(16)
+            }
+            .background(Fx.canvas.ignoresSafeArea())
+            .searchable(text: $search, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search \(title)")
+            .navigationTitle(title)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
+            }
+        }
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
+    }
+
+    private func block(_ head: String, _ options: [String], adultSet: Set<String>, empty: String,
+                       flame: Bool = false) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 4) {
+                if flame { Image(systemName: "flame.fill").foregroundStyle(Fx.explicitText) }
+                Text(head).font(.footnote.weight(.semibold)).foregroundStyle(Fx.secondaryText)
+            }
+            if options.isEmpty {
+                Text(empty).font(.footnote).foregroundStyle(Fx.secondaryText)
+            } else {
+                FlowRows(spacing: 6) {
+                    ForEach(options, id: \.self) { o in chip(o, explicit: adultSet.contains(o)) }
+                }
+            }
+        }
+    }
+
+    private func chip(_ o: String, explicit: Bool) -> some View {
+        let on = isOn(o)
+        return Button { toggle(o) } label: {
+            Text(o)
+                .font(.system(size: 14, weight: on ? .semibold : .regular))
+                .lineLimit(1)
+                .foregroundStyle(on ? (explicit ? Fx.explicitText : Fx.accentSoftText) : Color.primary)
+                .padding(.horizontal, 11)
+                .frame(height: 32)
+                .background(Capsule().fill(on ? (explicit ? Fx.explicitFill : Fx.onTintStrong) : Fx.tile))
+                .overlay(Capsule().strokeBorder(on ? (explicit ? Fx.explicitStroke : Fx.accent)
+                                                   : (explicit ? Fx.explicitStroke.opacity(0.4) : Color.clear),
+                                                lineWidth: 1))
+                .frame(minHeight: 44)
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(on ? .isSelected : [])
+        .accessibilityHint(explicit ? "Explicit" : "")
+    }
+}
+
+/// Lays chips out left to right, wrapping onto new lines (a plain flow layout).
+struct FlowRows: Layout {
+    var spacing: CGFloat = 6
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let width = proposal.width ?? .infinity
+        var x: CGFloat = 0, y: CGFloat = 0, line: CGFloat = 0, widest: CGFloat = 0
+        for s in subviews {
+            let size = s.sizeThatFits(.unspecified)
+            if x > 0, x + size.width > width { y += line + spacing; x = 0; line = 0 }
+            x += size.width + spacing
+            line = max(line, size.height)
+            widest = max(widest, x - spacing)
+        }
+        return CGSize(width: proposal.width ?? widest, height: y + line)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var x = bounds.minX, y = bounds.minY, line: CGFloat = 0
+        for s in subviews {
+            let size = s.sizeThatFits(.unspecified)
+            if x > bounds.minX, x + size.width > bounds.maxX { y += line + spacing; x = bounds.minX; line = 0 }
+            s.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(size))
+            x += size.width + spacing
+            line = max(line, size.height)
+        }
     }
 }

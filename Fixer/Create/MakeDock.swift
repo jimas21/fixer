@@ -171,47 +171,102 @@ extension CreateScreen {
 
     // MARK: quick picks
 
+    /// One quick-pick group. 11-19: its 18+ options are no longer tacked onto the end of the everyday strip (nobody
+    /// scrolls 40 chips to find them): while 18+ is on they get their own strip underneath, tagged with a flame, that
+    /// swipes on its own; with 18+ off that strip isn't there at all and everything below moves up. The name tag on
+    /// the left stays put and opens the whole group in a sheet (`QuickPickSheet`) to see and pick from everything.
     func quickRow(_ g: QuickGroup) -> some View {
-        let options = g.options + (makeExplicit ? g.explicitOptions : [])
-        let explicitSet = Set(g.explicitOptions)
-        let text = quickBinding.wrappedValue
-        return HStack(spacing: 0) {
-            Text(g.label)
-                .font(.footnote)
-                .foregroundStyle(Fx.secondaryText)
-                .lineLimit(1)
-                .frame(width: 66, alignment: .leading)
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 6) {
-                    ForEach(options, id: \.self) { o in
-                        let on = PhraseList.contains(text, o)
-                        let exp = explicitSet.contains(o)
-                        let tint = exp ? Fx.explicitText : styleTint
-                        let fill = exp ? Fx.explicitFill : styleFill
-                        let stroke = exp ? Fx.explicitStroke : styleStroke
-                        let idleStroke = exp ? Fx.explicitStroke.opacity(0.4) : Color.clear
-                        Button { tapQuick(o) } label: {
-                            Text(o)
-                                .font(.system(size: 14, weight: on ? .semibold : .regular))
-                                .lineLimit(1)
-                                .foregroundStyle(on ? tint : Color.primary)
-                                .padding(.horizontal, 11)
-                                .frame(height: 32)
-                                .background(Capsule().fill(on ? fill : Fx.tile))
-                                .overlay(Capsule().strokeBorder(on ? stroke : idleStroke, lineWidth: 1))
-                                .frame(minHeight: 44)
-                                .contentShape(Capsule())
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityAddTraits(on ? .isSelected : [])
-                        .accessibilityHint(exp ? "Explicit" : "")
-                    }
+        let everyday = g.options
+        let shownEveryday = Set(everyday.map { $0.lowercased() })
+        let adult = makeExplicit ? g.explicitOptions.filter { !shownEveryday.contains($0.lowercased()) } : []
+        return VStack(alignment: .leading, spacing: 0) {
+            if !everyday.isEmpty {
+                HStack(spacing: 0) {
+                    groupTag(g, total: everyday.count + adult.count)
+                    chipStrip(everyday, explicit: false)
                 }
-                .padding(.trailing, 12)
             }
-            .padding(.trailing, -12)
+            if !adult.isEmpty {
+                HStack(spacing: 0) {
+                    if everyday.isEmpty {
+                        groupTag(g, total: adult.count, flame: true)    // an 18+-only group: its name, with the flame
+                    } else {
+                        flameTag
+                    }
+                    chipStrip(adult, explicit: true)
+                }
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
         }
         .accessibilityElement(children: .contain)
+    }
+
+    /// The group's name, fixed at the left. Tapping it opens every option of the group at once.
+    func groupTag(_ g: QuickGroup, total: Int, flame: Bool = false) -> some View {
+        Button { quickSheet = g } label: {
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 3) {
+                    if flame {
+                        Image(systemName: "flame.fill").font(.system(size: 10)).foregroundStyle(Fx.explicitText)
+                    }
+                    Text(g.label).font(.footnote).foregroundStyle(Fx.secondaryText).lineLimit(1)
+                }
+                HStack(spacing: 2) {
+                    Image(systemName: "square.grid.2x2").font(.system(size: 8, weight: .semibold))
+                    Text("all \(total)").font(.system(size: 10))
+                }
+                .foregroundStyle(Fx.accentSoftText)
+            }
+            .frame(width: 66, alignment: .leading)
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(g.label): see all \(total)")
+    }
+
+    /// The tag in front of a group's own 18+ strip.
+    var flameTag: some View {
+        HStack(spacing: 3) {
+            Image(systemName: "flame.fill").font(.system(size: 11))
+            Text("18+").font(.system(size: 10, weight: .semibold))
+        }
+        .foregroundStyle(Fx.explicitText)
+        .frame(width: 66, alignment: .leading)
+        .accessibilityLabel("18+")
+    }
+
+    /// One swipeable strip of chips (everyday, or the warm 18+ colours).
+    func chipStrip(_ options: [String], explicit exp: Bool) -> some View {
+        let text = quickBinding.wrappedValue
+        let tint = exp ? Fx.explicitText : styleTint
+        let fill = exp ? Fx.explicitFill : styleFill
+        let stroke = exp ? Fx.explicitStroke : styleStroke
+        let idleStroke = exp ? Fx.explicitStroke.opacity(0.4) : Color.clear
+        return ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(options, id: \.self) { o in
+                    let on = PhraseList.contains(text, o)
+                    Button { tapQuick(o) } label: {
+                        Text(o)
+                            .font(.system(size: 14, weight: on ? .semibold : .regular))
+                            .lineLimit(1)
+                            .foregroundStyle(on ? tint : Color.primary)
+                            .padding(.horizontal, 11)
+                            .frame(height: 32)
+                            .background(Capsule().fill(on ? fill : Fx.tile))
+                            .overlay(Capsule().strokeBorder(on ? stroke : idleStroke, lineWidth: 1))
+                            .frame(minHeight: 44)
+                            .contentShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityAddTraits(on ? .isSelected : [])
+                    .accessibilityHint(exp ? "Explicit" : "")
+                }
+            }
+            .padding(.trailing, 12)
+        }
+        .padding(.trailing, -12)
     }
 
     // MARK: tiles

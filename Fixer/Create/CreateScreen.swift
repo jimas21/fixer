@@ -445,6 +445,7 @@ struct CreateScreen: View {
     @State var loraExtra: [String: String] = [:]       // extra activation words the user typed per add-on file
     @State var quickTick = 0                          // bumped when a quick pick is tapped (for its haptic)
     @State var quickExpanded: Set<String> = []        // open quick-pick sections (lives here: the card's offset in composeStack shifts)
+    @State var quickSheet: QuickGroup?                 // 11-19: the group open in the "see all" sheet
     @State var createSignature = ""                    // the form as it was when the run started
     @State var reviseSignature = ""
     @State var videoSignature = ""
@@ -553,6 +554,7 @@ struct CreateScreen: View {
             .onChange(of: rawNote) { _, n in if n == nil { noteDismissed = nil } }
             .sheet(isPresented: $showQueue) { NavigationStack { QueueScreen(inSheet: true, chat: chat) } }
             .sheet(isPresented: $showModels) { MakeModelSheet(recipes: shownRecipes, chosen: modelChoice) }
+            .sheet(item: $quickSheet) { g in quickPickSheet(g) }     // 11-19: every option of one group at once
             .onChange(of: router.clearedCount) { _, _ in
                 workingID = nil; changeText = ""
                 running?.cancel(); running = nil; runToken = nil

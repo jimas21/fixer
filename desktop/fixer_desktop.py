@@ -1992,7 +1992,7 @@ def _with_queue(p: dict) -> dict:
 
 
 _KIND_WORDS = {"picture": "picture", "pictures": "pictures", "edit": "photo edit", "change": "change", "video": "video",
-               "song": "song", "album": "album", "cutout": "cut-out", "upscale": "sharpen and enlarge", "remove": "removing a model"}
+               "song": "song", "album": "album", "artwork": "artwork", "cutout": "cut-out", "upscale": "sharpen and enlarge", "remove": "removing a model"}
 
 
 def _queue_note(jobs: list[dict], slot: str | None, figures=None, paused: bool = False) -> str:
@@ -4428,9 +4428,58 @@ def job_song(p: dict, emit, cancel):
             ref[1].unlink(missing_ok=True)             # the recording never outlives the job
     if cancel.is_set() or not mp3:
         return
+    art_id = secrets.token_hex(6) if p.get("artwork") is True else None
     emit({"t": "progress", "v": 1.0})
     emit({"t": "audio", "v": base64.b64encode(mp3).decode(), "format": "mp3", "seconds": seconds, "seed": seed,
-          "title": title, "tags": tags, "lyrics": lyrics, "bpm": bpm, "key": key, "language": s["language"]})
+          "title": title, "tags": tags, "lyrics": lyrics, "bpm": bpm, "key": key, "language": s["language"],
+          **({"art_id": art_id} if art_id else {})})
+    if art_id and not cancel.is_set():                 # 11-20: artwork after the song, so the song comes first
+        status("Painting the artwork…")
+        png = _album_cover(_art_prompt(title, tags, lyrics, s["idea"], s["safe"], cancel), seed, cancel)
+        if png and not cancel.is_set():
+            emit({"t": "cover", "v": base64.b64encode(png).decode(), "art_id": art_id})
+        elif not cancel.is_set():
+            emit({"t": "note", "v": "The song is done; its artwork couldn't be painted this time."})
+
+
+def _art_prompt(title: str, tags: str, lyrics: str, idea: str, safe: bool, cancel, wish: str = "") -> str:
+    """One vivid sentence for a song's cover picture, from the song (and the owner's own wish, when given)."""
+    sys_ = ("You design cover art for songs. Answer with one JSON object and nothing else: "
+            '{"cover": one vivid sentence describing a striking square cover picture: subject, setting, colours, '
+            "light and style, matching the song's mood and genre, with no words, letters or logos in it}."
+            + (" The owner described what they want; follow it closely." if wish else "")
+            + (" Keep it clean: nothing sexual or explicit." if safe else ""))
+    text = (f"Owner's wish: {wish[:600]}\n" if wish else "") + (
+        f"Song: {title[:80]}\nIdea: {idea[:600]}\nSound: {tags[:400]}\nLyrics:\n{lyrics[:1500]}")
+    d = _llm_json(sys_, text, cancel, max_tokens=300, temperature=0.8)
+    cover = str((d or {}).get("cover") or "").strip()[:500]
+    return cover or wish or f"{title}, {tags}".strip(", ")[:500] or "abstract colourful music artwork"
+
+
+def job_artwork(p: dict, emit, cancel):
+    """11-20 (the owner: "add artwork after or during the creation of the song or album"): a new square picture for
+    a song or an album ("art_id" is the phone's key, sent back with it). "prompt" is the owner's own description;
+    without one it is designed from the song's title, sound and lyrics."""
+    status = lambda s: emit({"t": "status", "v": s})  # noqa: E731
+    art_id = str(p.get("art_id") or "").strip()[:64]
+    if not art_id:
+        raise UserFacing("Which song is that for?")
+    wish = str(p.get("prompt") or "").strip()
+    status("Designing the artwork…")
+    prompt = _art_prompt(str(p.get("title") or ""), str(p.get("tags") or ""), str(p.get("lyrics") or ""),
+                         str(p.get("idea") or ""), p.get("safe") is True, cancel, wish)
+    if cancel.is_set():
+        return
+    _song_card(status)
+    status("Painting the artwork…")
+    seed = int.from_bytes(os.urandom(4), "big")
+    png = _album_cover(prompt, seed, cancel)
+    if cancel.is_set():
+        return
+    if not png:
+        raise UserFacing("No everyday picture model is on your computer to paint it.")
+    emit({"t": "progress", "v": 1.0})
+    emit({"t": "cover", "v": base64.b64encode(png).decode(), "art_id": art_id, "prompt": prompt})
 
 
 def _album_system(n: int, instrumental: bool, safe: bool, style: str, language: str, artists: str = "") -> str:
@@ -6326,7 +6375,7 @@ JOBS = {"status": job_status, "chat": job_chat, "image": job_image, "video": job
         "lora_search": job_lora_search, "lora_thumb": job_lora_thumb, "lora_inspect": job_lora_inspect,
         "lora_add": job_lora_add, "lora_list": job_lora_list, "lora_set": job_lora_set,
         "lora_remove": job_lora_remove, "lora_key": job_lora_key, "song": job_song,
-        "song_write": job_song_write, "album": job_album,
+        "song_write": job_song_write, "album": job_album, "artwork": job_artwork,
         "stop_all": _no_job, "queue": _no_job, "free_memory": _no_job,   # these answer on the event loop
         "leave": _no_job}
 # 11-17: never wait for the line, stream as before. (comfy_recipes never needed the card: it waited behind videos and
@@ -6365,7 +6414,7 @@ CHATS_ACTIVE = 0                      # chats answering right now (the idle stop
 LAST_SEEN = time.monotonic()          # 11-17: the last request of any kind from a phone (chat, job, warm-up, queue)
 LEFT_AT: float | None = None          # 11-18: when a phone said "leave" (app went to the background); None = someone is here
 HIDDEN_OPS = {"warm"}                 # make warm-ups: never listed, never noted, never wait
-QUEUED_OPS = {"image", "video", "cutout", "upscale", "comfy_run", "remove_model", "warm", "song", "album"}   # warm: for "make" only
+QUEUED_OPS = {"image", "video", "cutout", "upscale", "comfy_run", "remove_model", "warm", "song", "album", "artwork"}   # warm: for "make" only
 RESULT_TYPES = {"image", "video", "mask", "audio", "cover", "album"}
 STOP_TEXT = {"replaced": "Stopped: a newer request from the same place replaced it.", "cancelled": "Stopped.",
              "stop_all": "Stopped: everything on your computer was stopped.",
@@ -6384,7 +6433,7 @@ def _job_prompt(p: dict) -> str:
 
 
 def _job_kind(op: str, p: dict) -> str:
-    if op in ("video", "cutout", "upscale", "warm", "song", "album"):
+    if op in ("video", "cutout", "upscale", "warm", "song", "album", "artwork"):
         return op
     if op == "remove_model":
         return "remove"

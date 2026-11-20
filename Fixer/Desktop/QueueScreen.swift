@@ -289,6 +289,7 @@ struct QueueScreen: View {
         case "video": return "Video"
         case "song": return "Song"
         case "album": return "Album"
+        case "artwork": return "Artwork"
         case "cutout": return "Cut-out"
         case "upscale": return "Sharpen and enlarge"
         case "remove": return "Removing a model"

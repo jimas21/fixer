@@ -298,5 +298,35 @@ except fd.UserFacing as e:
           "a failing link says so and leaves nothing")
 fd._comfy_run = fake_run
 
+# artwork: painted after the song when asked; or later on its own, from the song or the owner's wish
+fd._comfy_run = fake_run
+covers = []
+fd._album_cover = lambda prompt, seed, cancel: covers.append(prompt) or b"PNG"
+fd._chat_llama = writer_answer(good)
+out = run({"prompt": "x", "seconds": 60, "artwork": True})
+kinds = [o["t"] for o in out if o["t"] in ("audio", "cover")]
+aud = [o for o in out if o["t"] == "audio"][0]
+cov = [o for o in out if o["t"] == "cover"]
+check(kinds == ["audio", "cover"] and aud["art_id"] == cov[0]["art_id"], "song artwork comes after the song, same key")
+out = run({"prompt": "x", "seconds": 60})
+check(not [o for o in out if o["t"] == "cover"] and "art_id" not in [o for o in out if o["t"] == "audio"][0],
+      "no artwork unless asked")
+fd._chat_llama = writer_answer(json.dumps({"cover": "a red guitar in the rain"}))
+out = []
+fd.job_artwork({"art_id": "abc", "title": "T", "tags": "rock"}, out.append, threading.Event())
+c = [o for o in out if o["t"] == "cover"]
+check(len(c) == 1 and c[0]["art_id"] == "abc" and covers[-1] == "a red guitar in the rain", "artwork later: designed")
+out = []
+fd.job_artwork({"art_id": "abc", "prompt": "my dog on a stage"}, out.append, threading.Event())
+check("my dog on a stage" in fd._chat_llama.last["text"] if hasattr(fd._chat_llama, "last") and "text" in fd._chat_llama.last
+      else "my dog on a stage" in json.dumps(fd._chat_llama.last), "the owner's wish reaches the designer")
+fd._album_cover = lambda prompt, seed, cancel: None
+try:
+    fd.job_artwork({"art_id": "abc"}, [].append, threading.Event())
+    check(False, "no picture model says so")
+except fd.UserFacing:
+    check(True, "")
+check(fd._job_kind("artwork", {}) == "artwork" and "artwork" in fd.QUEUED_OPS, "artwork is queued")
+
 print(f"{checks} checks, {fails} failed")
 raise SystemExit(1 if fails else 0)

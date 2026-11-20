@@ -966,7 +966,7 @@ final class Desktop: ObservableObject {
         if let slot { p["slot"] = slot }
         p["ack"] = true
         let first = call(op, p, link: link)
-        let single = op != "comfy_run" && op != "album"     // an album sends one song per track
+        let single = op != "comfy_run" && op != "album" && op != "song"   // an album sends one song per track; a song may send its artwork after it
         return AsyncThrowingStream { continuation in
             let task = Task {
                 var jobID: String?
@@ -991,7 +991,7 @@ final class Desktop: ObservableObject {
                                 seen.insert(n)
                             }
                             continuation.yield(f)
-                            if single, t == "image" || t == "video" || t == "mask" || t == "audio", let id = jobID {
+                            if single, t == "image" || t == "video" || t == "mask" || t == "audio" || t == "cover", let id = jobID {
                                 await Self.live.markCollected(id)
                                 await self.ackNow(id, link: link)       // finished before the id leaves `live`
                             }

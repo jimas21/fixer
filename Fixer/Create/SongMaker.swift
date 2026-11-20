@@ -1,4 +1,5 @@
 import AVFoundation
+import PhotosUI
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -35,6 +36,10 @@ struct SongItem: Codable, Identifiable, Hashable {
     var key: String?
     var language: String?
     var seed: Int?
+    var art: String?
+
+    /// The key of its artwork file (cover-<key>.png): an album's id for album tracks, else its own.
+    var artKey: String { album ?? art ?? id.uuidString }
 
     var displayTitle: String { title.isEmpty ? (idea.isEmpty ? "Song" : String(idea.prefix(40))) : title }
     var instrumental: Bool { lyrics.isEmpty || lyrics == "[Instrumental]" }
@@ -55,6 +60,7 @@ struct SongDraft: Codable, Equatable {
     var tracks = 6
     var artists: [ArtistPick] = []
     var link = ""
+    var artwork = true                     // 11-20: paint artwork for a song as it is made (albums always get a cover)
 
     static let key = "song.draft"
     static func load() -> SongDraft {
@@ -181,8 +187,54 @@ final class SongStore: ObservableObject {
     }
 
     func url(of s: SongItem) -> URL { Self.folder.appendingPathComponent(s.file) }
-    func coverURL(_ album: String) -> URL { Self.folder.appendingPathComponent("cover-\(album).png") }
-    func cover(_ album: String) -> UIImage? { UIImage(contentsOfFile: coverURL(album).path) }
+    func coverURL(_ key: String) -> URL { Self.folder.appendingPathComponent("cover-\(key).png") }
+    func cover(_ key: String) -> UIImage? { artVersion >= 0 ? UIImage(contentsOfFile: coverURL(key).path) : nil }
+    /// Bumped whenever a cover file changes, so the list redraws its pictures.
+    @Published private(set) var artVersion = 0
+    /// Artwork being painted on the computer, by key.
+    @Published private(set) var painting: Set<String> = []
+
+    func setArt(_ key: String, png: Data) {
+        try? png.write(to: coverURL(key), options: .atomic)
+        artVersion += 1
+    }
+
+    /// A photo from the library as the artwork: square-cropped to 1024.
+    func setArt(_ key: String, image: UIImage) {
+        let side = min(image.size.width, image.size.height)
+        guard side > 0 else { return }
+        let target = CGSize(width: 1024, height: 1024)
+        let out = UIGraphicsImageRenderer(size: target).image { _ in
+            let scale = 1024 / side
+            let w = image.size.width * scale, h = image.size.height * scale
+            image.draw(in: CGRect(x: (1024 - w) / 2, y: (1024 - h) / 2, width: w, height: h))
+        }
+        if let d = out.jpegData(compressionQuality: 0.9) { setArt(key, png: d) }
+    }
+
+    func removeArt(_ key: String) {
+        try? FileManager.default.removeItem(at: coverURL(key))
+        artVersion += 1
+    }
+
+    /// Paints new artwork on the computer for a song or an album (its own job: it never stops a song being made).
+    func paintArt(key: String, title: String, tags: String, lyrics: String, idea: String, wish: String) {
+        guard !painting.contains(key) else { return }
+        painting.insert(key)
+        let p: [String: Any] = ["art_id": key, "title": title, "tags": tags, "lyrics": String(lyrics.prefix(1500)),
+                                "idea": idea, "prompt": wish, "label": "Artwork: " + (title.isEmpty ? "song" : title)]
+        Task {
+            do {
+                try await Desktop.shared.music("artwork", p, slot: "make:art:" + key) { [weak self] f in
+                    guard let self else { return }
+                    if f["t"] as? String == "cover" { self.handle(f, idea: idea) }
+                }
+            } catch {
+                note = (error as? LocalizedError)?.errorDescription ?? "The artwork couldn't be painted."
+            }
+            painting.remove(key)
+        }
+    }
 
     private func save() {
         if let d = try? JSONEncoder().encode(songs) { try? d.write(to: Self.index, options: .atomic) }
@@ -221,7 +273,8 @@ final class SongStore: ObservableObject {
         var p: [String: Any] = ["prompt": d.idea.trimmingCharacters(in: .whitespacesAndNewlines),
                                 "tags": d.tags, "language": d.language, "seconds": d.auto ? 0 : d.seconds,
                                 "instrumental": d.lyricMode == .none,
-                                "artists": d.artists.map { ["name": $0.name, "genres": $0.genres] }]
+                                "artists": d.artists.map { ["name": $0.name, "genres": $0.genres] },
+                                "artwork": !d.album && d.artwork]
         if !d.album, d.lyricMode == .mine { p["lyrics"] = d.lyrics.trimmingCharacters(in: .whitespacesAndNewlines) }
         if d.album {
             p["tracks"] = d.tracks
@@ -285,9 +338,9 @@ final class SongStore: ObservableObject {
         case "album":
             albumPlan = (f["album_title"] as? String ?? "Album", f["titles"] as? [String] ?? [])
         case "cover":
-            if let a = f["album_id"] as? String, let b64 = f["v"] as? String, let d = Data(base64Encoded: b64) {
-                try? d.write(to: coverURL(a), options: .atomic)
-                objectWillChange.send()
+            if let key = (f["album_id"] as? String) ?? (f["art_id"] as? String), let b64 = f["v"] as? String,
+               let d = Data(base64Encoded: b64) {
+                setArt(key, png: d)
             }
         case "audio":
             if let b64 = f["v"] as? String, let d = Data(base64Encoded: b64) { add(d, meta: f, idea: idea) }
@@ -330,7 +383,8 @@ final class SongStore: ObservableObject {
                          lyrics: meta["lyrics"] as? String ?? "", seconds: int("seconds") ?? 0,
                          file: UUID().uuidString + ".mp3", album: meta["album_id"] as? String,
                          albumTitle: meta["album_title"] as? String, track: int("track"), bpm: int("bpm"),
-                         key: meta["key"] as? String, language: meta["language"] as? String, seed: int("seed"))
+                         key: meta["key"] as? String, language: meta["language"] as? String, seed: int("seed"),
+                         art: meta["art_id"] as? String)
         do { try data.write(to: url(of: s), options: .atomic) } catch { note = "The song couldn't be saved."; return }
         songs.insert(s, at: 0)
         save()
@@ -345,7 +399,9 @@ final class SongStore: ObservableObject {
         if SongPlayer.shared.playing == s.id { SongPlayer.shared.stop() }
         try? FileManager.default.removeItem(at: url(of: s))
         songs.removeAll { $0.id == s.id }
-        if let a = s.album, !songs.contains(where: { $0.album == a }) { try? FileManager.default.removeItem(at: coverURL(a)) }
+        if s.album == nil || !songs.contains(where: { $0.album == s.album }) {
+            try? FileManager.default.removeItem(at: coverURL(s.artKey))
+        }
         save()
     }
 
@@ -435,7 +491,16 @@ struct SongMakerView: View {
     @State private var artistNote: String?
     @State private var reference: SongReference?
     @State private var importing = false
+    @State private var artTarget: ArtTarget?                 // "Paint new artwork…" is asking for a wish
+    @State private var artWish = ""
+    @State private var photoKey: String?                     // "Choose from Photos" is open for this key
+    @State private var photoItem: PhotosPickerItem?
     @FocusState private var focus: Bool
+
+    struct ArtTarget: Identifiable {
+        let id: String                                       // the artwork key
+        let title, tags, lyrics, idea: String
+    }
 
     private var d: Binding<SongDraft> { $store.draft }
     private let lengths: [(String, Int)] = [("30 s", 30), ("1 min", 60), ("2 min", 120), ("3 min", 180),
@@ -479,6 +544,66 @@ struct SongMakerView: View {
             if case .success(let url) = result { Task { await loadReference(url) } }
         }
         .task(id: artistQuery) { await searchArtists() }
+        .alert("Paint new artwork", isPresented: Binding(get: { artTarget != nil }, set: { if !$0 { artTarget = nil } })) {
+            TextField("Describe it (optional)", text: $artWish)
+            Button("Paint") {
+                if let t = artTarget {
+                    store.paintArt(key: t.id, title: t.title, tags: t.tags, lyrics: t.lyrics, idea: t.idea,
+                                   wish: artWish.trimmingCharacters(in: .whitespacesAndNewlines))
+                }
+                artTarget = nil
+            }
+            Button("Cancel", role: .cancel) { artTarget = nil }
+        } message: {
+            Text("Leave it empty and it's designed from the song.")
+        }
+        .photosPicker(isPresented: Binding(get: { photoKey != nil }, set: { if !$0 { photoKey = nil } }),
+                      selection: $photoItem, matching: .images)
+        .onChange(of: photoItem) { _, item in
+            guard let item, let key = photoKey else { return }
+            Task {
+                if let data = try? await item.loadTransferable(type: Data.self), let img = UIImage(data: data) {
+                    store.setArt(key, image: img)
+                }
+                photoItem = nil
+                photoKey = nil
+            }
+        }
+    }
+
+    private func paint(_ key: String, _ title: String, _ songs: [SongItem]) {
+        let first = songs.first
+        artWish = ""
+        artTarget = ArtTarget(id: key, title: title, tags: first?.tags ?? "",
+                              lyrics: songs.map(\.lyrics).filter { $0 != "[Instrumental]" }.joined(separator: "\n\n"),
+                              idea: first?.idea ?? "")
+    }
+
+    @ViewBuilder private func artMenu(_ key: String, _ title: String, _ songs: [SongItem]) -> some View {
+        Button("Paint new artwork…", systemImage: "paintbrush") { paint(key, title, songs) }
+        Button("Choose artwork from Photos", systemImage: "photo") { photoKey = key }
+        if store.cover(key) != nil {
+            Button("Remove artwork", systemImage: "photo.badge.minus") { store.removeArt(key) }
+        }
+    }
+
+    /// The artwork (or a placeholder; a spinner while it is being painted).
+    private func artThumb(_ key: String, side: CGFloat, placeholder: String) -> some View {
+        ZStack {
+            if let c = store.cover(key) {
+                Image(uiImage: c).resizable().scaledToFill()
+            } else {
+                Fx.canvas
+                Image(systemName: placeholder).font(.system(size: side * 0.36)).foregroundStyle(Fx.secondaryText)
+            }
+            if store.painting.contains(key) {
+                Color.black.opacity(0.35)
+                ProgressView().tint(.white)
+            }
+        }
+        .frame(width: side, height: side)
+        .clipShape(RoundedRectangle(cornerRadius: side > 50 ? 10 : 7, style: .continuous))
+        .accessibilityHidden(true)
     }
 
     // MARK: form
@@ -503,6 +628,11 @@ struct SongMakerView: View {
             } else {
                 lyricsSection
                 referenceSection
+                Toggle(isOn: d.artwork) {
+                    Label("Make artwork for it", systemImage: "photo.artframe").font(.subheadline.weight(.semibold))
+                }
+                .tint(Fx.accent)
+                .frame(minHeight: 44)
             }
             moreSection
         }
@@ -843,16 +973,7 @@ struct SongMakerView: View {
         let total = tracks.reduce(0) { $0 + $1.seconds }
         return VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 12) {
-                Group {
-                    if let c = store.cover(id) {
-                        Image(uiImage: c).resizable().scaledToFill()
-                    } else {
-                        Image(systemName: "square.stack").font(.system(size: 26)).foregroundStyle(Fx.secondaryText)
-                            .frame(maxWidth: .infinity, maxHeight: .infinity).background(Fx.canvas)
-                    }
-                }
-                .frame(width: 72, height: 72)
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                artThumb(id, side: 72, placeholder: "square.stack")
                 VStack(alignment: .leading, spacing: 3) {
                     Text(title).font(.subheadline.weight(.semibold)).lineLimit(2)
                     Text("Album · \(tracks.count) tracks · \(Self.length(total))")
@@ -876,6 +997,7 @@ struct SongMakerView: View {
                         .foregroundStyle(Color.primary)
                         Spacer(minLength: 0)
                         Menu {
+                            artMenu(id, title, tracks)
                             Button("Delete album", systemImage: "trash", role: .destructive) { store.deleteAlbum(id) }
                         } label: {
                             Image(systemName: "ellipsis").frame(width: 44, height: 44).contentShape(Rectangle())
@@ -906,30 +1028,40 @@ struct SongMakerView: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(on ? "Stop \(s.displayTitle)" : "Play \(s.displayTitle)")
-                VStack(alignment: .leading, spacing: 2) {
-                    Text((s.track.map { "\($0). " } ?? "") + s.displayTitle)
-                        .font(.subheadline.weight(.semibold)).lineLimit(1)
-                    Text("\(Self.length(s.seconds)) · \(s.tags)").font(.caption).foregroundStyle(Fx.secondaryText).lineLimit(1)
+                if !inAlbum { artThumb(s.artKey, side: 44, placeholder: "music.note") }
+                // 11-20 (the owner): tapping the song shows and hides its lyrics, no menu needed.
+                Button {
+                    guard !s.instrumental else { return }
+                    withAnimation(Motion.pop) { shownLyrics = shownLyrics == s.id ? nil : s.id }
+                } label: {
+                    HStack(spacing: 0) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text((s.track.map { "\($0). " } ?? "") + s.displayTitle)
+                                .font(.subheadline.weight(.semibold)).lineLimit(1)
+                            Text("\(Self.length(s.seconds)) · \(s.tags)").font(.caption)
+                                .foregroundStyle(Fx.secondaryText).lineLimit(1)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .frame(minHeight: 44)
+                    .contentShape(Rectangle())
                 }
-                Spacer(minLength: 0)
+                .buttonStyle(.plain)
+                .accessibilityHint(s.instrumental ? "Instrumental" : (shownLyrics == s.id ? "Hides the lyrics" : "Shows the lyrics"))
                 ShareLink(item: store.url(of: s)) {
                     Image(systemName: "square.and.arrow.up").frame(width: 44, height: 44)
                 }
                 .accessibilityLabel("Share \(s.displayTitle)")
                 Menu {
                     Button("Another take", systemImage: "arrow.triangle.2.circlepath") { store.anotherTake(s) }
+                        .disabled(store.running)
                     Button("Edit and remake", systemImage: "slider.horizontal.3") { editAndRemake(s) }
-                    if !s.instrumental {
-                        Button(shownLyrics == s.id ? "Hide lyrics" : "Show lyrics", systemImage: "text.quote") {
-                            shownLyrics = shownLyrics == s.id ? nil : s.id
-                        }
-                    }
                     Button("Start a new song from this one", systemImage: "waveform") { useSong(s) }
+                    if !inAlbum { artMenu(s.artKey, s.displayTitle, [s]) }
                     Button("Delete", systemImage: "trash", role: .destructive) { store.delete(s) }
                 } label: {
                     Image(systemName: "ellipsis").frame(width: 44, height: 44).contentShape(Rectangle())
                 }
-                .disabled(store.running)
                 .accessibilityLabel("More for \(s.displayTitle)")
             }
             .foregroundStyle(Color.primary)

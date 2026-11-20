@@ -353,8 +353,22 @@ extension CreateScreen {
                 Text("No add-ons for \(loraModelName) on your computer yet.")
                     .font(.footnote).foregroundStyle(Fx.secondaryText)
             }
-            ForEach(fitting) { e in
+            // 11-19: the 18+ add-ons (listed only while 18+ is on) in their own flame block under the everyday ones.
+            ForEach(fitting.filter { !$0.explicit }) { e in
                 SwipeToDelete(onDelete: { removingLora = e }) { loraRow(e) }
+            }
+            let adultLoras = fitting.filter(\.explicit)
+            if !adultLoras.isEmpty {
+                HStack(spacing: 4) {
+                    Image(systemName: "flame.fill")
+                    Text("18+ add-ons").font(.footnote.weight(.semibold))
+                }
+                .foregroundStyle(Fx.explicitText)
+                .padding(.top, 4)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+                ForEach(adultLoras) { e in
+                    SwipeToDelete(onDelete: { removingLora = e }) { loraRow(e) }
+                }
             }
             Button { showLoraBrowser = true } label: {
                 Label("Add a LoRA", systemImage: "plus.circle").frame(minHeight: 44)

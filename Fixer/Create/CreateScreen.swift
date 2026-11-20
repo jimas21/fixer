@@ -1049,20 +1049,15 @@ struct MakeModelSheet: View {
     var body: some View {
         NavigationStack {
             List {
-                ForEach(recipes) { r in
-                    Button { chosen = r.id; dismiss() } label: {
-                        HStack(alignment: .top) {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(r.name).foregroundStyle(.primary)
-                                if let note = r.note { Text(note).font(.footnote).foregroundStyle(.secondary) }
-                            }
-                            Spacer()
-                            if chosen == r.id { Image(systemName: "checkmark").foregroundStyle(Color.accentColor) }
-                        }
-                        .frame(minHeight: 44)
-                        .contentShape(Rectangle())
+                // 11-19: the 18+ models (listed only while 18+ is on) in their own flame section.
+                Section { ForEach(recipes.filter { !$0.adult }) { r in row(r) } }
+                let adult = recipes.filter(\.adult)
+                if !adult.isEmpty {
+                    Section {
+                        ForEach(adult) { r in row(r) }
+                    } header: {
+                        Label("18+", systemImage: "flame.fill").foregroundStyle(Fx.explicitText)
                     }
-                    .accessibilityAddTraits(chosen == r.id ? .isSelected : [])
                 }
             }
             .safeAreaInset(edge: .bottom) {
@@ -1076,6 +1071,22 @@ struct MakeModelSheet: View {
             .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Done") { dismiss() } } }
         }
         .presentationDetents([.large])
+    }
+
+    private func row(_ r: CreateRecipe) -> some View {
+        Button { chosen = r.id; dismiss() } label: {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(r.name).foregroundStyle(.primary)
+                    if let note = r.note { Text(note).font(.footnote).foregroundStyle(.secondary) }
+                }
+                Spacer()
+                if chosen == r.id { Image(systemName: "checkmark").foregroundStyle(Color.accentColor) }
+            }
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
+        }
+        .accessibilityAddTraits(chosen == r.id ? .isSelected : [])
     }
 }
 

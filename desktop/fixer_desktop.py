@@ -4110,7 +4110,19 @@ def _song_workflow(tags: str, lyrics: str, seconds: float, seed: int, bpm: int, 
     return wf
 
 
-SONG_KEEP = {"loose": 0.3, "balanced": 0.45, "close": 0.6}   # how much of a recording a song keeps
+# How much of a recording a song keeps. 11-20, tuned by ear with the owner: from 0.5 up the original singer's voice
+# survives (0.45 sounded like a different singer); 0.55 kept her voice with 73% of the new words clear, 0.6 only 46%.
+SONG_KEEP = {"loose": 0.3, "balanced": 0.45, "close": 0.55}
+
+
+def _keep_of(p: dict) -> float:
+    """The named strength, or an exact one (0.1-0.8) for tuning from this PC."""
+    try:
+        if p.get("reference_keep_value") is not None:
+            return max(0.1, min(0.8, float(p["reference_keep_value"])))
+    except (TypeError, ValueError):
+        pass
+    return SONG_KEEP.get(str(p.get("reference_keep") or "balanced"), SONG_KEEP["balanced"])
 
 
 def _song_graph(tags: str, lyrics: str, seconds: float, seed: int, bpm: int, key: str, language: str) -> dict:
@@ -4551,7 +4563,7 @@ def job_song(p: dict, emit, cancel):
         status("Loading the song model…")
         mp3 = _sing(tags, lyrics, seconds, seed, bpm, key, s["language"], emit, cancel,
                     reference=ref[0] if ref else None,
-                    keep=SONG_KEEP.get(str(p.get("reference_keep") or "balanced"), SONG_KEEP["balanced"]),
+                    keep=_keep_of(p),
                     match=p.get("reference_match") if p.get("reference_match") in ("start", "voice", "both", "revoice")
                     else "start", revoice=float(p.get("revoice") or 0.6))
     finally:

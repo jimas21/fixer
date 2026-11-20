@@ -92,6 +92,7 @@ def main():
     ap.add_argument("--asis", action="store_true", help="song: sing --tags and --lyrics as given (no writing)")
     ap.add_argument("--seed", type=int)
     ap.add_argument("--revoice", type=float)
+    ap.add_argument("--keepv", type=float, help="song with a recording: an exact keep 0.1-0.8")
     ap.add_argument("--out", help="save the image here (default: nothing is written)")
     ap.add_argument("--url", default=f"http://127.0.0.1:{pair.PORT}")
     a = ap.parse_args()
@@ -130,6 +131,8 @@ def main():
             payload["seed"] = a.seed
         if a.revoice:
             payload["revoice"] = a.revoice
+        if a.keepv is not None:
+            payload["reference_keep_value"] = a.keepv
     else:
         op, payload = "image", {"prompt": a.text, "model": a.model, "steps": a.steps, "guidance": 1.0}
         if a.op == "edit":

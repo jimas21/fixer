@@ -246,7 +246,7 @@ check(name.endswith(".wav") and wf["6"]["inputs"]["latent_image"] == ["11", 0]
 check(wf["5"]["inputs"]["seconds"] == 95.0 and wf["10"]["inputs"]["duration"] == 95.0, "auto length = the recording's")
 out = run({"prompt": "x", "reference": base64.b64encode(b"x").decode(), "reference_seconds": 40, "seconds": 120,
            "reference_keep": "close"})
-check(ran["wf"]["10"]["inputs"]["duration"] == 40.0 and ran["wf"]["6"]["inputs"]["denoise"] == 0.4,
+check(ran["wf"]["10"]["inputs"]["duration"] == 40.0 and ran["wf"]["6"]["inputs"]["denoise"] == 0.45,
       "no longer than the recording; Close keeps more of it")
 out = run({"prompt": "x", "reference": base64.b64encode(b"x").decode(), "reference_ext": "exe", "seconds": 60})
 check(ran["wf"]["9"]["inputs"]["audio"].endswith(".m4a"), "an odd extension becomes m4a")

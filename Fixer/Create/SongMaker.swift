@@ -994,13 +994,14 @@ struct SongMakerView: View {
                 Picker("How close to the recording", selection: d.keep) {
                     Text("Loose").tag("loose")
                     Text("Balanced").tag("balanced")
-                    Text("Close").tag("close")
+                    Text("Keep the singer").tag("close")
                 }
                 .pickerStyle(.segmented)
                 .frame(minHeight: 44)
                 Text("The song is written from your lyrics, picks and artists, then made starting from the recording, "
-                     + "in its tempo and key: Close keeps more of its melody and sound, Loose changes more. It doesn't "
-                     + "copy the singer's voice: describe the voice you want in Voice picks or Sounds like.")
+                     + "in its tempo and key. Keep the singer keeps the recording's own voice (the words come through a "
+                     + "little less clearly); Balanced and Loose sing it with a new voice, which you can describe in "
+                     + "Voice picks or Sounds like.")
                     .font(.caption).foregroundStyle(Fx.secondaryText)
                 Text("Used for this song only and deleted from your computer after.")
                     .font(.caption).foregroundStyle(Fx.secondaryText)

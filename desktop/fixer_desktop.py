@@ -7007,6 +7007,9 @@ async def local_unload(request: web.Request) -> web.Response:
         async with GPU:
             await asyncio.get_running_loop().run_in_executor(None, ENGINE.unload)
             LLAMA.stop()                               # restarts in seconds on the next chat
+            # 11-19: the picture models too (it used to leave ComfyUI's ~15 GB in place), the same as the app's Free;
+            # ComfyUI itself keeps running, empty, so the next picture has no cold engine start.
+            await asyncio.get_running_loop().run_in_executor(None, COMFY.free)
     return web.json_response({"loaded": ENGINE.repo})
 
 

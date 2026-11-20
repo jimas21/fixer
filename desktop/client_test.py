@@ -5,6 +5,7 @@
     python client_test.py make "a red fox in snow, photo" --out fox.png   (nothing is written without --out)
     python client_test.py edit "make it night" --image some.jpg
     python client_test.py video "the dog runs" --image some.jpg --out clip.mp4   (no --image: from the words)
+    python client_test.py song "upbeat summer pop about a road trip" --seconds 60 --out song.mp3
 
 Uses a throwaway test phone that it adds to keys.json and removes again when it finishes.
 """
@@ -73,11 +74,14 @@ def b64file(p: str) -> str:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("op", choices=["status", "chat", "make", "edit", "video"])
+    ap.add_argument("op", choices=["status", "chat", "make", "edit", "video", "song"])
     ap.add_argument("text", nargs="?", default="")
     ap.add_argument("--image")
     ap.add_argument("--model")
     ap.add_argument("--steps", type=int, default=4)
+    ap.add_argument("--seconds", type=int, default=60)
+    ap.add_argument("--lyrics", default="")
+    ap.add_argument("--instrumental", action="store_true")
     ap.add_argument("--out", help="save the image here (default: nothing is written)")
     ap.add_argument("--url", default=f"http://127.0.0.1:{pair.PORT}")
     a = ap.parse_args()
@@ -93,6 +97,9 @@ def main():
         op, payload = "video", {"prompt": a.text, "model": a.model, "seconds": 5}
         if a.image:
             payload["image"] = b64file(a.image)
+    elif a.op == "song":
+        op, payload = "song", {"prompt": a.text, "seconds": a.seconds, "lyrics": a.lyrics,
+                               "instrumental": a.instrumental}
     else:
         op, payload = "image", {"prompt": a.text, "model": a.model, "steps": a.steps, "guidance": 1.0}
         if a.op == "edit":
@@ -111,6 +118,12 @@ def main():
             elif f["t"] == "video":
                 data = base64.b64decode(f["v"])
                 print(f"\n[video {len(data) // 1024} KB, {f.get('width')}x{f.get('height')}, {f.get('seconds')} s, seed {f.get('seed')}]")
+                if a.out:
+                    Path(a.out).write_bytes(data)
+            elif f["t"] == "audio":
+                data = base64.b64decode(f["v"])
+                meta = {k: v for k, v in f.items() if k not in ("t", "v")}
+                print(f"\n[audio {len(data) // 1024} KB] {json.dumps(meta)}")
                 if a.out:
                     Path(a.out).write_bytes(data)
             elif f["t"] == "progress":

@@ -190,7 +190,13 @@ extension CreateScreen {
         // body / from behind / over the shoulder / focus and couldn't find them.
         let defaults = mode == "video" ? ["motion"]
             : ["subject", "hair", "outfit", "expression", "pose", "setting", "lighting", "camera"]
-        let ids = applied?.kind == (mode == "video" ? "video" : "picture") ? (appliedChips.isEmpty ? defaults : appliedChips) : defaults
+        var ids = applied?.kind == (mode == "video" ? "video" : "picture") ? (appliedChips.isEmpty ? defaults : appliedChips) : defaults
+        // 11-20 (the owner: the 18+ quick picks were gone): they came only with an 18+ style, and with the 18+ styles
+        // folded away nobody picked one. While 18+ is on, the 18+ rows are always there, after the style's own.
+        if makeExplicit, mode != "video" {
+            for id in ["body_size", "act", "anatomy_f", "anatomy_m", "fluids", "reactions", "kink", "fetish"]
+            where !ids.contains(id) { ids.append(id) }
+        }
         // 11-19: with 18+ off, a row that has only 18+ options (anatomy, kink, ...) isn't shown at all.
         return ids.compactMap { id in c.groups.first { $0.id == id } }
             .filter { makeExplicit || !$0.options.isEmpty }

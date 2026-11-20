@@ -79,21 +79,27 @@ extension CreateScreen {
 
     /// 11-19: the "see all" sheet for one group (opened from its add button): every option, with its pictograph
     /// where one exists, 18+ ones (only while 18+ is on) in their own flame block.
+    /// 11-20 (the owner): each row's sheet shows only its own side, the everyday options or the 18+ ones.
     func quickPickSheet(_ g: QuickGroup) -> some View {
         let everydaySet = Set(g.options.map { $0.lowercased() })
         let adult = makeExplicit ? g.explicitOptions.filter { !everydaySet.contains($0.lowercased()) } : []
-        let opts = g.options.map { PickOption(id: $0, label: $0, asset: Pictograph.asset(groupID: g.id, option: $0),
-                                               explicit: false) }
-            + adult.map { PickOption(id: $0, label: $0, asset: nil, explicit: true) }
-        return QuickPickSheet(title: g.label, options: opts,
+        let showAdult = sheetAdult && !adult.isEmpty
+        let opts = showAdult
+            ? adult.map { PickOption(id: $0, label: $0, asset: nil, explicit: true) }
+            : g.options.map { PickOption(id: $0, label: $0, asset: Pictograph.asset(groupID: g.id, option: $0),
+                                         explicit: false) }
+        return QuickPickSheet(title: showAdult ? "\(g.label) · 18+" : g.label, options: opts,
                               isOn: { PhraseList.contains(quickBinding.wrappedValue, $0) },
                               toggle: { tapQuick($0) })
     }
 
     /// 11-19: the same sheet for one style-tip group.
     func tipPickSheet(_ g: PromptToggleGroup) -> some View {
-        QuickPickSheet(title: g.name.isEmpty ? "Style tips" : g.name,
-                       options: g.items.map { PickOption(id: $0.id, label: $0.label, asset: nil, explicit: $0.explicit) },
+        let side = g.items.filter { $0.explicit == sheetAdult }
+        let items = side.isEmpty ? g.items : side
+        let name = g.name.isEmpty ? "Style tips" : g.name
+        return QuickPickSheet(title: sheetAdult && !side.isEmpty ? "\(name) · 18+" : name,
+                       options: items.map { PickOption(id: $0.id, label: $0.label, asset: nil, explicit: $0.explicit) },
                        isOn: { chosen.contains($0) },
                        toggle: { id in
                            if chosen.contains(id) { chosen.remove(id) } else { chosen.insert(id) }
@@ -122,7 +128,7 @@ extension CreateScreen {
             HStack(spacing: 8) {
                 Text(g.label).font(.footnote).foregroundStyle(Fx.secondaryText).lineLimit(1)
                 Spacer(minLength: 8)
-                Button { quickSheet = g } label: {                     // 11-19: the same "see all" as chip rows
+                Button { sheetAdult = false; quickSheet = g } label: {   // 11-19: the same "see all" as chip rows
                     HStack(spacing: 2) {
                         Image(systemName: "square.grid.2x2").font(.system(size: 9, weight: .semibold))
                         Text("all \(g.options.count + (makeExplicit ? g.explicitOptions.count : 0))")

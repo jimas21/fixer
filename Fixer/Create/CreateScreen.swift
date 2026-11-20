@@ -447,6 +447,8 @@ struct CreateScreen: View {
     @State var quickTick = 0                          // bumped when a quick pick is tapped (for its haptic)
     @State var quickExpanded: Set<String> = []        // open quick-pick sections (lives here: the card's offset in composeStack shifts)
     @State var quickSheet: QuickGroup?                 // 11-19: the group open in the "see all" sheet
+    @State var sheetAdult = false                      // 11-20: that sheet shows only its row's side (everyday or 18+)
+    @State var adultStylesOpen = false                 // 11-20: the 18+ style row is folded until its + is tapped
     @State var tipSheet: PromptToggleGroup?            // 11-19: the style-tip group open in it
     @State var createSignature = ""                    // the form as it was when the run started
     @State var reviseSignature = ""

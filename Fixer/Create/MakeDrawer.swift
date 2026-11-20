@@ -145,14 +145,14 @@ extension CreateScreen {
         return VStack(alignment: .leading, spacing: 0) {
             if !everyday.isEmpty {
                 HStack(spacing: 0) {
-                    addButton(name, total: g.items.count) { tipSheet = g }
+                    addButton(name, total: everyday.count) { sheetAdult = false; tipSheet = g }
                     tipStrip(everyday.filter { chosen.contains($0.id) })
                 }
             }
             if !adult.isEmpty {
                 HStack(spacing: 0) {
                     flameTag
-                    addButton(name, total: adult.count, explicit: true) { tipSheet = g }
+                    addButton(name, total: adult.count, explicit: true) { sheetAdult = true; tipSheet = g }
                     tipStrip(adult.filter { chosen.contains($0.id) })
                 }
                 .transition(.opacity.combined(with: .move(edge: .top)))

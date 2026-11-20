@@ -37,9 +37,30 @@ extension CreateScreen {
                     .accessibilityLabel("Style")
                 }
                 if !adult.isEmpty {
+                    // 11-20 (the owner): folded to the left until its + is tapped; folded, only the 18+ style in use
+                    // shows, so you can still see and tap it off.
+                    let inUse = adult.filter { applied?.id == $0.id && !styleIsCustom }
                     HStack(spacing: 0) {
                         flameTag
-                        styleStrip { ForEach(adult) { s in styleChip(s) } }
+                        Button { withAnimation(Motion.pop) { adultStylesOpen.toggle() } } label: {
+                            Image(systemName: adultStylesOpen ? "chevron.left" : "plus")
+                                .font(.system(size: 12, weight: .bold))
+                                .foregroundStyle(Fx.explicitText)
+                                .frame(width: 40, height: 32)
+                                .background(Capsule().fill(Fx.tile))
+                                .overlay(Capsule().strokeBorder(Fx.explicitStroke.opacity(0.4), lineWidth: 1))
+                                .frame(minHeight: 44)
+                                .contentShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.trailing, 6)
+                        .accessibilityLabel(adultStylesOpen ? "Hide 18+ styles" : "Show \(adult.count) 18+ styles")
+                        if adultStylesOpen {
+                            styleStrip { ForEach(adult) { s in styleChip(s) } }
+                        } else {
+                            ForEach(inUse) { s in styleChip(s) }
+                            Spacer(minLength: 0)
+                        }
                     }
                     .transition(.opacity.combined(with: .move(edge: .top)))
                     .accessibilityElement(children: .contain)
@@ -233,7 +254,7 @@ extension CreateScreen {
             if !everyday.isEmpty {
                 HStack(spacing: 0) {
                     groupTag(g.label)
-                    addButton(g.label, total: everyday.count + adult.count) { quickSheet = g }
+                    addButton(g.label, total: everyday.count) { sheetAdult = false; quickSheet = g }
                     chipStrip(pickedEveryday, explicit: false)
                 }
             }
@@ -244,7 +265,7 @@ extension CreateScreen {
                     } else {
                         flameTag
                     }
-                    addButton(g.label, total: adult.count, explicit: true) { quickSheet = g }
+                    addButton(g.label, total: adult.count, explicit: true) { sheetAdult = true; quickSheet = g }
                     chipStrip(pickedAdult, explicit: true)
                 }
                 .transition(.opacity.combined(with: .move(edge: .top)))

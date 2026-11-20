@@ -4391,10 +4391,12 @@ def _make_catalog() -> dict:
         if not isinstance(d, dict) or not d.get("id"):
             continue
         kind = "video" if d.get("kind") == "video" else "picture"
-        # 11-19: a recipe on an 18+ model is an 18+ recipe too (hidden with 18+ off, like the "Explicit" group).
+        # 11-19: a style is 18+ because of what it is (the "Explicit" group, or a video with the explicit add-on), never
+        # because of the model it names. (Marking every Chroma / Juggernaut style 18+ put a dozen everyday photo
+        # styles in the 18+ row, ahead of the real ones, and hid them with 18+ off; the owner: "a bunch of styles
+        # rolled into 18+".) An everyday style that names an 18+ model runs on the everyday model instead, below.
         item = {"id": str(d["id"]), "name": d.get("name") or d["id"], "group": d.get("group") or "", "kind": kind,
-                "explicit": (d.get("group") == "Explicit" or (kind == "video" and bool(d.get("explicit_addon")))
-                             or (kind != "video" and (d.get("model") or "") in _adult_models())),
+                "explicit": d.get("group") == "Explicit" or (kind == "video" and bool(d.get("explicit_addon"))),
                 "prefix": d.get("prompt_prefix") or "", "suffix": d.get("prompt_suffix") or "",
                 "chips": d.get("chips") or [], "note": d.get("note"), "shape": _shape_name(d.get("shape"))}
         if kind == "video":
@@ -4402,10 +4404,11 @@ def _make_catalog() -> dict:
                          "explicit_video": "on" if d.get("explicit_addon") else "off"})
         else:
             model_id = d.get("model") or ""
-            if item["explicit"] and model_id not in _adult_models():
-                # 11-19: an 18+ recipe on an everyday model (always safe) moves to an 18+ model, with that model's own
-                # settings: the old model's numbers and its add-on menu would mean nothing there.
-                alt = _first_ready(_auto_models().get("picture_explicit") or [])
+            if item["explicit"] != (model_id in _adult_models()):
+                # 11-19: an 18+ recipe on an everyday model (always safe) moves to an 18+ model, and an everyday recipe
+                # on an 18+ model moves to the everyday one, each with that model's own settings: the old model's
+                # numbers and its add-on menu would mean nothing there.
+                alt = _first_ready(_auto_models().get("picture_explicit" if item["explicit"] else "picture_safe") or [])
                 if alt is None:
                     continue
                 model_id = _recipe_id(alt)

@@ -13,29 +13,56 @@ extension CreateScreen {
         canChange || (effectiveTarget == .new && (!visibleStyles.isEmpty || applied != nil || (fixedSeed != nil && mode == "picture")))
     }
 
+    /// 11-19: the styles under the picture. A "Style" row with the everyday ones, swiping left and right (the owner:
+    /// the one place a long swipe row is fine), and, only while 18+ is on, its own flame row underneath with the 18+
+    /// ones; with 18+ off that row goes and everything below moves up. (They used to share one row, the 18+ ones at
+    /// its far end.) New / Change this sits above them: it chooses what the sheet does, it isn't a style.
     var recipeRow: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 6) {
-                if canChange { targetSwitch }
-                if effectiveTarget == .new {
-                    if styleIsCustom { customChip }
-                    ForEach(visibleStyles) { s in styleChip(s) }
-                    if mode == "picture", let seed = fixedSeed { seedChip(seed) }
-                } else if let w = working {
-                    let list = store.results
-                    let index = (list.firstIndex(where: { $0.id == w.id }) ?? list.count - 1) + 1
-                    Text("Changing picture \(index) of \(list.count)")
-                        .font(.footnote)
-                        .foregroundStyle(Fx.secondaryText)
-                        .padding(.horizontal, 6)
+        let everyday = visibleStyles.filter { !$0.explicit }
+        let adult = visibleStyles.filter(\.explicit)
+        return VStack(alignment: .leading, spacing: 2) {
+            if canChange { targetSwitch }
+            if effectiveTarget == .new {
+                HStack(spacing: 0) {
+                    groupTag("Style")
+                    styleStrip {
+                        if styleIsCustom { customChip }
+                        ForEach(everyday) { s in styleChip(s) }
+                        if mode == "picture", let seed = fixedSeed { seedChip(seed) }
+                    }
                 }
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Style")
+                if !adult.isEmpty {
+                    HStack(spacing: 0) {
+                        flameTag
+                        styleStrip { ForEach(adult) { s in styleChip(s) } }
+                    }
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                    .accessibilityElement(children: .contain)
+                    .accessibilityLabel("18+ style")
+                }
+            } else if let w = working {
+                let list = store.results
+                let index = (list.firstIndex(where: { $0.id == w.id }) ?? list.count - 1) + 1
+                Text("Changing picture \(index) of \(list.count)")
+                    .font(.footnote)
+                    .foregroundStyle(Fx.secondaryText)
+                    .padding(.horizontal, 6)
+                    .frame(minHeight: 44)
             }
-            .padding(.trailing, 12)
         }
+        .fxAnimation(Motion.pop, value: makeExplicit)
+    }
+
+    private func styleStrip<C: View>(@ViewBuilder _ content: () -> C) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) { content() }
+                .padding(.trailing, 12)
+        }
+        .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
         .padding(.trailing, -12)
         .frame(minHeight: 44)
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel(makeExplicit ? "Explicit recipe" : "Recipe")
     }
 
     var targetSwitch: some View {

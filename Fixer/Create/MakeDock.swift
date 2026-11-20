@@ -241,7 +241,10 @@ extension CreateScreen {
             }
             Text(label).font(.footnote).foregroundStyle(Fx.secondaryText).lineLimit(1)
         }
-        .frame(width: 66, alignment: .leading)
+        // 11-19: never cut short ("Anatomy (F)" read "Anatom…"): at least the usual width, wider when the name needs it.
+        .fixedSize(horizontal: true, vertical: false)
+        .frame(minWidth: 66, alignment: .leading)
+        .padding(.trailing, 6)
     }
 
     /// Always the first thing after the name: opens every option of the group (search, picks at the top).

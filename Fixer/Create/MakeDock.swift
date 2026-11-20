@@ -171,29 +171,34 @@ extension CreateScreen {
 
     // MARK: quick picks
 
-    /// One quick-pick group. 11-19: its 18+ options are no longer tacked onto the end of the everyday strip (nobody
-    /// scrolls 40 chips to find them): while 18+ is on they get their own strip underneath, tagged with a flame, that
-    /// swipes on its own; with 18+ off that strip isn't there at all and everything below moves up. The name tag on
-    /// the left stays put and opens the whole group in a sheet (`QuickPickSheet`) to see and pick from everything.
+    /// One quick-pick group. 11-19: a row is now just the group's name, an add button, and the picks that are ON (no
+    /// long strip of everything to hunt through). The add button, always first after the name, opens every option
+    /// in a sheet with a search (`QuickPickSheet`). While 18+ is on, the group's 18+ options get their own flame row
+    /// underneath with its own add button; with 18+ off that row isn't there and everything below moves up.
     func quickRow(_ g: QuickGroup) -> some View {
+        let text = quickBinding.wrappedValue
         let everyday = g.options
         let shownEveryday = Set(everyday.map { $0.lowercased() })
         let adult = makeExplicit ? g.explicitOptions.filter { !shownEveryday.contains($0.lowercased()) } : []
+        let pickedEveryday = everyday.filter { PhraseList.contains(text, $0) }
+        let pickedAdult = adult.filter { PhraseList.contains(text, $0) }
         return VStack(alignment: .leading, spacing: 0) {
             if !everyday.isEmpty {
                 HStack(spacing: 0) {
-                    groupTag(g, total: everyday.count + adult.count)
-                    chipStrip(everyday, explicit: false)
+                    groupTag(g.label)
+                    addButton(g.label, total: everyday.count + adult.count) { quickSheet = g }
+                    chipStrip(pickedEveryday, explicit: false)
                 }
             }
             if !adult.isEmpty {
                 HStack(spacing: 0) {
                     if everyday.isEmpty {
-                        groupTag(g, total: adult.count, flame: true)    // an 18+-only group: its name, with the flame
+                        groupTag(g.label, flame: true)                  // an 18+-only group: its name, with the flame
                     } else {
                         flameTag
                     }
-                    chipStrip(adult, explicit: true)
+                    addButton(g.label, total: adult.count, explicit: true) { quickSheet = g }
+                    chipStrip(pickedAdult, explicit: true)
                 }
                 .transition(.opacity.combined(with: .move(edge: .top)))
             }
@@ -201,28 +206,35 @@ extension CreateScreen {
         .accessibilityElement(children: .contain)
     }
 
-    /// The group's name, fixed at the left. Tapping it opens every option of the group at once.
-    func groupTag(_ g: QuickGroup, total: Int, flame: Bool = false) -> some View {
-        Button { quickSheet = g } label: {
-            VStack(alignment: .leading, spacing: 1) {
-                HStack(spacing: 3) {
-                    if flame {
-                        Image(systemName: "flame.fill").font(.system(size: 10)).foregroundStyle(Fx.explicitText)
-                    }
-                    Text(g.label).font(.footnote).foregroundStyle(Fx.secondaryText).lineLimit(1)
-                }
-                HStack(spacing: 2) {
-                    Image(systemName: "square.grid.2x2").font(.system(size: 8, weight: .semibold))
-                    Text("all \(total)").font(.system(size: 10))
-                }
-                .foregroundStyle(Fx.accentSoftText)
+    /// The group's name, fixed at the left.
+    func groupTag(_ label: String, flame: Bool = false) -> some View {
+        HStack(spacing: 3) {
+            if flame {
+                Image(systemName: "flame.fill").font(.system(size: 10)).foregroundStyle(Fx.explicitText)
             }
-            .frame(width: 66, alignment: .leading)
+            Text(label).font(.footnote).foregroundStyle(Fx.secondaryText).lineLimit(1)
+        }
+        .frame(width: 66, alignment: .leading)
+    }
+
+    /// Always the first thing after the name: opens every option of the group (search, picks at the top).
+    func addButton(_ label: String, total: Int, explicit: Bool = false, open: @escaping () -> Void) -> some View {
+        Button(action: open) {
+            HStack(spacing: 2) {
+                Image(systemName: "square.grid.2x2").font(.system(size: 11, weight: .semibold))
+                Image(systemName: "plus").font(.system(size: 9, weight: .bold))
+            }
+            .foregroundStyle(explicit ? Fx.explicitText : Fx.accentSoftText)
+            .padding(.horizontal, 10)
+            .frame(height: 32)
+            .background(Capsule().fill(Fx.tile))
+            .overlay(Capsule().strokeBorder(explicit ? Fx.explicitStroke.opacity(0.4) : Fx.hairline, lineWidth: 1))
             .frame(minHeight: 44)
-            .contentShape(Rectangle())
+            .contentShape(Capsule())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("\(g.label): see all \(total)")
+        .padding(.trailing, 6)
+        .accessibilityLabel("\(label): choose from all \(total)")
     }
 
     /// The tag in front of a group's own 18+ strip.
@@ -236,7 +248,8 @@ extension CreateScreen {
         .accessibilityLabel("18+")
     }
 
-    /// One swipeable strip of chips (everyday, or the warm 18+ colours).
+    /// The picks that are on, as chips (everyday, or the warm 18+ colours); tapping one takes it off. It scrolls only
+    /// when there are more than fit.
     func chipStrip(_ options: [String], explicit exp: Bool) -> some View {
         let text = quickBinding.wrappedValue
         let tint = exp ? Fx.explicitText : styleTint
@@ -266,6 +279,7 @@ extension CreateScreen {
             }
             .padding(.trailing, 12)
         }
+        .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
         .padding(.trailing, -12)
     }
 

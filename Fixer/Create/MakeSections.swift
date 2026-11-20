@@ -77,16 +77,28 @@ extension CreateScreen {
             .reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
     }
 
-    /// 11-19: the "see all" sheet for one group (opened from its name tag).
+    /// 11-19: the "see all" sheet for one group (opened from its add button): every option, with its pictograph
+    /// where one exists, 18+ ones (only while 18+ is on) in their own flame block.
     func quickPickSheet(_ g: QuickGroup) -> some View {
         let everydaySet = Set(g.options.map { $0.lowercased() })
-        return QuickPickSheet(
-            title: g.label,
-            everyday: g.options,
-            adult: makeExplicit ? g.explicitOptions.filter { !everydaySet.contains($0.lowercased()) } : [],
-            isOn: { PhraseList.contains(quickBinding.wrappedValue, $0) },
-            toggle: { tapQuick($0) }
-        )
+        let adult = makeExplicit ? g.explicitOptions.filter { !everydaySet.contains($0.lowercased()) } : []
+        let opts = g.options.map { PickOption(id: $0, label: $0, asset: Pictograph.asset(groupID: g.id, option: $0),
+                                               explicit: false) }
+            + adult.map { PickOption(id: $0, label: $0, asset: nil, explicit: true) }
+        return QuickPickSheet(title: g.label, options: opts,
+                              isOn: { PhraseList.contains(quickBinding.wrappedValue, $0) },
+                              toggle: { tapQuick($0) })
+    }
+
+    /// 11-19: the same sheet for one style-tip group.
+    func tipPickSheet(_ g: PromptToggleGroup) -> some View {
+        QuickPickSheet(title: g.name.isEmpty ? "Style tips" : g.name,
+                       options: g.items.map { PickOption(id: $0.id, label: $0.label, asset: nil, explicit: $0.explicit) },
+                       isOn: { chosen.contains($0) },
+                       toggle: { id in
+                           if chosen.contains(id) { chosen.remove(id) } else { chosen.insert(id) }
+                           quickTick += 1
+                       })
     }
 
     // MARK: tiled rows (Goal 2 plumbing)
@@ -95,23 +107,9 @@ extension CreateScreen {
     /// it is exactly the plain chip row. Taps go through the same `tapQuick`, so selection logic is shared.
     @ViewBuilder
     func quickRowTiled(_ g: QuickGroup) -> some View {
-        if g.options.contains(where: { Pictograph.asset(groupID: g.id, option: $0) != nil }) {
-            // 11-19: tiles for the everyday options; 18+ ones (while on) get their own flame strip, as in quickRow.
-            let everydaySet = Set(g.options.map { $0.lowercased() })
-            let adult = makeExplicit ? g.explicitOptions.filter { !everydaySet.contains($0.lowercased()) } : []
-            VStack(alignment: .leading, spacing: 0) {
-                tiledGroup(g, options: g.options)
-                if !adult.isEmpty {
-                    HStack(spacing: 0) {
-                        flameTag
-                        chipStrip(adult, explicit: true)
-                    }
-                    .transition(.opacity.combined(with: .move(edge: .top)))
-                }
-            }
-        } else {
-            quickRow(g)
-        }
+        // 11-19: every row is now name + add button + the picks that are on; the pictographs show in the add sheet
+        // (QuickPickSheet), where there is room to see them all.
+        quickRow(g)
     }
 
     /// The tile layout for one group: the group label over ONE horizontally scrolling strip of `PictographTile`s —
@@ -237,12 +235,12 @@ struct MakeSectionsCard: View {
             .buttonStyle(.plain)
             .accessibilityLabel((tip ? "Style tips, " : "") + (count > 0 ? "\(name), \(count) selected" : name))
             .accessibilityHint(isOpen ? "Collapse" : "Expand")
-            if !picked.isEmpty {
-                // 11-19: what's on, always in view: no scrolling 40 chips to remember what was picked.
+            if !picked.isEmpty, !isOpen {
+                // 11-19: what's on, in view while closed (open rows show the picks themselves): no scrolling 40 chips to remember what was picked.
                 Text(picked.joined(separator: " · "))
                     .font(.caption)
                     .foregroundStyle(tip ? Fx.secondaryText : Fx.accentSoftText)
-                    .lineLimit(isOpen ? 3 : 2)
+                    .lineLimit(2)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .accessibilityHidden(true)               // the header already says how many
             }
@@ -366,34 +364,43 @@ struct PictographTile: View {
 
 // MARK: - "See all" sheet (11-19)
 
-/// Every option of one quick-pick group at once, wrapped instead of in one long strip: what's picked sits at the top,
-/// a search narrows the rest, and the 18+ options (only while 18+ is on) have their own flame-marked block. Taps
-/// switch picks in the words straight away (the same `tapQuick` as the strips); Done just closes.
+/// One option in the "see all" sheet: `id` is what isOn / toggle use (the words themselves for a quick pick, the
+/// tip's id for a style tip); `asset` is its pictograph, if one was drawn.
+struct PickOption: Hashable {
+    let id: String
+    let label: String
+    let asset: String?
+    let explicit: Bool
+}
+
+/// Every option of one group at once, wrapped instead of in one long strip: what's picked sits at the top, a search
+/// narrows the rest, and the 18+ options (passed only while 18+ is on) have their own flame-marked block. Taps switch
+/// picks straight away (the same toggles as the rows); Done just closes.
 struct QuickPickSheet: View {
     let title: String
-    let everyday: [String]
-    let adult: [String]
+    let options: [PickOption]
     let isOn: (String) -> Bool
     let toggle: (String) -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var search = ""
 
-    private func matches(_ o: String) -> Bool {
+    private func matches(_ o: PickOption) -> Bool {
         let q = search.trimmingCharacters(in: .whitespaces)
-        return q.isEmpty || o.localizedCaseInsensitiveContains(q)
+        return q.isEmpty || o.label.localizedCaseInsensitiveContains(q)
     }
 
     var body: some View {
-        let picked = (everyday + adult).filter(isOn).reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
-        let adultSet = Set(adult)
+        let picked = options.filter { isOn($0.id) }
+        let everyday = options.filter { !$0.explicit }
+        let adult = options.filter(\.explicit)
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    block(picked.isEmpty ? "Nothing picked yet" : "Picked (\(picked.count))",
-                          picked, adultSet: adultSet, empty: "Tap any option below.")
-                    block("Options", everyday.filter(matches), adultSet: [], empty: "No match.")
+                    block(picked.isEmpty ? "Nothing picked yet" : "Picked (\(picked.count))", picked,
+                          empty: "Tap any option below.")
+                    block("Options", everyday.filter(matches), empty: "No match.")
                     if !adult.isEmpty {
-                        block("18+", adult.filter(matches), adultSet: adultSet, empty: "No match.", flame: true)
+                        block("18+", adult.filter(matches), empty: "No match.", flame: true)
                     }
                 }
                 .padding(16)
@@ -410,42 +417,46 @@ struct QuickPickSheet: View {
         .presentationDragIndicator(.visible)
     }
 
-    private func block(_ head: String, _ options: [String], adultSet: Set<String>, empty: String,
-                       flame: Bool = false) -> some View {
+    private func block(_ head: String, _ items: [PickOption], empty: String, flame: Bool = false) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 4) {
                 if flame { Image(systemName: "flame.fill").foregroundStyle(Fx.explicitText) }
                 Text(head).font(.footnote.weight(.semibold)).foregroundStyle(Fx.secondaryText)
             }
-            if options.isEmpty {
+            if items.isEmpty {
                 Text(empty).font(.footnote).foregroundStyle(Fx.secondaryText)
             } else {
                 FlowRows(spacing: 6) {
-                    ForEach(options, id: \.self) { o in chip(o, explicit: adultSet.contains(o)) }
+                    ForEach(items, id: \.self) { o in item(o) }
                 }
             }
         }
     }
 
-    private func chip(_ o: String, explicit: Bool) -> some View {
-        let on = isOn(o)
-        return Button { toggle(o) } label: {
-            Text(o)
-                .font(.system(size: 14, weight: on ? .semibold : .regular))
-                .lineLimit(1)
-                .foregroundStyle(on ? (explicit ? Fx.explicitText : Fx.accentSoftText) : Color.primary)
-                .padding(.horizontal, 11)
-                .frame(height: 32)
-                .background(Capsule().fill(on ? (explicit ? Fx.explicitFill : Fx.onTintStrong) : Fx.tile))
-                .overlay(Capsule().strokeBorder(on ? (explicit ? Fx.explicitStroke : Fx.accent)
-                                                   : (explicit ? Fx.explicitStroke.opacity(0.4) : Color.clear),
-                                                lineWidth: 1))
-                .frame(minHeight: 44)
-                .contentShape(Capsule())
+    @ViewBuilder
+    private func item(_ o: PickOption) -> some View {
+        let on = isOn(o.id)
+        if let asset = o.asset, UIImage(named: asset) != nil {
+            PictographTile(asset: asset, label: o.label, selected: on, explicit: o.explicit) { toggle(o.id) }
+        } else {
+            Button { toggle(o.id) } label: {
+                Text(o.label)
+                    .font(.system(size: 14, weight: on ? .semibold : .regular))
+                    .lineLimit(1)
+                    .foregroundStyle(on ? (o.explicit ? Fx.explicitText : Fx.accentSoftText) : Color.primary)
+                    .padding(.horizontal, 11)
+                    .frame(height: 32)
+                    .background(Capsule().fill(on ? (o.explicit ? Fx.explicitFill : Fx.onTintStrong) : Fx.tile))
+                    .overlay(Capsule().strokeBorder(on ? (o.explicit ? Fx.explicitStroke : Fx.accent)
+                                                       : (o.explicit ? Fx.explicitStroke.opacity(0.4) : Color.clear),
+                                                    lineWidth: 1))
+                    .frame(minHeight: 44)
+                    .contentShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            .accessibilityAddTraits(on ? .isSelected : [])
+            .accessibilityHint(o.explicit ? "Explicit" : "")
         }
-        .buttonStyle(.plain)
-        .accessibilityAddTraits(on ? .isSelected : [])
-        .accessibilityHint(explicit ? "Explicit" : "")
     }
 }
 

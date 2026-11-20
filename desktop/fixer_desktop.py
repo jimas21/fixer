@@ -4344,8 +4344,12 @@ def _apply_toggles(r: dict, v: dict) -> dict:
 
 
 def job_comfy_recipes(p: dict, emit, cancel):
-    """The Create screen's list: recipes whose files are on this computer, their controls, and the LoRA files."""
-    COMFY.ensure()
+    """The Create screen's list: recipes whose files are on this computer, their controls, and the LoRA files.
+    11-19: answers at once. It used to start ComfyUI first (COMFY.ensure(), a 25-110 s cold start) before sending a
+    list it already had, so opening Make sat on "Asking your computer…" for up to two minutes. The engine now starts
+    in the background, warming for the first picture while the owner fills in the form."""
+    if not COMFY.running():
+        threading.Thread(target=_quietly, args=(COMFY.ensure,), daemon=True, name="comfy-start").start()
     adult = _adult_models()
     recipes = [{"id": k, "name": r["name"], "kind": r["kind"], "note": r.get("note"),
                 "lora_family": r.get("lora_family"), "controls": _recipe_controls(r),

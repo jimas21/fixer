@@ -142,7 +142,10 @@ final class Desktop: ObservableObject {
             warmUp(force: true)
         }
     }
-    func unpair() { PCLink.forget(); link = nil; Rules.shared.usePC = false }
+    func unpair() {
+        PCLink.forget(); link = nil; Rules.shared.usePC = false
+        try? FileManager.default.removeItem(at: Self.recipeFile)      // 11-19: that computer's recipe list
+    }
 
     /// 11-17: set once any reply frame reached the caller, so a drop after that is never re-sent to the other address
     /// (the computer already accepted the request; sending it again would replace itself and start over).
@@ -571,14 +574,41 @@ final class Desktop: ObservableObject {
     func createRecipes() async throws -> (recipes: [CreateRecipe], loras: [String], library: [LoraEntry], videoFamily: String) {
         guard let link else { throw PCError.notPaired }
         for try await f in call("comfy_recipes", [:], link: link) where f["t"] as? String == "info" {
-            let recipes = (f["recipes"] as? [[String: Any]] ?? []).compactMap(CreateRecipe.init)
-            recipeCache = recipes
-            let names = f["loras"] as? [String] ?? []
-            var library = LoraEntry.rows(f["lora_library"])
-            if library.isEmpty, f["lora_library"] == nil { library = names.map { LoraEntry(file: $0) } }
-            return (recipes, names, library, f["video_lora_family"] as? String ?? "wan22")
+            Self.saveRecipeReply(f)
+            return parseRecipes(f)
         }
         throw PCError.bad
+    }
+
+    private func parseRecipes(_ f: [String: Any]) -> (recipes: [CreateRecipe], loras: [String], library: [LoraEntry],
+                                                         videoFamily: String) {
+        let recipes = (f["recipes"] as? [[String: Any]] ?? []).compactMap(CreateRecipe.init)
+        recipeCache = recipes
+        let names = f["loras"] as? [String] ?? []
+        var library = LoraEntry.rows(f["lora_library"])
+        if library.isEmpty, f["lora_library"] == nil { library = names.map { LoraEntry(file: $0) } }
+        return (recipes, names, library, f["video_lora_family"] as? String ?? "wan22")
+    }
+
+    /// 11-19: the last recipe list, kept so Make's form shows at once on open (then refreshed from the computer).
+    /// Model names, controls and add-on names only: no prompts, no pictures. In Caches (never backed up); dropped on
+    /// unpair.
+    private nonisolated static var recipeFile: URL {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("make-recipes.json")
+    }
+
+    private nonisolated static func saveRecipeReply(_ f: [String: Any]) {
+        var keep = f
+        keep.removeValue(forKey: "t")
+        guard let data = try? JSONSerialization.data(withJSONObject: keep) else { return }
+        try? data.write(to: recipeFile, options: [.atomic, .completeFileProtection])
+    }
+
+    func cachedRecipes() -> (recipes: [CreateRecipe], loras: [String], library: [LoraEntry], videoFamily: String)? {
+        guard isPaired, let data = try? Data(contentsOf: Self.recipeFile),
+              let f = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        let r = parseRecipes(f)
+        return r.recipes.isEmpty ? nil : r
     }
 
     // MARK: LoRA library (add-ons kept on the computer)

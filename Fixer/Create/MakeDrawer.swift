@@ -135,10 +135,27 @@ extension CreateScreen {
 
     /// One style-tip group's chips: a single scrolling row (its section header carries the group name). Shown inside
     /// the quick-pick card by `quickSectionsCard(tips:)`.
+    /// 11-19: like the quick picks, a group's 18+ tips (shown only while 18+ is on) get their own flame strip under
+    /// the everyday ones instead of sitting at the end of the row.
     func tipRow(_ g: PromptToggleGroup) -> some View {
+        let everyday = g.items.filter { !$0.explicit }
+        let adult = g.items.filter(\.explicit)
+        return VStack(alignment: .leading, spacing: 0) {
+            if !everyday.isEmpty { tipStrip(everyday) }
+            if !adult.isEmpty {
+                HStack(spacing: 0) {
+                    flameTag
+                    tipStrip(adult)
+                }
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+    }
+
+    private func tipStrip(_ items: [PromptToggle]) -> some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
-                ForEach(g.items) { t in tipChip(t) }
+                ForEach(items) { t in tipChip(t) }
             }
             .padding(.trailing, 12)
         }

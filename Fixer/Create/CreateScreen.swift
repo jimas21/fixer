@@ -875,23 +875,31 @@ struct CreateScreen: View {
         }
     }
 
+    /// 11-19: the form shows at once from the last list this phone saw (prompt, quick picks, settings all usable),
+    /// and the computer's fresh list replaces it when it arrives. Only a phone that has never seen a list waits.
     func load() async {
         guard Desktop.shared.isPaired else { loading = false; return }
-        loading = true
         failed = nil
+        if recipes.isEmpty, let c = Desktop.shared.cachedRecipes() {
+            apply(c)
+        }
+        loading = recipes.isEmpty
         do {
-            let r = try await Desktop.shared.createRecipes()
-            recipes = r.recipes
-            loraFiles = r.loras
-            loraLibrary = r.library
-            videoLoraFamily = r.videoFamily
-            if recipe == nil { recipeID = shownRecipes.first?.id ?? "" }
-            alignModelToExplicit(turnedOn: false)
-            if editor == "qwen21", !hasQwen21 { editor = "auto" }      // this computer doesn't have it
+            apply(try await Desktop.shared.createRecipes())
         } catch {
-            failed = "Couldn't reach your computer. Check that Fixer Desktop is on."
+            if recipes.isEmpty { failed = "Couldn't reach your computer. Check that Fixer Desktop is on." }
         }
         loading = false
+    }
+
+    private func apply(_ r: (recipes: [CreateRecipe], loras: [String], library: [LoraEntry], videoFamily: String)) {
+        recipes = r.recipes
+        loraFiles = r.loras
+        loraLibrary = r.library
+        videoLoraFamily = r.videoFamily
+        if recipe == nil { recipeID = shownRecipes.first?.id ?? "" }
+        alignModelToExplicit(turnedOn: false)
+        if editor == "qwen21", !hasQwen21 { editor = "auto" }      // this computer doesn't have it
     }
 
     func generate(_ r: CreateRecipe) {

@@ -124,9 +124,20 @@ extension CreateScreen {
     /// instant Make appeared (SIGSEGV in swift_getTypeByMangledName). One AnyView per section stops the types fusing.
     var composeStack: [AnyView] {
         var out: [AnyView] = [AnyView(composePicture)]
+        // 11-19 (the owner): the model / shape / pictures / enhance tiles sit right under the picture, before any
+        // other setting, in every mode.
+        if let tiles = composeTiles { out.append(tiles) }
         if store.results.count > 1 { out.append(AnyView(resultsRoll)) }
         out.append(contentsOf: composeSections)
         return out
+    }
+
+    /// The tile row for what is being made (pinned under the picture by `composeStack`).
+    var composeTiles: AnyView? {
+        if effectiveTarget == .change { return AnyView(changeTiles) }
+        if mode == "video" { return AnyView(videoTiles) }
+        if let r = recipe { return AnyView(pictureTiles(r)) }
+        return nil
     }
 
     /// The controls for what is being made, each its own card, each type-erased (see `composeStack`).
@@ -135,11 +146,9 @@ extension CreateScreen {
         if hasRecipeRow { out.append(AnyView(recipeRow)) }
         out.append(AnyView(promptBox))
         if effectiveTarget == .change {
-            out.append(AnyView(changeTiles))
             if hasQuickPicks { out.append(AnyView(quickSectionsCard(tips: []))) }
             out.append(AnyView(helpPage))
         } else if mode == "video" {
-            out.append(AnyView(videoTiles))
             out.append(AnyView(videoPhotoPage))
             out.append(AnyView(drawerSection("Add-ons") { loraSection }))
             out.append(AnyView(videoSettingsPage))
@@ -147,7 +156,6 @@ extension CreateScreen {
             let tips = shownToggles(r)              // 11-19: style tips sit inside the quick-pick card now
             if hasQuickPicks || !tips.isEmpty { out.append(AnyView(quickSectionsCard(tips: tips))) }
             if showBodyPanel { out.append(AnyView(drawerSection("Body") { bodyPanel })) }
-            out.append(AnyView(pictureTiles(r)))
             out.append(AnyView(drawerSection("Photo") { photoSection }))
             out.append(AnyView(drawerSection("Add-ons") { loraSection }))
             out.append(AnyView(pictureSettingsPage(r)))

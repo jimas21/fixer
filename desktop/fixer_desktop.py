@@ -4153,10 +4153,12 @@ def _artists_text(artists) -> str:
 
 
 def _inspired(artists: str) -> str:
-    return (f" Inspired by: {artists}. Capture their sound and their singers' voices in the tags in plain musical "
-            "words: genre and era, signature instruments, production, rhythm, and the vocal timbre and delivery "
-            '(e.g. "raspy male baritone, laid-back phrasing"). Never put an artist\'s name in the tags, title or '
-            "lyrics, and never copy their lyrics.") if artists else ""
+    return (f" Inspired by: {artists}. Capture their sound in the tags in plain musical words: genre and era, "
+            "signature instruments, production and rhythm. Describe their lead singer's voice in \"voice\" as exactly "
+            "as you can: the range, the timbre, the texture, the way they deliver a line, their accent (e.g. for a "
+            'deep country storyteller: "male, deep bass-baritone, resonant, gravelly, steady talk-sung delivery, '
+            'little vibrato, Southern drawl"). Never put an artist\'s name in the tags, voice, title or lyrics, and '
+            "never copy their lyrics.") if artists else ""
 
 
 def _song_system(seconds: int | None, instrumental: bool, has_lyrics: bool, safe: bool | str, style: str = "",
@@ -4172,7 +4174,11 @@ def _song_system(seconds: int | None, instrumental: bool, has_lyrics: bool, safe
              '{"title": a short song title, '
              '"tags": 8-20 comma-separated style tags: genre, era, mood, lead instruments, rhythm feel, vocal type '
              '(e.g. "female vocal", "male vocal", "duet", "choir") and production, '
-             f'"lyrics": {lyr}, '
+             + ('' if instrumental else
+                '"voice": the lead voice in 6-12 comma-separated musical words: gender, range (e.g. bass-baritone, '
+                'tenor, alto, soprano), timbre and texture (e.g. deep, resonant, gravelly, breathy, nasal, warm), '
+                'delivery (e.g. talk-sung, belted, crooned, laid-back, staccato), vibrato and accent, ')
+             + f'"lyrics": {lyr}, '
              '"bpm": a whole number 60-180 that suits the style, '
              '"key": a key like "A minor" or "Eb major"'
              + (', "seconds": the song\'s length in seconds (60-300) that suits its structure' if not seconds else "")
@@ -4258,6 +4264,10 @@ def _write_song(idea: str, lyrics: str, instrumental: bool, seconds: int | None,
         bpm = None
     key = str(d.get("key") or "").strip()
     tags = str(d["tags"]).strip()[:600]
+    voice = " ".join(str(d.get("voice") or "").split())[:240] if not instrumental else ""
+    if voice:
+        # 11-20 (the owner: "close but not voice wise"): the voice goes first, where the model weighs it most
+        tags = f"{voice}, {tags}"
     if not instrumental and not any(w in tags.lower() for w in ("vocal", "voice", "choir", "singer", "rap")):
         tags += ", vocals"                             # ACE-Step leaves the singing out when no voice is named
     return {"title": str(d.get("title") or "").strip()[:80], "tags": tags,

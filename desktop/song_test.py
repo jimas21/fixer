@@ -334,6 +334,15 @@ except fd.UserFacing:
     check(True, "")
 check(fd._job_kind("artwork", {}) == "artwork" and "artwork" in fd.QUEUED_OPS, "artwork is queued")
 
+# the voice line goes first in the tags (and never for an instrumental)
+fd._chat_llama = writer_answer(json.dumps({"tags": "country, banjo", "voice": "male, deep bass-baritone, gravelly",
+                                           "lyrics": "[Verse 1]\nalong the road again tonight"}))
+w = fd._write_song("x", "", False, 60, False, threading.Event(), artists="Some Singer")
+check(w["tags"].startswith("male, deep bass-baritone, gravelly, country"), "voice first in the tags")
+check('"voice"' in fd._chat_llama.last["instructions"], "the writer is asked for the voice")
+w = fd._write_song("x", "", True, 60, False, threading.Event())
+check("bass-baritone" not in w["tags"] and '"voice"' not in fd._chat_llama.last["instructions"], "no voice when instrumental")
+
 # explicit lyrics switch: off clean; on + 18+ off strong language only; on + 18+ on explicit
 fd._comfy_run = fake_run
 fd._song_ready = lambda: True

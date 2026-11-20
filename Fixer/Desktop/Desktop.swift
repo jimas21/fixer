@@ -454,6 +454,32 @@ final class Desktop: ObservableObject {
         throw PCError.server("No video came back. Try again.")
     }
 
+    /// 11-20: a song from an idea (and optional lyrics) — the MP3 and what the computer wrote for it (title, tags,
+    /// lyrics, seconds).
+    func song(idea: String, lyrics: String, instrumental: Bool, seconds: Int, slot: String? = nil,
+              status: @escaping @Sendable (String) -> Void,
+              progress: @escaping @Sendable (Double) -> Void,
+              note: @escaping @Sendable (String) -> Void) async throws -> (Data, [String: Any]) {
+        guard let link else { throw PCError.notPaired }
+        let payload: [String: Any] = ["prompt": idea, "lyrics": lyrics, "instrumental": instrumental,
+                                      "seconds": seconds, "safe": !Rules.shared.explicitNow,
+                                      "label": idea.isEmpty ? "Song" : idea]
+        for try await f in jobStream("song", payload, slot: slot, link: link) {
+            switch f["t"] as? String {
+            case "progress": progress(f["v"] as? Double ?? 0)
+            case "status": status(f["v"] as? String ?? "")
+            case "note": note(f["v"] as? String ?? "")
+            case "audio":
+                guard let b64 = f["v"] as? String, let data = Data(base64Encoded: b64) else { throw PCError.bad }
+                var meta = f
+                meta["v"] = nil
+                return (data, meta)
+            default: break
+            }
+        }
+        throw PCError.server("No song came back. Try again.")
+    }
+
     /// What to keep for a cut-out, as a mask the size of `photo`. `boxes` (0–1) limit it to those things; none =
     /// the main subject. The computer picks a hair-and-fur model for people and animals, a crisp one otherwise.
     func cutoutMask(_ photo: CGImage, boxes: [CGRect], labels: [String], slot: String? = nil,
@@ -972,7 +998,7 @@ final class Desktop: ObservableObject {
                                 seen.insert(n)
                             }
                             continuation.yield(f)
-                            if single, t == "image" || t == "video" || t == "mask", let id = jobID {
+                            if single, t == "image" || t == "video" || t == "mask" || t == "audio", let id = jobID {
                                 await Self.live.markCollected(id)
                                 await self.ackNow(id, link: link)       // finished before the id leaves `live`
                             }

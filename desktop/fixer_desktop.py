@@ -1992,7 +1992,7 @@ def _with_queue(p: dict) -> dict:
 
 
 _KIND_WORDS = {"picture": "picture", "pictures": "pictures", "edit": "photo edit", "change": "change", "video": "video",
-               "cutout": "cut-out", "upscale": "sharpen and enlarge", "remove": "removing a model"}
+               "song": "song", "cutout": "cut-out", "upscale": "sharpen and enlarge", "remove": "removing a model"}
 
 
 def _queue_note(jobs: list[dict], slot: str | None, figures=None, paused: bool = False) -> str:
@@ -2611,6 +2611,7 @@ def _comfy_paths_yaml() -> str:
     wan_x = _snapshot(WAN_EXPLICIT_REPO)
     qe, qb, qa = _snapshot(QWEN_EDIT_REPO), _snapshot(QWEN_BASE_REPO), _snapshot(QWEN_AIO_REPO)
     jug = _snapshot("Kandoo/Juggernaut-XL-Ragnarok")
+    song = _snapshot(SONG_REPO)
     def block(paths):
         return "|\n" + "".join(f"    {Path(x).as_posix()}\n" for x in paths if x)
     _ensure_lora_store()
@@ -2620,7 +2621,7 @@ def _comfy_paths_yaml() -> str:
             f"  text_encoders: {block([t5, wan_te / 'split_files' / 'text_encoders' if wan_te else None, qb / 'split_files' / 'text_encoders' if qb else None, q21te, q21te_bf])}"
             f"  upscale_models: {block([up])}"
             f"  vae: {block([COMFY_VAE, wan / 'split_files' / 'vae' if wan else None, qb / 'split_files' / 'vae' if qb else None, q21 / 'vae' if q21 else None])}"
-            f"  checkpoints: {block([qa / QWEN_AIO_DIR if qa else None, jug])}"
+            f"  checkpoints: {block([qa / QWEN_AIO_DIR if qa else None, jug, song / 'checkpoints' if song else None])}"
             f"  loras: {block([COMFY_LORAS, wan / 'split_files' / 'loras' if wan else None, wan_x, q21x])}")
 
 
@@ -4048,6 +4049,141 @@ def _comfy_video(p: dict, emit, cancel):
           "width": w, "height": h, "seed": seed})
 
 
+# ---- Songs (11-20, the owner: "add a music maker to the maker. Give prompts and it develops a song"). ACE-Step 1.5
+# turbo in ComfyUI (its own all-in-one file: the song model, its two text readers and its audio decoder). The chat
+# model first turns the idea into style tags and lyrics (the prompt writer's slot, never the chat's), then ACE-Step
+# sings it. 8 steps; about a minute of card for a 2-minute song.
+SONG_REPO = "Comfy-Org/ACE-Step-1.5"
+SONG_FILE = "checkpoints/ace_step_1.5_turbo_aio.safetensors"
+SONG_CKPT = "ace_step_1.5_turbo_aio.safetensors"
+SONG_SECONDS = (15, 240)
+SONG_KEYS = [f"{root} {q}" for q in ("major", "minor")
+             for root in ("C", "C#", "Db", "D", "D#", "Eb", "E", "F", "F#", "Gb", "G", "G#", "Ab", "A", "A#", "Bb", "B")]
+
+
+def _song_ready() -> bool:
+    snap = _snapshot(SONG_REPO)
+    return snap is not None and (snap / SONG_FILE).is_file()
+
+
+def _song_workflow(tags: str, lyrics: str, seconds: float, seed: int, bpm: int, key: str) -> dict:
+    """The ComfyUI template's graph (audio_ace_step_1_5_checkpoint), saved as MP3 and read back by _comfy_run."""
+    return {
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": SONG_CKPT}},
+        "2": {"class_type": "ModelSamplingAuraFlow", "inputs": {"model": ["1", 0], "shift": 3.0}},
+        "3": {"class_type": "TextEncodeAceStepAudio1.5",
+              "inputs": {"clip": ["1", 1], "tags": tags, "lyrics": lyrics, "seed": seed, "bpm": bpm,
+                         "duration": float(seconds), "timesignature": "4", "language": "en", "keyscale": key,
+                         "generate_audio_codes": True, "cfg_scale": 2.0, "temperature": 0.85, "top_p": 0.9,
+                         "top_k": 0, "min_p": 0.0}},
+        "4": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["3", 0]}},
+        "5": {"class_type": "EmptyAceStep1.5LatentAudio", "inputs": {"seconds": float(seconds), "batch_size": 1}},
+        "6": {"class_type": "KSampler",
+              "inputs": {"model": ["2", 0], "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["5", 0],
+                         "seed": seed, "steps": 8, "cfg": 1.0, "sampler_name": "euler", "scheduler": "simple",
+                         "denoise": 1.0}},
+        "7": {"class_type": "VAEDecodeAudio", "inputs": {"samples": ["6", 0], "vae": ["1", 2]}},
+        "8": {"class_type": "SaveAudioMP3",
+              "inputs": {"audio": ["7", 0], "filename_prefix": "fixer-song/song", "quality": "V0"}},
+    }
+
+
+def _song_system(seconds: int, instrumental: bool, has_lyrics: bool, safe: bool) -> str:
+    lines = max(8, min(48, seconds // 4))
+    lyr = ('"[Instrumental]"' if instrumental else
+           "the owner's lyrics exactly as given (only add section labels if they have none)" if has_lyrics else
+           f"new lyrics, about {lines} short singable lines in all, with section labels on their own lines "
+           "([Verse 1], [Chorus], [Verse 2], [Chorus], [Bridge], [Outro]); a chorus that repeats")
+    clean = " Keep the lyrics clean: nothing sexual or explicit." if safe else ""
+    return ("You write songs for a music model. From the owner's idea, answer with one JSON object and nothing else: "
+            '{"title": a short song title, '
+            '"tags": 8-20 comma-separated style tags: genre, era, mood, lead instruments, rhythm feel, vocal type '
+            '(e.g. "female vocal", "male vocal", "duet") and production, '
+            f'"lyrics": {lyr}, '
+            '"bpm": a whole number 60-180 that suits the style, '
+            '"key": a key like "A minor" or "Eb major"}. '
+            "Keep any names, places, phrases and lines the owner gave." + clean)
+
+
+def _write_song(idea: str, lyrics: str, instrumental: bool, seconds: int, safe: bool, cancel) -> dict | None:
+    """The chat model's take on the idea as {title, tags, lyrics, bpm, key}; None when it isn't available or fails."""
+    try:
+        port = _enhance_port()
+    except Exception:                                    # noqa: BLE001
+        port = None
+    if port is None:
+        return None
+    text = idea[:4000] + (("\n\nMy lyrics:\n" + lyrics[:6000]) if lyrics and not instrumental else "")
+    out: list[str] = []
+    p = {"instructions": _song_system(seconds, instrumental, bool(lyrics), safe),
+         "messages": [{"role": "user", "text": text}], "think": False, "temperature": 0.8,
+         "presence_penalty": 0.0, "max_tokens": 1800, "_slot": PROMPT_SLOT}
+    try:
+        _chat_llama(p, lambda o: out.append(o.get("v", "")) if o.get("t") == "text" else None, cancel, port)
+    except Exception:                                    # noqa: BLE001
+        return None
+    raw = "".join(out).strip()
+    a, b = raw.find("{"), raw.rfind("}")
+    try:
+        d = json.loads(raw[a:b + 1]) if a >= 0 and b > a else None
+    except ValueError:
+        d = None
+    if not isinstance(d, dict) or not str(d.get("tags") or "").strip():
+        return None
+    try:
+        bpm = max(60, min(180, int(d.get("bpm"))))
+    except (TypeError, ValueError):
+        bpm = None
+    key = str(d.get("key") or "").strip()
+    return {"title": str(d.get("title") or "").strip()[:80], "tags": str(d["tags"]).strip()[:600],
+            "lyrics": str(d.get("lyrics") or "").strip()[:8000], "bpm": bpm,
+            "key": key if key in SONG_KEYS else None}
+
+
+def job_song(p: dict, emit, cancel):
+    """A song from an idea ("prompt"), with the owner's lyrics, written ones or none ("instrumental"), 15-240 s."""
+    status = lambda s: emit({"t": "status", "v": s})  # noqa: E731
+    if not _song_ready():
+        raise UserFacing("The song model isn't on your computer yet.")
+    idea = str(p.get("prompt") or "").strip()
+    lyrics = str(p.get("lyrics") or "").strip()
+    instrumental = p.get("instrumental") is True
+    if not idea and not lyrics:
+        raise UserFacing("Say what the song should be.")
+    try:
+        seconds = max(SONG_SECONDS[0], min(SONG_SECONDS[1], int(p.get("seconds") or 120)))
+    except (TypeError, ValueError):
+        seconds = 120
+    seed = int(p.get("seed") or int.from_bytes(os.urandom(4), "big")) % (2 ** 32)
+    title, tags, bpm, key = "", idea or "pop song", 120, "C major"
+    status("Writing the song…")
+    w = _write_song(idea or "a song with these lyrics", lyrics, instrumental, seconds, p.get("safe") is True, cancel)
+    if cancel.is_set():
+        return
+    if w:
+        title, tags = w["title"], w["tags"]
+        bpm, key = w["bpm"] or bpm, w["key"] or key
+        if not lyrics and not instrumental:
+            lyrics = w["lyrics"]
+    elif not lyrics and not instrumental:
+        emit({"t": "note", "v": "The chat model couldn't write lyrics just now, so this one is instrumental."})
+    if instrumental or not lyrics:
+        lyrics = "[Instrumental]"
+    if _worker_alive():
+        WORKER.stop()                                  # the diffusers helper holds graphics memory too
+    COMFY.ensure_current(status)
+    _room_for_pictures()
+    _timing(model="ACE-Step 1.5", steps=8, count=1)
+    status("Loading the song model…")
+    mp3 = asyncio.run(_comfy_run(_song_workflow(tags, lyrics, seconds, seed, bpm, key), emit, cancel,
+                                 audio=True, label="Making the song…"))
+    if cancel.is_set() or not mp3:
+        return
+    emit({"t": "progress", "v": 1.0})
+    emit({"t": "audio", "v": base64.b64encode(mp3).decode(), "format": "mp3", "seconds": seconds, "seed": seed,
+          "title": title, "tags": tags, "lyrics": lyrics, "bpm": bpm, "key": key})
+
+
 def _photo_size(img, megapixels: float = 1.0) -> tuple[int, int]:
     """The photo's own shape at about `megapixels`, sides divisible by 16."""
     w, h = img.size
@@ -4602,9 +4738,9 @@ def _create_pictures(r, v, w, h, count, seed, loras, photo, photo_name, mode, em
 
 
 async def _comfy_run(workflow: dict, emit, cancel, previews: bool = False, frames: bool = False,
-                     label: str = "Creating image…"):
+                     label: str = "Creating image…", audio: bool = False):
     """Queues one workflow, relays progress (and live previews when asked), returns the PNG bytes sent over the
-    websocket."""
+    websocket. audio=True (songs): the saved audio file's bytes instead, read back and deleted from the output folder."""
     import uuid
     import aiohttp
     cid = uuid.uuid4().hex
@@ -4663,6 +4799,9 @@ async def _comfy_run(workflow: dict, emit, cancel, previews: bool = False, frame
                         break
                 elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                     raise UserFacing("Lost the connection to the picture engine.")
+        sound = b""
+        if audio and not cancel.is_set():
+            sound = await _comfy_audio_out(s, pid)
         try:
             await s.post(f"http://127.0.0.1:{COMFY_PORT}/history", json={"clear": True})   # keep nothing
         except Exception:
@@ -4670,9 +4809,34 @@ async def _comfy_run(workflow: dict, emit, cancel, previews: bool = False, frame
     if cancel.is_set():
         return [] if frames else b""
     watch.apply()
+    if audio:
+        if not sound:
+            raise UserFacing("The song engine returned no song.")
+        return sound
     if not png:
         raise UserFacing("The picture engine returned no picture.")
     return pngs if frames else png
+
+
+async def _comfy_audio_out(s, pid: str) -> bytes:
+    """The audio file a finished prompt saved: read through /view, then deleted (nothing is kept on the computer)."""
+    async with s.get(f"http://127.0.0.1:{COMFY_PORT}/history/{pid}") as r:
+        hist = await r.json(content_type=None)
+    data = b""
+    for out in ((hist.get(pid) or {}).get("outputs") or {}).values():
+        for a in out.get("audio") or []:
+            fn, sub = a.get("filename") or "", a.get("subfolder") or ""
+            if not fn:
+                continue
+            async with s.get(f"http://127.0.0.1:{COMFY_PORT}/view",
+                             params={"filename": fn, "subfolder": sub, "type": a.get("type") or "output"}) as v:
+                if v.status == 200 and not data:
+                    data = await v.read()
+            base = (COMFY_PRIVATE / "output").resolve()
+            f = (base / sub / fn).resolve()
+            if f.is_relative_to(base):
+                f.unlink(missing_ok=True)
+    return data
 
 
 def _quietly(fn):
@@ -5806,7 +5970,7 @@ JOBS = {"status": job_status, "chat": job_chat, "image": job_image, "video": job
         "make_recipes": job_make_recipes,
         "lora_search": job_lora_search, "lora_thumb": job_lora_thumb, "lora_inspect": job_lora_inspect,
         "lora_add": job_lora_add, "lora_list": job_lora_list, "lora_set": job_lora_set,
-        "lora_remove": job_lora_remove, "lora_key": job_lora_key,
+        "lora_remove": job_lora_remove, "lora_key": job_lora_key, "song": job_song,
         "stop_all": _no_job, "queue": _no_job, "free_memory": _no_job,   # these answer on the event loop
         "leave": _no_job}
 # 11-17: never wait for the line, stream as before. (comfy_recipes never needed the card: it waited behind videos and
@@ -5844,8 +6008,8 @@ CHATS_ACTIVE = 0                      # chats answering right now (the idle stop
 LAST_SEEN = time.monotonic()          # 11-17: the last request of any kind from a phone (chat, job, warm-up, queue)
 LEFT_AT: float | None = None          # 11-18: when a phone said "leave" (app went to the background); None = someone is here
 HIDDEN_OPS = {"warm"}                 # make warm-ups: never listed, never noted, never wait
-QUEUED_OPS = {"image", "video", "cutout", "upscale", "comfy_run", "remove_model", "warm"}   # warm: for "make" only
-RESULT_TYPES = {"image", "video", "mask"}
+QUEUED_OPS = {"image", "video", "cutout", "upscale", "comfy_run", "remove_model", "warm", "song"}   # warm: for "make" only
+RESULT_TYPES = {"image", "video", "mask", "audio"}
 STOP_TEXT = {"replaced": "Stopped: a newer request from the same place replaced it.", "cancelled": "Stopped.",
              "stop_all": "Stopped: everything on your computer was stopped.",
              "cleared": "Stopped: the work on your computer was cleared."}
@@ -5863,7 +6027,7 @@ def _job_prompt(p: dict) -> str:
 
 
 def _job_kind(op: str, p: dict) -> str:
-    if op in ("video", "cutout", "upscale", "warm"):
+    if op in ("video", "cutout", "upscale", "warm", "song"):
         return op
     if op == "remove_model":
         return "remove"

@@ -7,7 +7,18 @@ import SwiftUI
 /// quick picks, the tiles, the photo, style tips, add-ons and the model's settings. Nothing is hidden behind a drawer.
 /// The one wide Make button is pinned at the bottom (it rides above the keyboard when the words have it).
 extension CreateScreen {
-    var makeComposeStage: some View {
+    @ViewBuilder var makeComposeStage: some View {
+        if mode == "song" {
+            VStack(spacing: 0) {                         // 11-20: songs have their own form (SongMaker.swift)
+                makeHeader
+                SongMakerView()
+            }
+        } else {
+            pictureComposeStage
+        }
+    }
+
+    private var pictureComposeStage: some View {
         VStack(spacing: 0) {
             makeHeader
             ScrollView {

@@ -43,7 +43,7 @@ extension CreateScreen {
 
 }
 
-/// Picture | Video, a two-part capsule.
+/// Picture | Video | Song, a three-part capsule (Song: 11-20).
 struct MakeModeSwitch: View {
     @Binding var mode: String
 
@@ -51,9 +51,10 @@ struct MakeModeSwitch: View {
         HStack(spacing: 0) {
             segment("Picture", "picture")
             segment("Video", "video")
+            segment("Song", "song")
         }
         .padding(3)
-        .frame(width: 118, height: 44)
+        .frame(width: 166, height: 44)
         .background(Capsule().fill(Fx.bar))
         .overlay(Capsule().strokeBorder(Fx.hairline, lineWidth: 0.5))
         .fxAnimation(Motion.pop, value: mode)
@@ -61,6 +62,7 @@ struct MakeModeSwitch: View {
             Picker("Make", selection: $mode) {
                 Text("Picture").tag("picture")
                 Text("Video").tag("video")
+                Text("Song").tag("song")
             }
             .pickerStyle(.segmented)
         }
@@ -71,6 +73,8 @@ struct MakeModeSwitch: View {
             Text(title)
                 .font(.footnote.weight(.semibold))
                 .foregroundStyle(mode == value ? Color.primary : Fx.secondaryText)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background { if mode == value { Capsule().fill(Fx.segment) } }
                 .contentShape(Capsule())

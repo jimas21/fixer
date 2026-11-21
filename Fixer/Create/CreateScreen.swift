@@ -469,6 +469,7 @@ struct CreateScreen: View {
     @State var askMacroName = false                    // "Save as macro": the name prompt
     @State var macroName = "My macro"
     @State var macroResult: String?                    // its outcome: "Saved as a macro" or why not
+    @AppStorage("make.offTriggers") var offTriggersRaw = ""   // trigger words switched off (one per line, lowercased)
 
     struct LoraPick: Identifiable { let id = UUID(); var name: String; var strength: Double }
 
@@ -569,14 +570,14 @@ struct CreateScreen: View {
     /// modifier chain gets long enough to slow the compiler down.
     var screenEffects: some View {
         screenBase
-            .task { await load(); applyMakeAgain() }
+            .task { await load(); applyMakeAgain(); applyPendingMacro() }
             .onAppear {
                 if editor == "flux" { editor = "auto" }              // that editor is gone
-                applyMakeAgain(); Desktop.shared.warmUpMake()
+                applyMakeAgain(); applyPendingMacro(); Desktop.shared.warmUpMake()
                 Task { await recipeStore.refresh() }                 // every time Make opens: edits on the computer show at once
             }
             .onChange(of: desktop.isPaired) { _, paired in
-                if paired { Task { await load(); applyMakeAgain(); await recipeStore.refresh() } }
+                if paired { Task { await load(); applyMakeAgain(); applyPendingMacro(); await recipeStore.refresh() } }
             }
             .onChange(of: startTick) { _, _ in noteDismissed = nil }
             .onChange(of: rawNote) { _, n in if n == nil { noteDismissed = nil } }
@@ -606,6 +607,9 @@ struct CreateScreen: View {
             }
             .onChange(of: router.makeAgain) { _, meta in
                 if meta != nil { applyMakeAgain() }
+            }
+            .onChange(of: router.useMacro) { _, m in
+                if m != nil { applyPendingMacro() }
             }
             .sensoryFeedback(.impact, trigger: startTick)
             .sensoryFeedback(.impact(weight: .light), trigger: stopTick)

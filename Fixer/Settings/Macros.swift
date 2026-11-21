@@ -6,7 +6,9 @@ import SwiftUI
 /// Swipe a row to delete it (after a confirm). Saved on the computer.
 struct MacroList: View {
     @ObservedObject private var desktop = Desktop.shared
+    @EnvironmentObject private var router: AppRouter
     @State private var macros: [Desktop.Macro] = []
+    @State private var roles: [Desktop.Role] = []
     @State private var library: [LoraEntry] = []
     @State private var loading = true
     @State private var failed: String?
@@ -25,7 +27,7 @@ struct MacroList: View {
             } else {
                 Section {
                     NavigationLink {
-                        MacroEditor(macro: Desktop.Macro(), library: library, onSaved: { macros = $0 })
+                        MacroEditor(macro: Desktop.Macro(), library: library, roles: roles, onSaved: { macros = $0 })
                     } label: {
                         Label("New macro", systemImage: "plus")
                     }
@@ -34,14 +36,14 @@ struct MacroList: View {
                     } label: {
                         Label("Suggest macros", systemImage: "sparkles")
                     }
-                    Text("To save what you have set up in Make, press and hold the Model tile there and choose Save as macro.")
+                    Text("To save what you have set up in Make, press and hold the Model tile there and choose Save as macro. Swipe a macro right to use it in Make.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 if !macros.isEmpty {
                     Section("Saved macros") {
                         ForEach(macros) { m in
                             NavigationLink {
-                                MacroEditor(macro: m, library: library, onSaved: { macros = $0 })
+                                MacroEditor(macro: m, library: library, roles: roles, onSaved: { macros = $0 })
                             } label: {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(m.name.isEmpty ? "Untitled" : m.name)
@@ -52,6 +54,12 @@ struct MacroList: View {
                                 Button(role: .destructive) { removing = m } label: {
                                     Label("Delete", systemImage: "trash")
                                 }
+                            }
+                            .swipeActions(edge: .leading) {
+                                Button { router.useMacro = m.forMake(roles: roles); router.tab = .make } label: {
+                                    Label("Use in Make", systemImage: "paintbrush.pointed")
+                                }
+                                .tint(.accentColor)
                             }
                         }
                     }
@@ -77,7 +85,7 @@ struct MacroList: View {
         loading = true; failed = nil
         do {
             let r = try await desktop.macrosGet()
-            macros = r.macros; library = r.library
+            macros = r.macros; roles = r.roles; library = r.library
         } catch {
             failed = "Couldn't reach your computer."
         }
@@ -99,7 +107,9 @@ struct MacroList: View {
 struct MacroEditor: View {
     @State var macro: Desktop.Macro
     let library: [LoraEntry]
+    var roles: [Desktop.Role] = []
     var onSaved: ([Desktop.Macro]) -> Void
+    @EnvironmentObject private var router: AppRouter
     @ObservedObject private var desktop = Desktop.shared
     @Environment(\.dismiss) private var dismiss
     @State private var saving = false
@@ -143,6 +153,10 @@ struct MacroEditor: View {
                 Toggle("18+", isOn: $macro.explicit)
             }
             Section {
+                Button {
+                    router.useMacro = macro.forMake(roles: roles)
+                    router.tab = .make
+                } label: { Label("Use in Make", systemImage: "paintbrush.pointed") }
                 Button(saving ? "Saving…" : "Save") { Task { await save() } }
                     .disabled(saving || macro.name.trimmingCharacters(in: .whitespaces).isEmpty)
                 Button {
@@ -379,5 +393,26 @@ struct MacroRecommend: View {
         } catch {
             notice = "Couldn't add it. Try again."
         }
+    }
+}
+
+// MARK: - Hand-off to Make
+
+extension Desktop.Macro {
+    /// What Make needs to load this macro: add-on roles turned into the installed files they point at (a role that is
+    /// off or missing is left out). Make itself drops add-ons that don't fit its model or the 18+ switch.
+    func forMake(roles: [Desktop.Role]) -> MacroApply {
+        var picks: [MacroApply.Lora] = []
+        for l in loras {
+            if let r = l.role {
+                if let role = roles.first(where: { $0.name == r && $0.enabled }), !role.file.isEmpty {
+                    picks.append(MacroApply.Lora(file: role.file, strength: role.strength))
+                }
+            } else if let f = l.file, !f.isEmpty {
+                picks.append(MacroApply.Lora(file: f, strength: l.strength))
+            }
+        }
+        return MacroApply(name: name, promptAdd: promptAdd, negativeAdd: negativeAdd, loras: picks,
+                          cfg: cfg, steps: steps, model: model, explicit: explicit)
     }
 }

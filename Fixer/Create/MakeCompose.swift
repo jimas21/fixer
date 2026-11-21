@@ -160,10 +160,12 @@ extension CreateScreen {
             if hasQuickPicks { out.append(AnyView(quickSectionsCard(tips: []))) }
             out.append(AnyView(helpPage))
         } else if mode == "video" {
+            if !activeTriggerWords.isEmpty { out.append(AnyView(triggerRow)) }
             out.append(AnyView(videoPhotoPage))
             out.append(AnyView(drawerSection("Add-ons") { loraSection }))
             out.append(AnyView(videoSettingsPage))
         } else if let r = recipe {
+            if !activeTriggerWords.isEmpty { out.append(AnyView(triggerRow)) }   // 11-21: LoRA trigger words, tap to leave out
             let tips = shownToggles(r)              // 11-19: style tips sit inside the quick-pick card now
             if hasQuickPicks || !tips.isEmpty { out.append(AnyView(quickSectionsCard(tips: tips))) }
             if showBodyPanel { out.append(AnyView(drawerSection("Body") { bodyPanel })) }

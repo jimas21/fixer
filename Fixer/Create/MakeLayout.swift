@@ -140,7 +140,7 @@ extension CreateScreen {
         activeLoras.map { p in
             let words = (loraExtra[p.name] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             return "\(p.name)@\(p.strength)+\(words)"
-        }.joined(separator: ";")
+        }.joined(separator: ";") + "~" + offTriggersRaw
     }
 
     var changeFormSignature: String { [changeText, changeMode, editor].joined(separator: "|") }
@@ -397,6 +397,59 @@ extension CreateScreen {
         if effectiveTarget == .change { return $changeText }
         if mode == "video" { return $videoPrompt }
         return Binding(get: { texts["prompt"] ?? "" }, set: { texts["prompt"] = $0 })
+    }
+
+    /// 11-21: a quick pick's emphasis, stepped 0.1 at a time between 0.8 and 1.5 (1.0 = plain words, no brackets).
+    func nudgeQuick(_ option: String, by delta: Double) {
+        let b = quickBinding
+        guard PhraseList.contains(b.wrappedValue, option) else { return }
+        let now = PhraseList.weight(b.wrappedValue, option)
+        let next = Swift.min(1.5, Swift.max(0.8, ((now + delta) * 10).rounded() / 10))
+        b.wrappedValue = PhraseList.setWeight(b.wrappedValue, option, next)
+        quickTick += 1
+    }
+
+    /// 11-21: "Use in Make" from Settings → Macros. Loads the macro into the picture form: its words are added to
+    /// yours, its add-ons switched on (only ones installed and fitting this model), its settings and model applied.
+    func applyPendingMacro() {
+        guard let m = router.useMacro, !loading, !recipes.isEmpty else { return }
+        router.useMacro = nil
+        mode = "picture"
+        target = .new
+        var skipped: [String] = []
+        if m.explicit, !makeExplicit { rules.explicitNow = true }
+        if let id = m.model, !id.isEmpty {
+            if shownRecipes.contains(where: { $0.id == id }) { modelChoice.wrappedValue = id }
+            else { skipped.append("its model") }
+        }
+        let add = m.promptAdd.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !add.isEmpty {
+            let cur = (texts["prompt"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !cur.localizedCaseInsensitiveContains(add) {
+                texts["prompt"] = cur.isEmpty ? add : (cur.hasSuffix(",") ? cur + " " + add : cur + ", " + add)
+            }
+        }
+        let neg = m.negativeAdd.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !neg.isEmpty, recipe?.controls.contains(where: { $0.key == "negative" }) == true {
+            let cur = (texts["negative"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !cur.localizedCaseInsensitiveContains(neg) {
+                texts["negative"] = cur.isEmpty ? neg : (cur.hasSuffix(",") ? cur + " " + neg : cur + ", " + neg)
+            }
+        }
+        for (key, value) in [("cfg", m.cfg), ("steps", m.steps)] {
+            guard let value, let c = recipe?.controls.first(where: { $0.key == key }) else { continue }
+            numbers[key] = Swift.min(c.max, Swift.max(c.min, value))
+        }
+        let fitting = Set(fittingLoras.map(\.file))
+        for l in m.loras {
+            guard fitting.contains(l.file) else { skipped.append("an add-on"); continue }
+            loras.removeAll { $0.name == l.file }
+            loras.append(LoraPick(name: l.file, strength: l.strength))
+        }
+        let name = m.name.isEmpty ? "Macro" : m.name
+        macroResult = skipped.isEmpty ? "“\(name)” is loaded in Make."
+            : "“\(name)” is loaded in Make, without " + Set(skipped).sorted().joined(separator: " or ")
+              + " (not available here)."
     }
 
     func tapQuick(_ option: String) {

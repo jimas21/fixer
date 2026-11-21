@@ -331,8 +331,9 @@ extension CreateScreen {
             HStack(spacing: 6) {
                 ForEach(options, id: \.self) { o in
                     let on = PhraseList.contains(text, o)
+                    let w = on ? PhraseList.weight(text, o) : 1
                     Button { tapQuick(o) } label: {
-                        Text(o)
+                        Text(abs(w - 1) < 0.001 ? o : "\(o) ×\(String(format: "%.1f", w))")
                             .font(.system(size: 14, weight: on ? .semibold : .regular))
                             .lineLimit(1)
                             .foregroundStyle(on ? tint : Color.primary)
@@ -344,6 +345,17 @@ extension CreateScreen {
                             .contentShape(Capsule())
                     }
                     .buttonStyle(.plain)
+                    .contextMenu {                              // press and hold a pick that is on: more or less emphasis
+                        if on {
+                            Button { nudgeQuick(o, by: 0.1) } label: { Label("Stronger", systemImage: "plus") }
+                                .disabled(w >= 1.5)
+                            Button { nudgeQuick(o, by: -0.1) } label: { Label("Weaker", systemImage: "minus") }
+                                .disabled(w <= 0.8)
+                            if abs(w - 1) >= 0.001 {
+                                Button { nudgeQuick(o, by: 1 - w) } label: { Label("Back to normal", systemImage: "arrow.uturn.backward") }
+                            }
+                        }
+                    }
                     .accessibilityAddTraits(on ? .isSelected : [])
                     .accessibilityHint(exp ? "Explicit" : "")
                 }

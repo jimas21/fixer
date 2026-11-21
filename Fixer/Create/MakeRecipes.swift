@@ -161,17 +161,48 @@ enum PhraseList {
             .filter { !$0.isEmpty }
     }
 
-    /// Whether `phrase` is one of the comma-separated phrases of `text` (any capitals).
-    static func contains(_ text: String, _ phrase: String) -> Bool {
-        let p = phrase.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return tokens(text).contains { $0.lowercased() == p }
+    /// A phrase with its emphasis taken off: "(long hair:1.2)" -> "long hair". Plain phrases come back unchanged.
+    private static func bare(_ token: String) -> String {
+        weighted(token)?.phrase ?? token
     }
 
-    /// Adds the phrase at the end, or takes it out (with its comma) when it is already there.
+    /// "(phrase:1.2)" -> ("phrase", 1.2); nil for anything else.
+    private static func weighted(_ token: String) -> (phrase: String, weight: Double)? {
+        guard token.hasPrefix("("), token.hasSuffix(")"), let colon = token.lastIndex(of: ":") else { return nil }
+        let inner = token[token.index(after: token.startIndex)..<colon]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let num = token[token.index(after: colon)..<token.index(before: token.endIndex)]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !inner.isEmpty, let w = Double(num) else { return nil }
+        return (inner, w)
+    }
+
+    /// Whether `phrase` is one of the comma-separated phrases of `text` (any capitals, with or without emphasis).
+    static func contains(_ text: String, _ phrase: String) -> Bool {
+        let p = phrase.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return tokens(text).contains { bare($0).lowercased() == p }
+    }
+
+    /// The emphasis a phrase has in `text`: 1 when plain or absent.
+    static func weight(_ text: String, _ phrase: String) -> Double {
+        let p = phrase.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        for t in tokens(text) where bare(t).lowercased() == p { return weighted(t)?.weight ?? 1 }
+        return 1
+    }
+
+    /// Puts the phrase (already in `text`) at that emphasis, in place: "(phrase:1.2)", or plain at 1.
+    static func setWeight(_ text: String, _ phrase: String, _ w: Double) -> String {
+        let p = phrase.trimmingCharacters(in: .whitespacesAndNewlines)
+        let form = abs(w - 1) < 0.001 ? p : "(\(p):\(String(format: "%.1f", w)))"
+        let list = tokens(text).map { bare($0).lowercased() == p.lowercased() ? form : $0 }
+        return list.joined(separator: ", ")
+    }
+
+    /// Adds the phrase at the end, or takes it out (with its comma, and any emphasis) when it is already there.
     static func toggled(_ text: String, _ phrase: String) -> String {
         let p = phrase.trimmingCharacters(in: .whitespacesAndNewlines)
         var list = tokens(text)
-        if let i = list.firstIndex(where: { $0.lowercased() == p.lowercased() }) {
+        if let i = list.firstIndex(where: { bare($0).lowercased() == p.lowercased() }) {
             list.remove(at: i)
         } else {
             list.append(p)
@@ -183,7 +214,7 @@ enum PhraseList {
     /// sliders: each axis owns a set of mutually-exclusive terms and sets exactly one (or none at the low end).
     static func replacing(_ text: String, remove: [String], with phrase: String?) -> String {
         let drop = Set(remove.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() })
-        var list = tokens(text).filter { !drop.contains($0.lowercased()) }
+        var list = tokens(text).filter { !drop.contains(bare($0).lowercased()) }
         if let p = phrase?.trimmingCharacters(in: .whitespacesAndNewlines), !p.isEmpty {
             list.append(p)
         }

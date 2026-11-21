@@ -442,13 +442,85 @@ extension CreateScreen {
     /// user typed into the "extra activation words" box (so the computer adds exactly these).
     func loraSendTriggers(_ file: String) -> [String]? {
         let extra = (loraExtra[file] ?? "")
-            .split(whereSeparator: { $0 == "," || $0 == ";" || $0 == "\n" })
+            .split(whereSeparator: { $0 == "," || $0 == ";" || $0 == "
+" })
             .map { String($0).trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
-        guard !extra.isEmpty else { return nil }
-        var all = loraLibrary.first { $0.file == file }?.triggers ?? []
+        // 11-21: trigger words switched off in the trigger row are left out (an empty list sends none at all).
+        let own = loraLibrary.first { $0.file == file }?.triggers ?? []
+        let off = offTriggers
+        var all = own.filter { !off.contains($0.lowercased()) }
+        guard !extra.isEmpty || all.count != own.count else { return nil }
         for w in extra where !all.contains(w) { all.append(w) }
         return all
+    }
+
+    /// 11-21: the trigger words switched off (lowercased), kept across launches.
+    var offTriggers: Set<String> {
+        Set(offTriggersRaw.split(separator: "
+").map { String($0) })
+    }
+
+    func toggleTrigger(_ word: String) {
+        var off = offTriggers
+        let k = word.lowercased()
+        if off.contains(k) { off.remove(k) } else { off.insert(k) }
+        offTriggersRaw = off.sorted().joined(separator: "
+")
+        quickTick += 1
+    }
+
+    /// The trigger words of the add-ons in use now (the same list the computer adds on its own), each once.
+    var activeTriggerWords: [String] {
+        var seen = Set<String>()
+        var out: [String] = []
+        for p in activeLoras {
+            for t in loraLibrary.first(where: { $0.file == p.name })?.triggers ?? [] {
+                let w = t.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !w.isEmpty, seen.insert(w.lowercased()).inserted { out.append(w) }
+            }
+        }
+        return out
+    }
+
+    /// A row of chips, one per trigger word of the add-ons that are on: lit = sent, dimmed = left out. Not there when
+    /// no add-on is on or none has trigger words.
+    @ViewBuilder var triggerRow: some View {
+        let words = activeTriggerWords
+        if !words.isEmpty {
+            let off = offTriggers
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Add-on trigger words (tap to leave one out)")
+                    .font(.footnote).foregroundStyle(Fx.secondaryText)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(words, id: \.self) { w in
+                            let on = !off.contains(w.lowercased())
+                            Button { toggleTrigger(w) } label: {
+                                Text(w)
+                                    .font(.system(size: 14, weight: on ? .semibold : .regular))
+                                    .lineLimit(1)
+                                    .strikethrough(!on)
+                                    .foregroundStyle(on ? styleTint : Fx.secondaryText)
+                                    .padding(.horizontal, 11)
+                                    .frame(height: 32)
+                                    .background(Capsule().fill(on ? styleFill : Fx.tile))
+                                    .overlay(Capsule().strokeBorder(on ? styleStroke : Color.clear, lineWidth: 1))
+                                    .opacity(on ? 1 : 0.6)
+                                    .frame(minHeight: 44)
+                                    .contentShape(Capsule())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityAddTraits(on ? .isSelected : [])
+                            .accessibilityHint(on ? "Sent with the add-on" : "Left out")
+                        }
+                    }
+                }
+                .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 4)
+        }
     }
 
     /// One add-on: an on/off switch, and a chevron that drops down its own options — strength, the extra activation

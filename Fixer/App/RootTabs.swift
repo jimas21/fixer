@@ -11,6 +11,22 @@ final class AppRouter: ObservableObject {
     @Published var clearedCount = 0
     /// Set by the Library or the chat to reuse an item's words, model and seed in Make.
     @Published var makeAgain: LibraryMeta?
+    /// Set by Settings → Macros ("Use in Make"): a saved macro for Make to load into its form, then clear.
+    @Published var useMacro: MacroApply?
+}
+
+/// 11-21: a saved macro, ready for Make: its add-on roles already resolved to installed files.
+struct MacroApply: Equatable {
+    struct Lora: Equatable { var file: String; var strength: Double }
+    var id = UUID()
+    var name: String
+    var promptAdd: String
+    var negativeAdd: String
+    var loras: [Lora]
+    var cfg: Double?
+    var steps: Double?
+    var model: String?
+    var explicit: Bool
 }
 
 /// Chat, Make, Library and Settings, each with its own navigation stack. The chat is created here so every tab shares it.

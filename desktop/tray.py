@@ -83,13 +83,28 @@ def icon_image(state: str) -> Image.Image:
 
 
 CREATE_SUSPENDED = 0x00000004
+SERVER_LOG = ROOT / "server.log"
+
+
+def server_log():
+    """11-20: the server's stderr (its warnings and any crash traceback; never request data) goes to server.log,
+    started fresh once it passes 1 MB. Before this it went nowhere, so a server that stopped serving left no cause."""
+    try:
+        if SERVER_LOG.exists() and SERVER_LOG.stat().st_size > 1_000_000:
+            SERVER_LOG.write_text("", encoding="utf-8")
+        f = open(SERVER_LOG, "a", encoding="utf-8")
+        f.write(time.strftime("--- %Y-%m-%d %H:%M:%S server start\n"))
+        f.flush()
+        return f
+    except Exception:                                   # noqa: BLE001
+        return subprocess.DEVNULL
 
 
 def start_in_job(cmd: list[str], cwd, job) -> subprocess.Popen:
     """11-18: starts cmd suspended, puts it in `job`, then lets it run, so nothing it starts (the venv launcher's real
     Python, the server's children) can be born outside the job. If it cannot be resumed it is killed and started the
     old way (start, then add), and that is logged."""
-    io = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+    io = dict(stdout=subprocess.DEVNULL, stderr=server_log(), stdin=subprocess.DEVNULL)
     p = subprocess.Popen(cmd, cwd=str(cwd), creationflags=NO_WINDOW | CREATE_SUSPENDED, **io)
     added = job.add(p)
     if fx.resume_process(p):

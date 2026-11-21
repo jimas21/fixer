@@ -7797,6 +7797,11 @@ def main():
         import traceback
         traceback.print_exc()
     finally:
+        # 11-20: bounded like _quit_now: a cleanup stuck on a lock left a server alive but no longer listening, and
+        # the tray (which only checks the process) never started a new one.
+        watchdog = threading.Timer(QUIT_GRACE, lambda: _EXIT(code))
+        watchdog.daemon = True
+        watchdog.start()
         _shutdown_cleanup()                            # chat model, helper, ComfyUI (also empties its private folder)
         try:
             sys.stderr.flush()

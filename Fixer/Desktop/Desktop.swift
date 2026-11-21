@@ -772,8 +772,105 @@ final class Desktop: ObservableObject {
         var id: String { name }
     }
 
-    /// The editable roles, the user macros (kept raw: passed back unchanged on save) and the installed LoRAs.
-    func macrosGet() async throws -> (roles: [Role], macros: [[String: Any]], library: [LoraEntry]) {
+    /// 11-21: one add-on slot in a macro: either a named role (e.g. "realism") or an installed file at a strength.
+    struct MacroLora: Identifiable, Hashable {
+        var id = UUID()
+        var role: String?
+        var file: String?
+        var strength: Double = 1
+
+        init(role: String? = nil, file: String? = nil, strength: Double = 1) {
+            self.role = role; self.file = file; self.strength = strength
+        }
+        init?(_ d: [String: Any]) {
+            if let r = d["role"] as? String, !r.isEmpty { role = r }
+            else if let f = d["file"] as? String, !f.isEmpty { file = f }
+            else { return nil }
+            strength = (d["strength"] as? NSNumber)?.doubleValue ?? 1
+        }
+        var raw: [String: Any] {
+            if let role { return ["role": role] }
+            return ["file": file ?? "", "strength": strength]
+        }
+    }
+
+    /// 11-21: a saved preset: text added to the prompt, the add-on stack, settings and an optional model.
+    struct Macro: Identifiable {
+        var id: String = UUID().uuidString
+        var name = ""
+        var promptAdd = ""
+        var negativeAdd = ""
+        var loras: [MacroLora] = []
+        var cfg: Double?
+        var steps: Double?
+        var model: String?
+        var explicit = false
+        private var extra: [String: Any] = [:]       // keys this version doesn't know are passed back unchanged
+
+        init() {}
+        init(_ d: [String: Any]) {
+            extra = d
+            id = d["id"] as? String ?? UUID().uuidString
+            name = d["name"] as? String ?? ""
+            promptAdd = d["prompt_add"] as? String ?? ""
+            negativeAdd = d["negative_add"] as? String ?? ""
+            loras = (d["loras"] as? [[String: Any]] ?? []).compactMap { MacroLora($0) }
+            let st = d["settings"] as? [String: Any] ?? [:]
+            cfg = (st["cfg"] as? NSNumber)?.doubleValue
+            steps = (st["steps"] as? NSNumber)?.doubleValue
+            let m = d["model"] as? String
+            model = (m?.isEmpty ?? true) ? nil : m
+            explicit = d["explicit"] as? Bool ?? false
+        }
+        var raw: [String: Any] {
+            var d = extra
+            d["id"] = id
+            d["name"] = name
+            d["prompt_add"] = promptAdd
+            d["negative_add"] = negativeAdd
+            d["loras"] = loras.map { $0.raw }
+            var st: [String: Any] = [:]
+            if let cfg { st["cfg"] = cfg }
+            if let steps { st["steps"] = steps }
+            d["settings"] = st
+            d["model"] = model ?? NSNull()
+            d["explicit"] = explicit
+            return d
+        }
+
+        /// Overwrites only the fields a suggestion's `apply` holds.
+        mutating func merge(_ a: [String: Any]) {
+            if let v = a["prompt_add"] as? String { promptAdd = v }
+            if let v = a["negative_add"] as? String { negativeAdd = v }
+            if let v = a["loras"] as? [[String: Any]] { loras = v.compactMap { MacroLora($0) } }
+            if let st = a["settings"] as? [String: Any] {
+                if let v = st["cfg"] as? NSNumber { cfg = v.doubleValue }
+                if let v = st["steps"] as? NSNumber { steps = v.doubleValue }
+            }
+            if let v = a["model"] as? String { model = v.isEmpty ? nil : v }
+            if let v = a["explicit"] as? Bool { explicit = v }
+        }
+
+        /// "prompt snippet · N add-ons" for the list.
+        var summary: String {
+            let t = promptAdd.trimmingCharacters(in: .whitespacesAndNewlines)
+            let snippet = t.count > 40 ? String(t.prefix(40)) + "…" : t
+            let n = loras.count
+            let adds = n == 1 ? "1 add-on" : "\(n) add-ons"
+            return snippet.isEmpty ? adds : "\(snippet) · \(adds)"
+        }
+    }
+
+    /// One improvement the local AI suggests. `apply` (when present) holds the macro fields to overwrite.
+    struct MacroSuggestion: Identifiable {
+        let id: String
+        let title: String
+        let detail: String
+        let apply: [String: Any]?
+    }
+
+    /// The editable roles, the saved macros and the installed LoRAs.
+    func macrosGet() async throws -> (roles: [Role], macros: [Macro], library: [LoraEntry]) {
         guard let link else { throw PCError.notPaired }
         for try await f in call("macros_get", [:], link: link) where f["t"] as? String == "info" {
             return Self.parseMacros(f)
@@ -781,21 +878,55 @@ final class Desktop: ObservableObject {
         throw PCError.bad
     }
 
-    /// Saves the whole document (roles edited, macros as they came) and returns what the computer now holds.
-    func macrosSet(roles: [Role], macros: [[String: Any]]) async throws
-        -> (roles: [Role], macros: [[String: Any]], library: [LoraEntry]) {
+    /// Saves the whole document and returns what the computer now holds.
+    func macrosSet(roles: [Role], macros: [Macro]) async throws
+        -> (roles: [Role], macros: [Macro], library: [LoraEntry]) {
         guard let link else { throw PCError.notPaired }
         var raw: [String: Any] = [:]
         for r in roles { raw[r.name] = ["file": r.file, "strength": r.strength, "enabled": r.enabled] as [String: Any] }
-        let payload: [String: Any] = ["roles": raw, "macros": macros]
+        let payload: [String: Any] = ["roles": raw, "macros": macros.map { $0.raw }]
         for try await f in call("macros_set", payload, link: link) where f["t"] as? String == "info" {
             return Self.parseMacros(f)
         }
         throw PCError.bad
     }
 
+    /// Adds a macro, or replaces the one with the same id.
+    @discardableResult
+    func saveMacro(_ m: Macro) async throws -> [Macro] {
+        let cur = try await macrosGet()
+        var list = cur.macros
+        if let i = list.firstIndex(where: { $0.id == m.id }) { list[i] = m } else { list.append(m) }
+        return try await macrosSet(roles: cur.roles, macros: list).macros
+    }
+
+    @discardableResult
+    func deleteMacro(id: String) async throws -> [Macro] {
+        let cur = try await macrosGet()
+        return try await macrosSet(roles: cur.roles, macros: cur.macros.filter { $0.id != id }).macros
+    }
+
+    func deleteAllMacros() async throws {
+        let cur = try await macrosGet()
+        _ = try await macrosSet(roles: cur.roles, macros: [])
+    }
+
+    /// Asks the local AI to review a macro; each suggestion is one discrete improvement.
+    func analyzeMacro(_ macro: Macro, safe: Bool) async throws -> [MacroSuggestion] {
+        guard let link else { throw PCError.notPaired }
+        let payload: [String: Any] = ["macro": macro.raw, "safe": safe]
+        for try await f in call("analyze_macro", payload, link: link) where f["t"] as? String == "info" {
+            let rows = f["suggestions"] as? [[String: Any]] ?? []
+            return rows.enumerated().map { i, d in
+                MacroSuggestion(id: d["id"] as? String ?? "s\(i)", title: d["title"] as? String ?? "",
+                                detail: d["detail"] as? String ?? "", apply: d["apply"] as? [String: Any])
+            }
+        }
+        throw PCError.bad
+    }
+
     private nonisolated static func parseMacros(_ f: [String: Any])
-        -> (roles: [Role], macros: [[String: Any]], library: [LoraEntry]) {
+        -> (roles: [Role], macros: [Macro], library: [LoraEntry]) {
         let doc = f["macros"] as? [String: Any] ?? [:]
         let rawRoles = doc["roles"] as? [String: Any] ?? [:]
         let roles: [Role] = rawRoles.compactMap { key, value in
@@ -804,7 +935,8 @@ final class Desktop: ObservableObject {
                         strength: (d["strength"] as? NSNumber)?.doubleValue ?? 1,
                         enabled: d["enabled"] as? Bool ?? false)
         }.sorted { $0.name < $1.name }
-        return (roles, doc["macros"] as? [[String: Any]] ?? [], LoraEntry.rows(f["library"]))
+        let macros = (doc["macros"] as? [[String: Any]] ?? []).map { Macro($0) }
+        return (roles, macros, LoraEntry.rows(f["library"]))
     }
 
     /// Deletes a LoRA (both files of a video pair) from the computer.

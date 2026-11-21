@@ -88,6 +88,9 @@ struct SettingsScreen: View {
                         NavigationLink { RolesMacros() } label: {
                             Label("Add-on roles", systemImage: "slider.horizontal.3")
                         }
+                        NavigationLink { MacroList() } label: {
+                            Label("Macros", systemImage: "wand.and.stars")
+                        }
                     }
                     desktopDetails
                     if !desktop.isOn {
@@ -96,6 +99,8 @@ struct SettingsScreen: View {
                 } header: {
                     Text("Advanced")
                 }
+
+                if desktop.isOn { DeleteAllMacrosSection() }
 
                 Section {
                     LabeledContent("Version", value: Self.version)

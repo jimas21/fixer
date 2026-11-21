@@ -5,7 +5,7 @@ import SwiftUI
 struct RolesMacros: View {
     @ObservedObject private var desktop = Desktop.shared
     @State private var roles: [Desktop.Role] = []
-    @State private var macros: [[String: Any]] = []
+    @State private var macros: [Desktop.Macro] = []
     @State private var library: [LoraEntry] = []
     @State private var loading = true
     @State private var saving = false

@@ -763,6 +763,50 @@ final class Desktop: ObservableObject {
         throw PCError.bad
     }
 
+    /// 11-21: a named add-on role (e.g. "realism") and the installed LoRA it points at.
+    struct Role: Identifiable, Hashable {
+        var name: String
+        var file: String
+        var strength: Double
+        var enabled: Bool
+        var id: String { name }
+    }
+
+    /// The editable roles, the user macros (kept raw: passed back unchanged on save) and the installed LoRAs.
+    func macrosGet() async throws -> (roles: [Role], macros: [[String: Any]], library: [LoraEntry]) {
+        guard let link else { throw PCError.notPaired }
+        for try await f in call("macros_get", [:], link: link) where f["t"] as? String == "info" {
+            return Self.parseMacros(f)
+        }
+        throw PCError.bad
+    }
+
+    /// Saves the whole document (roles edited, macros as they came) and returns what the computer now holds.
+    func macrosSet(roles: [Role], macros: [[String: Any]]) async throws
+        -> (roles: [Role], macros: [[String: Any]], library: [LoraEntry]) {
+        guard let link else { throw PCError.notPaired }
+        var raw: [String: Any] = [:]
+        for r in roles { raw[r.name] = ["file": r.file, "strength": r.strength, "enabled": r.enabled] as [String: Any] }
+        let payload: [String: Any] = ["roles": raw, "macros": macros]
+        for try await f in call("macros_set", payload, link: link) where f["t"] as? String == "info" {
+            return Self.parseMacros(f)
+        }
+        throw PCError.bad
+    }
+
+    private nonisolated static func parseMacros(_ f: [String: Any])
+        -> (roles: [Role], macros: [[String: Any]], library: [LoraEntry]) {
+        let doc = f["macros"] as? [String: Any] ?? [:]
+        let rawRoles = doc["roles"] as? [String: Any] ?? [:]
+        let roles: [Role] = rawRoles.compactMap { key, value in
+            guard let d = value as? [String: Any] else { return nil }
+            return Role(name: key, file: d["file"] as? String ?? "",
+                        strength: (d["strength"] as? NSNumber)?.doubleValue ?? 1,
+                        enabled: d["enabled"] as? Bool ?? false)
+        }.sorted { $0.name < $1.name }
+        return (roles, doc["macros"] as? [[String: Any]] ?? [], LoraEntry.rows(f["library"]))
+    }
+
     /// Deletes a LoRA (both files of a video pair) from the computer.
     func loraRemove(_ file: String) async throws {
         guard let link else { throw PCError.notPaired }

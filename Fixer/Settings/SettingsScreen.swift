@@ -85,6 +85,9 @@ struct SettingsScreen: View {
                         NavigationLink { ModelsOnComputer() } label: {
                             Label("Models on your computer", systemImage: "externaldrive")
                         }
+                        NavigationLink { RolesMacros() } label: {
+                            Label("Add-on roles", systemImage: "slider.horizontal.3")
+                        }
                     }
                     desktopDetails
                     if !desktop.isOn {

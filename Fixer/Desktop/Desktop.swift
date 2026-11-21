@@ -925,6 +925,22 @@ final class Desktop: ObservableObject {
         throw PCError.bad
     }
 
+    /// Asks the local AI for a few complete macros to start from. `context` is what the user is going for (optional).
+    func recommendMacros(context: String, safe: Bool) async throws -> [Macro] {
+        guard let link else { throw PCError.notPaired }
+        var payload: [String: Any] = ["safe": safe]
+        let c = context.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !c.isEmpty { payload["context"] = c }
+        for try await f in call("recommend_macros", payload, link: link) where f["t"] as? String == "info" {
+            return (f["macros"] as? [[String: Any]] ?? []).map { raw -> Macro in
+                var m = Macro(raw)
+                m.id = UUID().uuidString          // a fresh id: it is added as a new macro
+                return m
+            }
+        }
+        throw PCError.bad
+    }
+
     private nonisolated static func parseMacros(_ f: [String: Any])
         -> (roles: [Role], macros: [Macro], library: [LoraEntry]) {
         let doc = f["macros"] as? [String: Any] ?? [:]

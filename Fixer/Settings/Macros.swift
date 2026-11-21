@@ -29,6 +29,11 @@ struct MacroList: View {
                     } label: {
                         Label("New macro", systemImage: "plus")
                     }
+                    NavigationLink {
+                        MacroRecommend(onAdded: { macros = $0 })
+                    } label: {
+                        Label("Suggest macros", systemImage: "sparkles")
+                    }
                     // TODO: "Save current Make setup as a macro" needs Make's prompt and add-on picks, which live in
                     // CreateScreen's private state. Not wired blind: add a hand-off from Make (a Macro built from
                     // its prompt, `activeLoras` and Rules.pcSteps/pcGuidance) and call Desktop.saveMacro.
@@ -307,6 +312,73 @@ struct DeleteAllMacrosSection: View {
                 }
             }
             Button("Cancel", role: .cancel) {}
+        }
+    }
+}
+
+// MARK: - Recommended macros
+
+/// Settings → Macros → Suggest macros: the local AI proposes a few complete macros; each can be added as a new,
+/// editable macro (with a fresh id), any, all or none.
+struct MacroRecommend: View {
+    var onAdded: ([Desktop.Macro]) -> Void
+    @ObservedObject private var desktop = Desktop.shared
+    @State private var context = ""
+    @State private var results: [Desktop.Macro] = []
+    @State private var added: Set<String> = []
+    @State private var working = false
+    @State private var notice: String?
+
+    var body: some View {
+        Form {
+            Section("What are you going for?") {
+                TextField("Optional, e.g. moody street portraits", text: $context, axis: .vertical).lineLimit(1...4)
+                Button {
+                    Task { await fetch() }
+                } label: {
+                    if working { HStack { ProgressView(); Text("Thinking…") } }
+                    else { Label(results.isEmpty ? "Suggest macros" : "Suggest again", systemImage: "sparkles") }
+                }
+                .disabled(working)
+                if let notice { Text(notice).font(.footnote).foregroundStyle(.secondary) }
+            }
+            ForEach(results) { r in
+                Section(r.name.isEmpty ? "Untitled" : r.name) {
+                    Text(r.summary).font(.footnote).foregroundStyle(.secondary)
+                    if !r.promptAdd.isEmpty { Text(r.promptAdd).font(.footnote).lineLimit(4) }
+                    if added.contains(r.id) {
+                        Label("Added", systemImage: "checkmark").foregroundStyle(.secondary)
+                    } else {
+                        Button("Add as a new macro") { Task { await add(r) } }
+                    }
+                }
+            }
+            if results.count > 1, results.contains(where: { !added.contains($0.id) }) {
+                Section { Button("Add all") { Task { for r in results where !added.contains(r.id) { await add(r) } } } }
+            }
+        }
+        .navigationTitle("Suggest macros")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func fetch() async {
+        working = true; notice = nil
+        do {
+            results = try await desktop.recommendMacros(context: context, safe: !Rules.shared.explicitNow)
+            added = []
+            if results.isEmpty { notice = "No suggestions this time." }
+        } catch {
+            notice = "Couldn't get suggestions. Try again."
+        }
+        working = false
+    }
+
+    private func add(_ m: Desktop.Macro) async {
+        do {
+            onAdded(try await desktop.saveMacro(m))
+            added.insert(m.id)
+        } catch {
+            notice = "Couldn't add it. Try again."
         }
     }
 }

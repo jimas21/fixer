@@ -194,7 +194,8 @@ extension CreateScreen {
         // 11-20 (the owner: the 18+ quick picks were gone): they came only with an 18+ style, and with the 18+ styles
         // folded away nobody picked one. While 18+ is on, the 18+ rows are always there, after the style's own.
         if makeExplicit, mode != "video" {
-            for id in ["body_size", "act", "anatomy_f", "anatomy_m", "fluids", "reactions", "kink", "fetish"]
+            // 11-21: "Undress" leads the 18+ rows — the first thing wanted when working an uploaded photo with 18+ on.
+            for id in ["undress", "body_size", "act", "anatomy_f", "anatomy_m", "fluids", "reactions", "kink", "fetish"]
             where !ids.contains(id) { ids.append(id) }
         }
         // 11-19: with 18+ off, a row that has only 18+ options (anatomy, kink, ...) isn't shown at all.

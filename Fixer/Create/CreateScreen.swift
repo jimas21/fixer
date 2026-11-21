@@ -519,7 +519,15 @@ struct CreateScreen: View {
                     if let first = imgs.first {
                         photo = first
                         morePhotos = Array(imgs.dropFirst().prefix(2))
-                        if !morePhotos.isEmpty, photoMode == "start" { photoMode = "edit" }
+                        if !morePhotos.isEmpty {
+                            if photoMode == "start" { photoMode = "edit" }   // combining photos needs the editor
+                        } else if makeExplicit {
+                            // 11-21: with 18+ on, a single uploaded photo is worked by the current picture model —
+                            // its own add-ons (LoRAs), prompt and settings — by redrawing from it, so the model's
+                            // LoRAs show and actually apply. The Qwen editor only loads qwen-edit LoRAs, so it would
+                            // hide every chroma/SDXL add-on. An editor is still one tap away in "Model for this photo".
+                            photoMode = "start"
+                        }
                         LibraryStore.shared.add(picture: first, meta: Made(source: .added, action: "added")
                             .meta(kind: .picture, conversation: nil))
                     }

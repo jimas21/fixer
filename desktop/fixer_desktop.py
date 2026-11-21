@@ -2893,6 +2893,260 @@ def enhance_prompt(prompt: str, edit: bool, image_b64: str | None, cancel) -> tu
     return text, ""
 
 
+# ----- Reference photo -> prompt (11-21): "Match this photo" --------------------------------------------------------
+# The owner feeds a photo they like; the local VISION brain writes the prompt that would redraw it. Slice 1 returns
+# the prompt, a negative and an 18+ flag only (a later slice suggests a model and add-ons through the role map). It is
+# faithful, not inventive, and replies as JSON so it parses cleanly. Runs on the brain's prompt slot, like enhance.
+DESCRIBE_SYSTEM = (
+    "You look at ONE photo and write the prompt that would redraw it for a text-to-image model. Describe the subject, "
+    "pose, body, clothing (or none), expression, setting, light, camera angle, style and colours in plain sentences. "
+    "Describe exactly what is in the photo — never invent details that are not there. "
+    "Reply with ONLY a JSON object and nothing else: "
+    '{"prompt": "<the full description>", "negative": "<things to avoid, or empty>", "explicit": true or false}. '
+    'Set "explicit" to true only when the photo shows nudity or sex.')
+
+
+def _describe_system(safe: bool) -> str:
+    base = DESCRIBE_SYSTEM
+    if safe:
+        base += ("\nThis is a safe session: describe people as clothed, keep the description non-sexual, and set "
+                 '"explicit" to false.')
+    extra = _tune_text("describe_system_extra", "")
+    return base + ("\n" + extra if extra else "")
+
+
+def _parse_describe(text: str) -> dict | None:
+    """The brain's reply as {prompt, negative, explicit}, or None when there is no usable JSON object."""
+    t = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S)
+    t = re.sub(r"```[a-z]*", "", t)
+    m = re.search(r"\{.*\}", t, re.S)
+    if not m:
+        return None
+    try:
+        obj = json.loads(m.group(0))
+    except Exception:                                    # noqa: BLE001
+        return None
+    if not isinstance(obj, dict):
+        return None
+    prompt = str(obj.get("prompt") or "").strip()
+    if not prompt:
+        return None
+    return {"prompt": prompt[:4000], "negative": str(obj.get("negative") or "").strip()[:1000],
+            "explicit": bool(obj.get("explicit"))}
+
+
+def describe_photo(image_b64: str, safe: bool, cancel) -> tuple[dict | None, str]:
+    """(described dict or None, a plain-words note when it couldn't). Uses the brain's vision slot; think off."""
+    try:
+        port = _enhance_port()
+    except Exception:                                    # noqa: BLE001
+        port = None
+    if port is None:
+        return None, (PAUSED_TEXT if LLAMA.paused_for else
+                      "The chat model isn't available right now, so a photo can't be matched.")
+    if not LLAMA.vision:                                 # 11-21: fail loudly; a non-vision brain silently drops images
+        return None, "This computer's chat model can't see images, so it can't match a photo."
+    msg = {"role": "user", "text": "Describe this photo as an image prompt.", "image": image_b64}
+    out: list[str] = []
+    p = {"instructions": _describe_system(safe), "messages": [msg], "think": False,
+         "temperature": _tune("describe_temp", 0.3), "max_tokens": int(_tune("describe_max_tokens", 1100)),
+         "_slot": PROMPT_SLOT}
+    try:
+        _chat_llama(p, lambda o: out.append(o.get("v", "")) if o.get("t") == "text" else None, cancel, port)
+    except Exception:                                    # noqa: BLE001
+        return None, "Matching the photo didn't work, so nothing was filled in."
+    parsed = _parse_describe("".join(out))
+    if parsed is None or len(parsed["prompt"]) < 20:
+        return None, "The photo couldn't be described. Try another one."
+    if safe:
+        parsed["explicit"] = False                       # the 18+ switch, not the photo, decides in safe mode
+    return parsed, ""
+
+
+# ----- Macro review & recommendations (11-21) ----------------------------------------------------------------------
+# The local brain reviews a MACRO (a reusable preset: prompt add, negative add, add-on roles/LoRAs, settings, model)
+# and either suggests concrete improvements (a checklist the owner picks from) or proposes a few complete starter
+# macros to adopt. Everything the brain returns is allow-listed against the real models/roles/library before it goes
+# back, so a hallucinated model or add-on is dropped, and 18+ is forced off in a safe session.
+def _brain_chat(system: str, user_text: str, cancel, temperature: float = 0.4, max_tokens: int = 1200) -> str | None:
+    """A plain text-in / text-out brain call on the prompt slot (think off). None when the brain isn't available."""
+    try:
+        port = _enhance_port()
+    except Exception:                                    # noqa: BLE001
+        port = None
+    if port is None:
+        return None
+    out: list[str] = []
+    p = {"instructions": system, "messages": [{"role": "user", "text": user_text[:8000]}], "think": False,
+         "temperature": temperature, "max_tokens": int(max_tokens), "_slot": PROMPT_SLOT}
+    try:
+        _chat_llama(p, lambda o: out.append(o.get("v", "")) if o.get("t") == "text" else None, cancel, port)
+    except Exception:                                    # noqa: BLE001
+        return None
+    return "".join(out)
+
+
+def _brain_json(text: str):
+    """The first JSON object in a brain reply (think block and fences stripped), or None."""
+    t = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S)
+    t = re.sub(r"```[a-z]*", "", t)
+    m = re.search(r"\{.*\}", t, re.S)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:                                    # noqa: BLE001
+        return None
+
+
+def _macro_text(m: dict) -> str:
+    """A macro as readable lines for the brain."""
+    parts = [f"Name: {m.get('name') or '(unnamed)'}"]
+    if m.get("prompt_add"):
+        parts.append(f"Prompt: {m['prompt_add']}")
+    if m.get("negative_add"):
+        parts.append(f"Negative: {m['negative_add']}")
+    loras = [str((it.get('role') or it.get('file') or '?')) for it in (m.get('loras') or []) if isinstance(it, dict)]
+    if loras:
+        parts.append("Add-ons: " + ", ".join(loras))
+    s = m.get("settings") if isinstance(m.get("settings"), dict) else {}
+    if s:
+        parts.append("Settings: " + ", ".join(f"{k}={v}" for k, v in s.items()))
+    if m.get("model"):
+        parts.append(f"Model: {m['model']}")
+    parts.append(f"Explicit: {bool(m.get('explicit'))}")
+    return "\n".join(parts)
+
+
+def _macro_vocab(safe: bool) -> str:
+    roles = list((_macros().get("roles") or {}).keys())
+    models = [rid for rid, r in CREATE_RECIPES.items() if _recipe_ready(r) and not (safe and rid in _adult_models())]
+    return (f"Add-on role names you may use for loras (or an empty list): {', '.join(roles) or 'none'}.\n"
+            f"Model ids you may use (or null): {', '.join(models) or 'none'}.")
+
+
+def _clean_patch(ap: dict, safe: bool) -> dict:
+    """Keep only valid, provided macro fields from a brain-proposed change, coerced and allow-listed."""
+    out: dict = {}
+    if "prompt_add" in ap:
+        out["prompt_add"] = str(ap["prompt_add"] or "")[:2000]
+    if "negative_add" in ap:
+        out["negative_add"] = str(ap["negative_add"] or "")[:1000]
+    if "explicit" in ap:
+        out["explicit"] = bool(ap["explicit"]) and not safe
+    if isinstance(ap.get("settings"), dict):
+        s = {}
+        for k in ("cfg", "steps", "shift"):
+            if k in ap["settings"]:
+                try:
+                    s[k] = float(ap["settings"][k])
+                except (TypeError, ValueError):
+                    pass
+        out["settings"] = s
+    if "model" in ap:
+        mid = str(ap["model"] or "")
+        if mid in CREATE_RECIPES and _recipe_ready(CREATE_RECIPES[mid]) and not (safe and mid in _adult_models()):
+            out["model"] = mid
+    if isinstance(ap.get("loras"), list):
+        roles = set((_macros().get("roles") or {}).keys())
+        lib = _lora_lib()
+        kept = []
+        for it in ap["loras"]:
+            if not isinstance(it, dict):
+                continue
+            if it.get("role") and str(it["role"]) in roles:
+                kept.append({"role": str(it["role"])})
+            elif it.get("file") and str(it["file"]) in lib:
+                kept.append({"file": str(it["file"]), "strength": max(0.0, min(2.0, float(it.get("strength", 1.0))))})
+        out["loras"] = kept
+    return out
+
+
+def _sanitize_macro(raw: dict, safe: bool) -> dict | None:
+    """A whole brain-proposed macro, coerced to the real schema. None when there's nothing usable."""
+    if not isinstance(raw, dict):
+        return None
+    import uuid
+    patch = _clean_patch(raw, safe)
+    prompt_add = patch.get("prompt_add") or str(raw.get("prompt") or "")[:2000]
+    name = str(raw.get("name") or "Suggested macro")[:80]
+    if not prompt_add and not patch.get("loras"):
+        return None
+    return {"id": str(raw.get("id") or uuid.uuid4().hex[:8]), "name": name, "prompt_add": prompt_add,
+            "negative_add": patch.get("negative_add", ""), "loras": patch.get("loras", []),
+            "settings": patch.get("settings", {}), "model": patch.get("model"),
+            "explicit": patch.get("explicit", False)}
+
+
+def _analyze_macro_system(safe: bool) -> str:
+    base = (
+        "You review ONE image-generation MACRO (a reusable preset: a prompt addition, a negative addition, add-on "
+        "LoRAs, picture settings like cfg/steps, and maybe a model). Suggest concrete, specific improvements for "
+        "sharper, more realistic, more on-target images. Look for redundant or conflicting add-ons, prompt phrases "
+        "that repeat or fight, missing detail, a cfg/steps value that is off, or trigger words worth adding. Give a "
+        "SHORT list (3 to 6) of discrete suggestions. "
+        'Reply with ONLY JSON: {"suggestions": [{"title": "<short>", "detail": "<one sentence why>", '
+        '"apply": {<only the macro fields to change>}}]}. Include "apply" only when the change is concrete, e.g. '
+        '{"negative_add": "..."} or {"settings": {"cfg": 3.0}}. Never invent add-ons or models not already present.')
+    return base + ("\nThis is a safe session: keep every suggestion non-explicit." if safe else "")
+
+
+def _recommend_macros_system(safe: bool) -> str:
+    base = (
+        "You propose a few COMPLETE starter macros for a local image generator. Each is all-inclusive: a name, a "
+        "prompt addition, a negative addition, add-on LoRAs (by role name, or an empty list), picture settings, an "
+        "optional model, and an explicit flag. Give 2 to 4 distinct, genuinely useful macros the owner can adopt and "
+        "tweak. Keep prompts concrete and short. "
+        'Reply with ONLY JSON: {"macros": [{"name": "...", "prompt_add": "...", "negative_add": "...", '
+        '"loras": [{"role": "realism"}], "settings": {"cfg": 3.5}, "model": null, "explicit": false}]}.\n'
+        + _macro_vocab(safe))
+    return base + ("\nThis is a safe session: every macro must be non-explicit (set explicit false)." if safe else "")
+
+
+def job_analyze_macro(p: dict, emit, cancel):
+    """Review a macro -> a short list of pickable suggestions."""
+    macro = p.get("macro")
+    if not isinstance(macro, dict):
+        raise UserFacing("No macro to review.")
+    safe = p.get("safe") is True
+    emit({"t": "status", "v": "Reviewing your macro…"})
+    text = _brain_chat(_analyze_macro_system(safe), _macro_text(macro), cancel,
+                       temperature=_tune("macro_temp", 0.4), max_tokens=int(_tune("macro_max_tokens", 1200)))
+    if text is None:
+        raise UserFacing(PAUSED_TEXT if LLAMA.paused_for else "The chat model isn't available right now.")
+    obj = _brain_json(text)
+    import uuid
+    out = []
+    for s in ((obj or {}).get("suggestions") or [])[:8]:
+        if not isinstance(s, dict):
+            continue
+        title = str(s.get("title") or "").strip()
+        if not title:
+            continue
+        item = {"id": uuid.uuid4().hex[:8], "title": title[:120], "detail": str(s.get("detail") or "")[:300]}
+        if isinstance(s.get("apply"), dict):
+            patch = _clean_patch(s["apply"], safe)
+            if patch:
+                item["apply"] = patch
+        out.append(item)
+    emit({"t": "info", "suggestions": out})
+
+
+def job_recommend_macros(p: dict, emit, cancel):
+    """Propose a few complete starter macros."""
+    safe = p.get("safe") is True
+    ctx = str(p.get("context") or "").strip()
+    user = f"What I'm going for: {ctx}" if ctx else "Suggest some useful macros."
+    emit({"t": "status", "v": "Thinking up some macros…"})
+    text = _brain_chat(_recommend_macros_system(safe), user, cancel,
+                       temperature=_tune("macro_temp", 0.6), max_tokens=int(_tune("macro_rec_max_tokens", 1600)))
+    if text is None:
+        raise UserFacing(PAUSED_TEXT if LLAMA.paused_for else "The chat model isn't available right now.")
+    obj = _brain_json(text)
+    macros = [m for m in (_sanitize_macro(r, safe) for r in ((obj or {}).get("macros") or [])[:6]) if m]
+    emit({"t": "info", "macros": macros})
+
+
 def _enhance_inputs(op: str, payload: dict | None):
     """(prompt, is_edit, photo) when this request asks to be enhanced, else None. Paint (a spot's own words) is never."""
     if not isinstance(payload, dict):
@@ -6590,6 +6844,27 @@ def job_macros_set(p: dict, emit, cancel):
     emit({"t": "info", "macros": _macros(), "library": _lora_entries()})
 
 
+def job_describe_photo(p: dict, emit, cancel):
+    """"Match this photo": a photo in -> the prompt that would redraw it. The image is downscaled on the computer
+    before it reaches the vision brain, to stay within its context window."""
+    b64 = p.get("image")
+    if not isinstance(b64, str) or not b64:
+        raise UserFacing("No photo to match.")
+    try:
+        img = _image_in(b64)
+    except Exception:                                    # noqa: BLE001
+        raise UserFacing("That photo couldn't be read.")
+    px = max(256, min(2048, int(_tune("describe_image_px", 1280))))
+    img.thumbnail((px, px))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=90)
+    emit({"t": "status", "v": "Looking at your photo…"})
+    parsed, note = describe_photo(base64.b64encode(buf.getvalue()).decode(), p.get("safe") is True, cancel)
+    if parsed is None:
+        raise UserFacing(note or "The photo couldn't be described.")
+    emit({"t": "info", "described": parsed})
+
+
 def job_lora_remove(p: dict, emit, cancel):
     """Delete a file (or a whole pair) and its library entry."""
     fn = str(p.get("file") or "")
@@ -6845,7 +7120,8 @@ JOBS = {"status": job_status, "chat": job_chat, "image": job_image, "video": job
         "lora_search": job_lora_search, "lora_thumb": job_lora_thumb, "lora_inspect": job_lora_inspect,
         "lora_add": job_lora_add, "lora_list": job_lora_list, "lora_set": job_lora_set,
         "lora_remove": job_lora_remove, "lora_key": job_lora_key,
-        "macros_get": job_macros_get, "macros_set": job_macros_set, "song": job_song,
+        "macros_get": job_macros_get, "macros_set": job_macros_set, "describe_photo": job_describe_photo,
+        "analyze_macro": job_analyze_macro, "recommend_macros": job_recommend_macros, "song": job_song,
         "song_write": job_song_write, "album": job_album, "artwork": job_artwork,
         "stop_all": _no_job, "queue": _no_job, "free_memory": _no_job,   # these answer on the event loop
         "leave": _no_job, "uninstall": job_uninstall}
@@ -6853,7 +7129,8 @@ JOBS = {"status": job_status, "chat": job_chat, "image": job_image, "video": job
 # left Make on "Asking your computer..." for minutes.)
 IMMEDIATE = {"status", "search", "forget", "config", "comfy_recipes", "make_recipes", "chat", "installed",
              "song_write", "uninstall", "macros_get",
-             "lora_search", "lora_thumb", "lora_inspect"}   # 11-21: read-only lookups, never queue behind a job
+             "lora_search", "lora_thumb", "lora_inspect",   # 11-21: read-only lookups, never queue behind a job
+             "describe_photo", "analyze_macro", "recommend_macros"}   # brain prompt slot, like chat
 ASYNC_OPS = {"queue", "stop_all", "free_memory", "leave"}
 
 

@@ -164,7 +164,8 @@ private struct LibraryMediaViewer: View {
     }
 
     private var items: [MediaItem] {
-        LibraryScreen.visible(store.entries, filter).map {
+        // 11-21: entries are newest-first; reverse so the viewer runs oldest -> newest with the newest on the right.
+        LibraryScreen.visible(store.entries, filter).reversed().map {
             MediaItem(id: $0.id, kind: $0.meta.kind == .video ? .video : .picture, source: .library($0.id),
                       libraryID: $0.id, recipeID: $0.meta.recipeID, enhanced: $0.meta.enhanced)
         }

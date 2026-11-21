@@ -1135,7 +1135,8 @@ struct MakeMediaViewer: View {
     }
 
     private var items: [MediaItem] {
-        store.results.reversed().map {
+        // 11-21: oldest -> newest, so the newest sits on the right (a left-to-right timeline).
+        store.results.map {
             if let url = $0.videoURL {
                 return MediaItem(id: $0.id, kind: .video, source: .chatVideo(url), libraryID: $0.libraryID, note: $0.note)
             }

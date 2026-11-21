@@ -524,6 +524,7 @@ struct ZoomableImage: UIViewRepresentable {
         scroll.showsVerticalScrollIndicator = false
         scroll.backgroundColor = .black
         scroll.contentInsetAdjustmentBehavior = .never
+        scroll.isScrollEnabled = false            // 11-21: no panning until zoomed, so the gallery pager snaps cleanly
         let view = UIImageView(image: image)
         view.contentMode = .scaleAspectFit
         view.translatesAutoresizingMaskIntoConstraints = false
@@ -547,6 +548,7 @@ struct ZoomableImage: UIViewRepresentable {
         if context.coordinator.imageView?.image !== image {
             context.coordinator.imageView?.image = image
             scroll.setZoomScale(1, animated: false)
+            scroll.isScrollEnabled = false        // back to a fresh image at 1x: let the pager own the swipe again
         }
     }
 
@@ -556,6 +558,11 @@ struct ZoomableImage: UIViewRepresentable {
         weak var imageView: UIImageView?
 
         func viewForZooming(in scrollView: UIScrollView) -> UIView? { imageView }
+
+        // 11-21: allow panning only while zoomed in; at 1x the TabView pager gets the swipe and snaps cleanly.
+        func scrollViewDidZoom(_ scrollView: UIScrollView) {
+            scrollView.isScrollEnabled = scrollView.zoomScale > scrollView.minimumZoomScale
+        }
 
         @objc func doubleTapped(_ gesture: UITapGestureRecognizer) {
             guard let scroll = gesture.view as? UIScrollView, let imageView else { return }

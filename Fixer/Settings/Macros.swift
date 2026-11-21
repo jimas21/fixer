@@ -34,9 +34,8 @@ struct MacroList: View {
                     } label: {
                         Label("Suggest macros", systemImage: "sparkles")
                     }
-                    // TODO: "Save current Make setup as a macro" needs Make's prompt and add-on picks, which live in
-                    // CreateScreen's private state. Not wired blind: add a hand-off from Make (a Macro built from
-                    // its prompt, `activeLoras` and Rules.pcSteps/pcGuidance) and call Desktop.saveMacro.
+                    Text("To save what you have set up in Make, press and hold the Model tile there and choose Save as macro.")
+                        .font(.footnote).foregroundStyle(.secondary)
                 }
                 if !macros.isEmpty {
                     Section("Saved macros") {

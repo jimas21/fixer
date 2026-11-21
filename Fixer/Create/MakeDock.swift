@@ -363,6 +363,13 @@ extension CreateScreen {
                 MakeTile(caption: "Model", value: r.name)
             }
             .buttonStyle(.plain)
+            .contextMenu {                                  // press and hold the Model tile
+                Button {
+                    macroName = "My macro"
+                    askMacroName = true
+                } label: { Label("Save as macro", systemImage: "square.and.arrow.down") }
+                .disabled(!canSaveMacro)
+            }
             .accessibilityLabel("Model: \(r.name)")
             .accessibilityHint(recipes.count > 1 ? "Opens the list of models" : "")
             Menu {
@@ -384,6 +391,36 @@ extension CreateScreen {
             .accessibilityLabel("Enhance my prompt")
             .accessibilityValue(enhanceOn ? "On" : "Off")
             .accessibilityHint(enhanceHint)
+        }
+    }
+
+    /// "Save as macro" needs the computer and something worth keeping: the user's words or an add-on.
+    var canSaveMacro: Bool {
+        guard desktop.isOn, mode == "picture" else { return false }
+        let words = (texts["prompt"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return !words.isEmpty || !activeLoras.isEmpty
+    }
+
+    /// Builds a macro from the form as it is now (the user's own words, not the recipe's prefix/suffix) and saves it.
+    func saveCurrentAsMacro() {
+        let typed = macroName.trimmingCharacters(in: .whitespacesAndNewlines)
+        var macro = Desktop.Macro()
+        macro.name = typed.isEmpty ? "My macro" : typed
+        macro.promptAdd = (texts["prompt"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        macro.negativeAdd = (texts["negative"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        macro.loras = activeLoras.map { Desktop.MacroLora(file: $0.name, strength: $0.strength) }
+        macro.cfg = numbers["cfg"]
+        macro.steps = numbers["steps"]
+        macro.model = recipeID.isEmpty ? nil : recipeID
+        macro.explicit = makeExplicit
+        let toSave = macro
+        Task {
+            do {
+                try await Desktop.shared.saveMacro(toSave)
+                macroResult = "Saved as a macro"
+            } catch {
+                macroResult = "Couldn't save the macro. Check that your computer is on."
+            }
         }
     }
 

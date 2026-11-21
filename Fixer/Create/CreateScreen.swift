@@ -466,6 +466,9 @@ struct CreateScreen: View {
     @State var startTick = 0
     @State var stopTick = 0
     @State var noteDismissed: String?
+    @State var askMacroName = false                    // "Save as macro": the name prompt
+    @State var macroName = "My macro"
+    @State var macroResult: String?                    // its outcome: "Saved as a macro" or why not
 
     struct LoraPick: Identifiable { let id = UUID(); var name: String; var strength: Double }
 
@@ -488,6 +491,9 @@ struct CreateScreen: View {
                 }
             }
             .tabBarClearance()
+            .alert(macroResult ?? "", isPresented: Binding(get: { macroResult != nil }, set: { if !$0 { macroResult = nil } })) {
+                Button("OK", role: .cancel) {}
+            }
             .toolbar(.hidden, for: .navigationBar)
             .toolbar {
                 ToolbarItemGroup(placement: .keyboard) {
@@ -575,6 +581,13 @@ struct CreateScreen: View {
             .onChange(of: startTick) { _, _ in noteDismissed = nil }
             .onChange(of: rawNote) { _, n in if n == nil { noteDismissed = nil } }
             .sheet(isPresented: $showQueue) { NavigationStack { QueueScreen(inSheet: true, chat: chat) } }
+            .alert("Save as macro", isPresented: $askMacroName) {
+                TextField("Name", text: $macroName)
+                Button("Cancel", role: .cancel) {}
+                Button("Save") { saveCurrentAsMacro() }
+            } message: {
+                Text("Keeps your words, add-ons and settings so you can add them to any picture later.")
+            }
             .sheet(isPresented: $showModels) { MakeModelSheet(recipes: shownRecipes, chosen: modelChoice) }
             .sheet(item: $quickSheet) { g in quickPickSheet(g) }     // 11-19: every option of one group at once
             .sheet(item: $tipSheet) { g in tipPickSheet(g) }

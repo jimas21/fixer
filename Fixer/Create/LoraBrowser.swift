@@ -141,6 +141,14 @@ struct LoraCard {
     let warnings: [String]
     let files: [String]
     let askFamily: Bool         // the computer couldn't tell which model it is for: the owner picks
+    let description: String     // plain text from the creator (untrusted: never rendered as markdown)
+    let gallery: [String]       // example-image links, already safe-filtered by the computer
+    let up: Int
+    let down: Int
+    let downloads: Int
+    let creator: String
+    let tags: [String]
+    let strength: Double?       // suggested starting strength
 
     /// It was made for a model this computer doesn't have: there is nothing to add.
     var refused: Bool { family.isEmpty && !askFamily }
@@ -157,6 +165,15 @@ struct LoraCard {
         warnings = notes
         files = d["files"] as? [String] ?? []
         askFamily = d["needs_pick"] as? Bool ?? false
+        description = d["description"] as? String ?? ""
+        gallery = (d["gallery"] as? [[String: Any]] ?? []).compactMap { $0["url"] as? String }
+        let r = d["rating"] as? [String: Any]
+        up = (r?["up"] as? NSNumber)?.intValue ?? 0
+        down = (r?["down"] as? NSNumber)?.intValue ?? 0
+        downloads = (r?["downloads"] as? NSNumber)?.intValue ?? 0
+        creator = d["creator"] as? String ?? ""
+        tags = d["tags"] as? [String] ?? []
+        strength = (d["strength"] as? NSNumber)?.doubleValue
     }
 }
 
@@ -238,46 +255,63 @@ struct LoraBrowser: View {
     // MARK: browse
 
     private var browsePage: some View {
-        List {
-            Section {
-                Picker("From", selection: $source) {
-                    Text("Civitai").tag("civitai")
-                    Text("Hugging Face").tag("hf")
+        VStack(spacing: 0) {
+            browseControls
+            browseResults
+        }
+        .task(id: facetKey) {
+            if loadedKey == facetKey, !results.isEmpty { return }      // back from a details page: keep the list
+            await search(reset: true)
+            if !Task.isCancelled { loadedKey = facetKey }
+        }
+    }
+
+    /// Source, search, engines, sort and categories: pinned above the results, which scroll underneath.
+    private var browseControls: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Picker("From", selection: $source) {
+                Text("Civitai").tag("civitai")
+                Text("Hugging Face").tag("hf")
+            }
+            .pickerStyle(.segmented)
+            HStack {
+                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                TextField("Search add-ons", text: $query)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .submitLabel(.search)
+                    .onSubmit { category = ""; Task { await search(reset: true) } }
+                if !query.isEmpty {
+                    Button { query = ""; Task { await search(reset: true) } } label: {
+                        Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+                if searching { ProgressView() }
+            }
+            .padding(.horizontal, 12).padding(.vertical, 8)
+            .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Fx.tile))
+            if source == "civitai" {
+                engineChips
+                Picker("Sort", selection: $sort) {
+                    Text("Popular").tag("popular")
+                    Text("Trending").tag("trending")
+                    Text("Top rated").tag("rated")
+                    Text("Newest").tag("new")
                 }
                 .pickerStyle(.segmented)
-                HStack {
-                    Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                    TextField("Search add-ons", text: $query)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .submitLabel(.search)
-                        .onSubmit { category = ""; Task { await search(reset: true) } }
-                    if !query.isEmpty {
-                        Button { query = ""; Task { await search(reset: true) } } label: {
-                            Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                    if searching { ProgressView() }
-                }
-            } footer: {
-                Text(source == "hf"
-                     ? "Hugging Face add-ons for \(modelName)."
-                     : "Browse the Civitai community — pick engines, a category, or search. Each add-on is checked to fit before it downloads.")
+                categoryChips
+            } else {
+                Text("Hugging Face add-ons for \(modelName).")
+                    .font(.footnote).foregroundStyle(.secondary)
             }
-            if source == "civitai" {
-                Section("Engines") { engineChips }
-                Section("Sort") {
-                    Picker("Sort", selection: $sort) {
-                        Text("Popular").tag("popular")
-                        Text("Trending").tag("trending")
-                        Text("Top rated").tag("rated")
-                        Text("Newest").tag("new")
-                    }
-                    .pickerStyle(.segmented)
-                }
-                Section("Categories") { categoryChips }
-            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.bottom, 8)
+    }
+
+    private var browseResults: some View {
+        List {
             if let searchNote {
                 Section {
                     Text(searchNote).font(.footnote).foregroundStyle(.secondary)
@@ -298,11 +332,6 @@ struct LoraBrowser: View {
                     }
                 }
             }
-        }
-        .task(id: facetKey) {
-            if loadedKey == facetKey, !results.isEmpty { return }      // back from a details page: keep the list
-            await search(reset: true)
-            if !Task.isCancelled { loadedKey = facetKey }
         }
     }
 
@@ -326,7 +355,6 @@ struct LoraBrowser: View {
             }
             .padding(.vertical, 2)
         }
-        .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
     }
 
     private var categoryChips: some View {
@@ -343,7 +371,6 @@ struct LoraBrowser: View {
             }
             .padding(.vertical, 2)
         }
-        .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
     }
 
     private func facetChip(_ label: String, on: Bool, _ tap: @escaping () -> Void) -> some View {
@@ -388,7 +415,7 @@ struct LoraBrowser: View {
             Spacer(minLength: 0)
             Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
         }
-        .frame(minHeight: 56)
+        .frame(minHeight: 76)
         .contentShape(Rectangle())
     }
 
@@ -476,13 +503,56 @@ private struct LoraThumbView: View {
                 Image(systemName: "photo").foregroundStyle(Fx.secondaryText)
             }
         }
-        .frame(width: 56, height: 56)
+        .frame(width: 76, height: 76)
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .task(id: thumb) {
             image = nil
             guard let thumb else { return }
             let loaded = try? await Desktop.shared.loraThumb(thumb)
             image = loaded
+        }
+        .accessibilityHidden(true)
+    }
+}
+
+/// A card's description: plain text (never markdown: it is the creator's, untrusted), cut short with a "more".
+private struct LoraDescription: View {
+    let text: String
+    @State private var open = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(text)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .lineLimit(open ? nil : 4)
+            if text.count > 160 {
+                Button(open ? "Less" : "More") { open.toggle() }
+                    .font(.footnote.weight(.medium))
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Fx.accent)
+            }
+        }
+    }
+}
+
+/// One example picture in a card's gallery, fetched larger through the computer.
+private struct LoraGalleryImage: View {
+    let url: String
+    @State private var image: UIImage?
+
+    var body: some View {
+        ZStack {
+            Fx.tile
+            if let image {
+                Image(uiImage: image).resizable().scaledToFit()
+            } else {
+                ProgressView()
+            }
+        }
+        .task(id: url) {
+            image = nil
+            image = try? await Desktop.shared.loraThumb(url, max: 768)
         }
         .accessibilityHidden(true)
     }
@@ -541,6 +611,46 @@ struct LoraCardView: View {
 
     @ViewBuilder
     private func details(_ c: LoraCard) -> some View {
+        if !c.gallery.isEmpty {
+            Section {
+                TabView {
+                    ForEach(c.gallery, id: \.self) { u in LoraGalleryImage(url: u) }
+                }
+                .tabViewStyle(.page)
+                .frame(height: 320)
+                .listRowInsets(EdgeInsets())
+            }
+        }
+        if !c.description.isEmpty || !c.creator.isEmpty || !c.tags.isEmpty || c.up + c.down + c.downloads > 0 {
+            Section {
+                if !c.creator.isEmpty { LabeledContent("By", value: c.creator) }
+                if c.up + c.down + c.downloads > 0 {
+                    HStack(spacing: 14) {
+                        Text("👍 \(c.up)")
+                        Text("👎 \(c.down)")
+                        if c.downloads > 0 { Text("\(c.downloads) downloads").foregroundStyle(.secondary) }
+                    }
+                    .font(.subheadline)
+                }
+                if let s = c.strength {
+                    LabeledContent("Suggested strength", value: String(format: "%.1f", s))
+                }
+                if !c.tags.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            ForEach(c.tags, id: \.self) { t in
+                                Text(t)
+                                    .font(.caption)
+                                    .padding(.horizontal, 8).padding(.vertical, 4)
+                                    .background(Capsule().fill(Fx.tile))
+                                    .foregroundStyle(Fx.secondaryText)
+                            }
+                        }
+                    }
+                }
+                if !c.description.isEmpty { LoraDescription(text: c.description) }
+            }
+        }
         Section {
             LabeledContent("Size", value: LoraEntry.sizeText(c.size))
             LabeledContent("Works with", value: fitsText(c))

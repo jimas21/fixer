@@ -478,6 +478,14 @@ extension CreateScreen {
                 }
             } label: { MakeTile(caption: "How", value: redraw ? "Redraw it" : "Keep the rest") }
                 .accessibilityLabel("How: \(redraw ? "Redraw it" : "Keep the rest")")
+            if redraw {
+                Button { useOriginalLoras.toggle() } label: {
+                    MakeTile(caption: "Add-ons", value: useOriginalLoras ? "Original's" : "None", on: useOriginalLoras)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Use the original's add-ons")
+                .accessibilityValue(useOriginalLoras ? "On" : "Off")
+            }
             Button { enhanceEdits.toggle() } label: {
                 MakeTile(caption: "Enhance", value: enhanceOn ? "On" : "Off", systemImage: "sparkles", on: enhanceOn)
             }

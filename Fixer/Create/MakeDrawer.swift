@@ -353,12 +353,38 @@ extension CreateScreen {
                 Text("No add-ons for \(loraModelName) on your computer yet.")
                     .font(.footnote).foregroundStyle(Fx.secondaryText)
             }
+            if !fitting.isEmpty {
+                let onCount = fitting.filter { isLoraOn($0) }.count
+                Button {
+                    withAnimation(.snappy(duration: 0.2)) { loraListOpen.toggle() }
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.semibold)).foregroundStyle(Fx.secondaryText)
+                            .rotationEffect(.degrees(loraListOpen ? 90 : 0))
+                        Text("Your add-ons (\(fitting.count))")
+                        if onCount > 0 {
+                            Text("\(onCount) on")
+                                .font(.caption2.weight(.semibold))
+                                .padding(.horizontal, 7).padding(.vertical, 2)
+                                .background(Capsule().fill(Fx.accent.opacity(0.18)))
+                                .foregroundStyle(Fx.accent)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .frame(minHeight: 44)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
             // 11-19: the 18+ add-ons (listed only while 18+ is on) in their own flame block under the everyday ones.
+            if loraListOpen {
             ForEach(fitting.filter { !$0.explicit }) { e in
                 SwipeToDelete(onDelete: { removingLora = e }) { loraRow(e) }
             }
+            }
             let adultLoras = fitting.filter(\.explicit)
-            if !adultLoras.isEmpty {
+            if loraListOpen, !adultLoras.isEmpty {
                 HStack(spacing: 4) {
                     Image(systemName: "flame.fill")
                     Text("18+ add-ons").font(.footnote.weight(.semibold))
@@ -462,6 +488,14 @@ extension CreateScreen {
                         Text(pct == 100 ? "100% · Normal" : "\(pct)%")
                             .font(.footnote).monospacedDigit().foregroundStyle(Fx.secondaryText)
                     }
+                    HStack {
+                        Text("← weaker")
+                        Spacer()
+                        Text("Normal at 100%")
+                        Spacer()
+                        Text("stronger →")
+                    }
+                    .font(.caption).foregroundStyle(Fx.secondaryText)
                 } else {
                     Text("Turn it on to set its strength.").font(.caption).foregroundStyle(Fx.secondaryText)
                 }

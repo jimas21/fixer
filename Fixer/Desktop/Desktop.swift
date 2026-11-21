@@ -683,9 +683,11 @@ final class Desktop: ObservableObject {
     }
 
     /// A search result's small preview, fetched through the computer (nothing is kept on the phone).
-    func loraThumb(_ thumb: String) async throws -> UIImage? {
+    func loraThumb(_ thumb: String, max: Int? = nil) async throws -> UIImage? {
         guard let link else { throw PCError.notPaired }
-        for try await f in call("lora_thumb", ["url": thumb], link: link) where f["t"] as? String == "info" {
+        var payload: [String: Any] = ["url": thumb]
+        if let max { payload["max"] = max }
+        for try await f in call("lora_thumb", payload, link: link) where f["t"] as? String == "info" {
             guard let b64 = f["thumb"] as? String, let data = Data(base64Encoded: b64) else { return nil }
             return UIImage(data: data)
         }
@@ -696,7 +698,7 @@ final class Desktop: ObservableObject {
     /// from first. Each choice carries the link that leads to just that file.
     func loraInspect(link text: String?, ref: String?) async throws -> LoraInspection {
         guard let link else { throw PCError.notPaired }
-        var payload: [String: Any] = [:]
+        var payload: [String: Any] = ["safe": !Rules.shared.explicitNow]    // gallery is filtered by the 18+ switch
         if let text { payload["link"] = text }
         if let ref { payload["source_id"] = ref }
         for try await f in call("lora_inspect", payload, link: link) where f["t"] as? String == "info" {

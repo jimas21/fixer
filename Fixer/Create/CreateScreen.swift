@@ -98,6 +98,7 @@ struct CreateResult: Identifiable {
     var videoURL: URL?                      // set for a video: `image` is then its first frame
     var explicit: String?                   // a video's Explicit setting: off, on or auto
     var enhanced: String?                   // the prompt the computer wrote from my words (Enhance on)
+    var loras: [LoraSetting] = []           // the add-ons it was made with (a redraw can reuse them)
 }
 
 /// Pictures made on the Create screen: in memory only (never written to disk); "Clear everything" empties it.
@@ -261,7 +262,7 @@ final class CreateStore: ObservableObject {
     /// rest, and "redraw" has the picture's own model redraw it with the change added to its words. `explicit` is the
     /// Explicit add-on switch to use for a Qwen-Image 2.1 edit (nil = the switch the picture was made with).
     func revise(baseID: UUID, change: String, mode requested: String, mask: CGImage?, strength: Double?,
-                editor: String = "auto", explicit: String? = nil) {
+                editor: String = "auto", explicit: String? = nil, useLoras: Bool = true) {
         guard let base = results.first(where: { $0.id == baseID }), let cg = base.image.cgImage,
               let jpeg = Desktop.jpeg(cg, longest: 1536, quality: 0.92) else { return }
         let change = change.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -291,6 +292,13 @@ final class CreateStore: ObservableObject {
             values["prompt"] = original.isEmpty ? change : "\(original). \(change)"
             values["image_mode"] = "start"
             values["strength"] = 0.55
+            if useLoras {                                                     // the picture's own add-ons again
+                values["loras"] = base.loras.map { l -> [String: Any] in
+                    var d: [String: Any] = ["name": l.name, "strength": l.strength]
+                    if let t = l.triggers { d["triggers"] = t }
+                    return d
+                }
+            }
             for (k, v) in base.menus { values[k] = v }
             for (k, v) in base.numbers where k != "count" { values[k] = v }
         }
@@ -349,7 +357,7 @@ final class CreateStore: ObservableObject {
                             let made = CreateResult(image: ui, seed: seed, recipeID: base.recipeID, texts: texts,
                                                     numbers: base.numbers, menus: base.menus, shape: base.shape,
                                                     toggles: base.toggles, note: "Changed: \(change)", libraryID: libraryID,
-                                                    enhanced: enhanced)
+                                                    enhanced: enhanced, loras: mode == "redraw" && useLoras ? base.loras : [])
                             self.results.append(made)
                             self.revisedResultID = made.id
                         }
@@ -397,6 +405,8 @@ struct CreateScreen: View {
     @State var loraLibrary: [LoraEntry] = []        // every LoRA on the computer, with the model family each fits
     @State var videoLoraFamily = "wan22"
     @State var showLoraBrowser = false
+    @AppStorage("make.loraListOpen") var loraListOpen = false     // the installed add-ons list: collapsed until opened
+    @AppStorage("make.useOriginalLoras") var useOriginalLoras = true   // a redraw reuses the picture's own add-ons
     @State var loading = true
     @State var failed: String?
     @State var running: Task<Void, Never>?
@@ -677,7 +687,8 @@ struct CreateScreen: View {
         guard !words.isEmpty, w.videoURL == nil else { return }
         Self.hideKeyboard()
         store.revise(baseID: w.id, change: words, mode: changeMode, mask: nil, strength: nil, editor: editor,
-                     explicit: changeMode == "edit" && editor == "qwen21" ? addonValue : nil)
+                     explicit: changeMode == "edit" && editor == "qwen21" ? addonValue : nil,
+                     useLoras: useOriginalLoras)
         changeText = ""
     }
 
@@ -1012,7 +1023,8 @@ struct CreateScreen: View {
                             let libraryID = LibraryStore.shared.add(picture: ui, meta: meta)
                             store.results.append(CreateResult(image: ui, seed: seed, recipeID: r.id, texts: formTexts,
                                                               numbers: formNumbers, menus: formMenus, shape: formShape,
-                                                              toggles: formToggles, libraryID: libraryID, enhanced: enhanced))
+                                                              toggles: formToggles, libraryID: libraryID, enhanced: enhanced,
+                                                              loras: formLoras))
                         }
                     }
                 }

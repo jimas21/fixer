@@ -86,19 +86,40 @@ final class MakeRecipeStore: ObservableObject {
     @Published private(set) var catalog: MakeCatalog?
     private var loading = false
 
+    private var retry: Task<Void, Never>?
+
     func refresh() async {
         guard Desktop.shared.isPaired, !loading else { return }
+        retry?.cancel(); retry = nil
+        if await fetch() { return }
+        // 11-21: Make opened while the computer wasn't answering showed no styles until it was opened again. Keep
+        // trying in the background (a few seconds apart at first, then every 30 s, for 10 minutes) and fill them in
+        // the moment it answers.
+        retry = Task { [weak self] in
+            for wait in [3, 5, 10, 20] + Array(repeating: 30, count: 18) {
+                try? await Task.sleep(for: .seconds(wait))
+                guard let self, !Task.isCancelled, Desktop.shared.isPaired else { return }
+                if await self.fetch() { return }
+            }
+        }
+    }
+
+    /// One try. True when it's settled (loaded, or the computer is too old to have styles).
+    private func fetch() async -> Bool {
+        guard !loading else { return false }
         loading = true
         defer { loading = false }
         do {
             catalog = try await Desktop.shared.makeRecipes()
+            return true
         } catch {
-            if Desktop.isOldComputer(error) { catalog = nil }
+            if Desktop.isOldComputer(error) { catalog = nil; return true }
+            return false
         }
     }
 
     /// Clear everything.
-    func clear() { catalog = nil }
+    func clear() { retry?.cancel(); retry = nil; catalog = nil }
 }
 
 // MARK: - Form state that belongs to the recipes

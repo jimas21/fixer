@@ -245,15 +245,18 @@ extension CreateScreen {
         return picks + always
     }
 
-    /// The names of add-ons the computer will leave out: it uses 4 at once, a video pair counting as 2, and keeps
-    /// them in this order (the same walk as the computer's).
+    /// How many add-ons one job uses at once — live from the computer (the `lora_cap` knob), not hardcoded.
+    var loraCap: Int { recipeStore.catalog?.loraCap ?? 4 }
+
+    /// The names of add-ons the computer will leave out: it uses `loraCap` at once, a video pair counting as 2, and
+    /// keeps them in this order (the same walk as the computer's).
     var loraLeftOut: [String] {
         var total = 0
         var out: [String] = []
         for p in activeLoras {
             let e = loraLibrary.first { $0.file == p.name }
             let weight = (e?.pair ?? false) ? 2 : 1
-            if total + weight <= 4 { total += weight } else { out.append(e?.name ?? p.name) }
+            if total + weight <= loraCap { total += weight } else { out.append(e?.name ?? p.name) }
         }
         return out
     }
@@ -345,7 +348,7 @@ extension CreateScreen {
         let leftOut = loraLeftOut
         return VStack(alignment: .leading, spacing: 12) {
             if !leftOut.isEmpty {
-                Text("Only 4 add-ons can be used at once (a video pair counts as 2). Left out: "
+                Text("Only \(loraCap) add-ons can be used at once (a video pair counts as 2). Left out: "
                      + leftOut.joined(separator: ", ") + ".")
                     .font(.caption).foregroundStyle(.orange)
             }

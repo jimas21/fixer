@@ -231,6 +231,8 @@ struct AdultChip: View {
                     Text("18+")
                         .font(.caption.weight(.bold))
                         .monospacedDigit()
+                        .lineLimit(1)
+                        .fixedSize()                               // never wrap "18+" onto a second row
                         .transition(.opacity.combined(with: .scale(scale: 0.8, anchor: .leading)))
                 }
             }

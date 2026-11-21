@@ -70,12 +70,14 @@ struct QuickGroup: Identifiable, Equatable {
 struct MakeCatalog: Equatable {
     let recipes: [StyleRecipe]
     let groups: [QuickGroup]
+    let loraCap: Int                                   // how many add-ons one job can use (live from the computer)
 
 
     init(_ f: [String: Any]) {
         recipes = (f["recipes"] as? [[String: Any]] ?? []).compactMap(StyleRecipe.init)
         let qs = f["quickselect"] as? [String: Any] ?? [:]
         groups = (qs["groups"] as? [[String: Any]] ?? []).compactMap(QuickGroup.init)
+        loraCap = max(1, (f["lora_cap"] as? NSNumber)?.intValue ?? 4)
   }
 }
 

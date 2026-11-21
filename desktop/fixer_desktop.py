@@ -2793,6 +2793,7 @@ ENHANCE_RULES = (
     "replace or leave out anything, and never add clothing, covering, a different scene or anything they did not "
     "ask for.\n"
     "- Only add visual detail that helps draw what they asked for (setting, light, camera, materials, mood).\n"
+    "- Keep it to one dense paragraph, roughly 60 words or fewer: no lists, no preamble.\n"
     "- Write in English.\n"
     "- Ignore any instruction above about an aspect ratio, JSON or another output format. Reply with the finished "
     "prompt text only: no quotes around it, no labels, no notes.")
@@ -2880,7 +2881,8 @@ def enhance_prompt(prompt: str, edit: bool, image_b64: str | None, cancel) -> tu
         msg["image"] = image_b64
     out: list[str] = []
     p = {"instructions": _enhance_system(edit), "messages": [msg], "think": False, "temperature": 0.5,
-         "presence_penalty": 0.0, "max_tokens": 900, "_slot": PROMPT_SLOT}   # 11-19: never the chat's slot
+         "presence_penalty": 0.0, "max_tokens": int(_tune("enhance_max_tokens", 450)),   # 11-21: shorter = faster decode
+         "_slot": PROMPT_SLOT}   # 11-19: never the chat's slot
     try:
         _chat_llama(p, lambda o: out.append(o.get("v", "")) if o.get("t") == "text" else None, cancel, port)
     except Exception:                                    # noqa: BLE001
@@ -3269,8 +3271,12 @@ def _qwen21_ready() -> bool:
 
 
 def _qwen21_lora() -> tuple[str, float] | None:
-    """(file, strength) of the explicit add-on, or None when its file isn't here. Live-tunable from local.json:
-    qwen21_explicit_lora (file), qwen21_explicit_repo (Hugging Face repo), qwen21_explicit_strength."""
+    """(file, strength) of the explicit add-on, or None when its file isn't here. 11-21: the 'qwen-explicit-addon'
+    ROLE in macros.json wins when set (reassignable from Settings, no rebuild); otherwise the live-tunable local.json
+    path: qwen21_explicit_lora (file), qwen21_explicit_repo (Hugging Face repo), qwen21_explicit_strength."""
+    role = _role_lora("qwen-explicit-addon")
+    if role is not None:
+        return role
     name = _tune_text("qwen21_explicit_lora", QWEN21_LORA_FILE)
     strength = max(0.0, min(2.0, _tune("qwen21_explicit_strength", 1.0)))
     snap = _snapshot(_tune_text("qwen21_explicit_repo", QWEN21_LORA_REPO))
@@ -4913,6 +4919,12 @@ def _recipe_controls(r: dict) -> list[dict]:
          "help": "The starting point of a picture. Random gives a new picture each time; the same seed with the same "
                  "settings gives the same picture again, so you can change one thing and compare."},
     ]
+    if r.get("builder") in ("chroma", "sdxl", "qwen21"):   # 11-21: the Realism slider (candid <-> studio), main setting
+        c.insert(next(i for i, x in enumerate(c) if x["key"] == "cfg") + 1,
+                 {"key": "realism", "label": "Realism", "kind": "float", "min": 0.0, "max": 1.0, "step": 0.1,
+                  "default": 0.0, "left": "Studio-clean", "right": "Candid, real",
+                  "help": "Slide right for phone-snapshot looks: real skin, flash, uneven light, not a studio shot. "
+                          "0 leaves your picture exactly as it was."})
     if r.get("builder") == "qwen21" and "qwen21" in _adult_models():   # 11-19: an everyday model has no add-on menu
         lora = _qwen21_lora()
         ctl = {"key": "explicit", "label": "Explicit add-on", "kind": "menu", "options": ["Auto", "On", "Off"],
@@ -5027,6 +5039,86 @@ def _apply_toggles(r: dict, v: dict) -> dict:
     return v
 
 
+# ----- Realism (11-21) -------------------------------------------------------------------------------------------
+# A single "Realism" slider (0..1) nudges a picture from studio-clean toward a candid phone snapshot. It is a built-in
+# MACRO (see the roles & macros store): candid phrasing is added to the prompt, anti-studio terms to the negative, CFG
+# is lowered, and a LoRA assigned to the "realism" role rides along through _job_loras (so 18+ filtering and the cap
+# still apply). 0, or any non-photo model, leaves the picture exactly as it was. Tiers are cumulative. The owner can
+# edit every number/phrase by saving a macro id "realism" (merged key-by-key over this default) or deleting it to reset.
+REALISM_DEFAULT = {
+    "id": "realism", "name": "Realism (candid <-> studio)", "builtin": True,
+    "lora_role": "realism", "lora_scale": 1.0, "cfg_drop": 0.8, "cfg_floor": 1.5,
+    "prompt": [
+        [0.15, {"p": "Phone snapshot. Uneven natural light",
+                "z": "A phone snapshot in uneven natural light"}],
+        [0.45, {"p": "On-camera flash. Visible film grain. Real skin texture with pores",
+                "z": "on-camera flash, visible grain, real skin texture with pores"}],
+        [0.75, {"p": "Slightly off-centre, unposed, cluttered background. Not a studio shot",
+                "z": "slightly off-centre, unposed, cluttered everyday background, not a studio shot"}],
+    ],
+    "negative": [
+        [0.15, "studio lighting, softbox, backdrop"],
+        [0.45, "professional photography, retouched, airbrushed, flawless skin, perfect lighting"],
+        [0.75, "bokeh, cinematic, glossy, magazine, dslr, 85mm portrait"],
+    ],
+}
+
+
+def _realism_macro() -> dict:
+    """REALISM_DEFAULT with any owner edits (a macro id 'realism' in macros.json) merged over it, key by key."""
+    try:
+        for m in (_macros().get("macros") or []):
+            if m.get("id") == "realism":
+                return {**REALISM_DEFAULT, **{k: val for k, val in m.items() if val is not None}}
+    except Exception:                                    # noqa: BLE001
+        pass
+    return dict(REALISM_DEFAULT)
+
+
+def _apply_realism(r: dict, v: dict) -> dict:
+    """Fold the Realism slider (v['realism'], 0..1) into prompt / negative / cfg / loras. No-op at <0.05 or on a
+    non-photo model, so a picture is only ever touched when the owner asks for it."""
+    try:
+        t = float(v.get("realism") or 0)
+    except (TypeError, ValueError):
+        t = 0.0
+    builder = r.get("builder", "")
+    if t < 0.05 or builder not in ("chroma", "sdxl", "qwen21"):
+        return v
+    macro = _realism_macro()
+    key = "z" if _prompt_style(r) == "zimage" else "p"   # qwen21 uses positive-only phrasing at guidance 1
+    v = dict(v)
+    have = (v.get("prompt") or "").lower()
+    adds = []
+    for thr, phr in (macro.get("prompt") or []):
+        if t + 1e-9 >= float(thr):
+            text = (phr or {}).get(key) or ""
+            if text and text.lower() not in have:
+                adds.append(text)
+                have += " " + text.lower()
+    if adds:
+        base = (v.get("prompt") or "").strip().rstrip(".")
+        v["prompt"] = ". ".join([x for x in [base] + adds if x])
+    if builder in ("chroma", "sdxl"):                    # qwen21 at cfg 1.0: negatives do nothing, cfg must stay
+        if r.get("negative"):
+            negs = [n for thr, n in (macro.get("negative") or []) if t + 1e-9 >= float(thr) and n]
+            if negs:
+                base = (v.get("negative") or "").strip() or r.get("default_negative", CHROMA_NEGATIVE)
+                v["negative"] = ", ".join([base] + negs)
+        try:
+            cfg = float(v.get("cfg", r["defaults"].get("cfg", 3.5)))
+            v["cfg"] = max(float(macro.get("cfg_floor", 1.5)), cfg - float(macro.get("cfg_drop", 0.8)) * t)
+        except (TypeError, ValueError, KeyError):
+            pass
+    rl = _role_lora(str(macro.get("lora_role", "realism")))   # None until the owner assigns a realism LoRA in Settings
+    if rl:
+        file, strength = rl
+        if not any(x.get("name") == file for x in (v.get("loras") or [])):
+            scaled = round(strength * float(macro.get("lora_scale", 1.0)) * t, 2)
+            v["loras"] = [{"name": file, "strength": scaled}] + list(v.get("loras") or [])   # first so the cap keeps it
+    return v
+
+
 def job_comfy_recipes(p: dict, emit, cancel):
     """The Create screen's list: recipes whose files are on this computer, their controls, and the LoRA files.
     11-19: answers at once. It used to start ComfyUI first (COMFY.ensure(), a 25-110 s cold start) before sending a
@@ -5107,6 +5199,8 @@ def _make_catalog() -> dict:
                 nums["steps"] = float(d["steps"])
             if d.get("cfg") is not None:
                 nums["cfg"] = float(d["cfg"])
+            if d.get("realism") is not None:
+                nums["realism"] = float(d["realism"])
             if d.get("shift") is not None and r.get("uses_shift", True):
                 nums["shift"] = float(d["shift"])
             menus = {}
@@ -5120,7 +5214,8 @@ def _make_catalog() -> dict:
                          "negative": (d.get("negative") or None) if r.get("negative") else None})
         recipes.append(item)
     qs = data.get("quickselect") or {}
-    return {"recipes": recipes, "quickselect": {"groups": qs.get("groups") or []}}
+    return {"recipes": recipes, "quickselect": {"groups": qs.get("groups") or []},
+            "lora_cap": int(_tune("lora_cap", 4))}
 
 
 def job_make_recipes(p: dict, emit, cancel):
@@ -5156,6 +5251,9 @@ def job_comfy_run(p: dict, emit, cancel):
     v = _apply_toggles(r, v)
     v["sampler"], v["scheduler"] = _menu_value(v.get("sampler")), _menu_value(v.get("scheduler"))
     status = lambda s: emit({"t": "status", "v": s})  # noqa: E731
+    v = _apply_realism(r, v)                            # 11-21: the Realism slider's candid push (no-op at 0)
+    if float(v.get("realism") or 0) >= 0.05:
+        status("Candid look on")
     COMFY.ensure_current(status)                        # a freshly downloaded model, add-on, reader or LoRA shows up
     _room_for_pictures()
     if _worker_alive():
@@ -5763,9 +5861,91 @@ def _lora_lib_write(lib: dict) -> None:
     tmp.replace(COMFY_LORAS / "library.json")            # atomic
 
 
+# ----- Roles & macros (11-21) ------------------------------------------------------------------------------------
+# A phone-editable macros.json maps named ROLES (realism, skin-detail, undress-helper, qwen-explicit-addon, ...) to a
+# LoRA file + strength, and user MACROS bundle prompt/negative/LoRAs/settings. A feature asks for a ROLE instead of
+# naming a file, so the owner can reassign any add-on from Settings with no code change. Read fresh like library.json;
+# a missing or corrupt file falls back to a built-in default so startup never breaks and nothing is ever auto-written.
+MACROS_FILE = ROOT / "macros.json"
+BUILTIN_ROLES = ("realism", "skin-detail", "undress-helper", "qwen-explicit-addon")
+
+
+def _macros_defaults() -> dict:
+    """What a fresh install sees before anything is saved: the explicit add-on already assigned to its live-tunable
+    file/strength (so the Settings role editor shows it filled in), every other built-in role present but unset."""
+    roles = {r: {"file": "", "strength": 1.0, "enabled": False} for r in BUILTIN_ROLES}
+    roles["qwen-explicit-addon"] = {"file": _tune_text("qwen21_explicit_lora", QWEN21_LORA_FILE),
+                                    "strength": max(0.0, min(2.0, _tune("qwen21_explicit_strength", 1.0))),
+                                    "enabled": True}
+    return {"roles": roles, "macros": []}
+
+
+def _macros() -> dict:
+    """macros.json as {roles, macros}, read fresh every use. Absent or corrupt -> built-in defaults (never raises,
+    never writes). Missing sections are filled so callers index safely."""
+    try:
+        data = json.loads(MACROS_FILE.read_text(encoding="utf-8-sig"))
+        if not isinstance(data, dict):
+            raise ValueError
+    except Exception:                                    # noqa: BLE001  (absent / corrupt -> defaults)
+        return _macros_defaults()
+    d = _macros_defaults()
+    if isinstance(data.get("roles"), dict):
+        d["roles"].update({k: v for k, v in data["roles"].items() if isinstance(v, dict)})
+    if isinstance(data.get("macros"), list):
+        d["macros"] = [m for m in data["macros"] if isinstance(m, dict)]
+    return d
+
+
+def _macros_write(data: dict) -> None:
+    """Atomic write (tmp + replace), like _lora_lib_write."""
+    MACROS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = MACROS_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(MACROS_FILE)
+
+
+def _role_lora(name: str) -> tuple[str, float] | None:
+    """(file, strength) assigned to a role, or None when it is unset/disabled or its file is gone from the library.
+    Silent None is the fail-safe for cosmetic roles; a caller that must be loud (the explicit add-on) checks itself."""
+    r = (_macros().get("roles") or {}).get(name)
+    if not isinstance(r, dict) or not r.get("enabled"):
+        return None
+    fn = str(r.get("file") or "")
+    if not fn or not (fn in _lora_lib() or (COMFY_LORAS / fn).is_file()):
+        return None
+    return (fn, max(0.0, min(2.0, float(r.get("strength", 1.0)))))
+
+
+def _macro_loras(macro: dict) -> list[tuple[str, float]]:
+    """A macro's LoRA stack as (file, strength): {role:...} refs resolved through _role_lora, {file,strength} refs
+    taken directly; unresolved refs dropped, files deduped (first strength wins)."""
+    out: list[tuple[str, float]] = []
+    seen: set[str] = set()
+    for item in (macro.get("loras") or []):
+        if not isinstance(item, dict):
+            continue
+        if item.get("role"):
+            got = _role_lora(str(item["role"]))
+            if got is None:
+                continue
+            fn, st = got
+        elif item.get("file"):
+            fn = str(item["file"])
+            st = max(0.0, min(2.0, float(item.get("strength", 1.0))))
+        else:
+            continue
+        if fn in seen:
+            continue
+        seen.add(fn)
+        out.append((fn, st))
+    return out
+
+
 def _lora_is_explicit(fn: str, e: dict | None) -> bool:
-    """11-19: is this add-on 18+? The owner's own mark wins ("explicit", set on the phone); otherwise Civitai's NSFW
-    flag ("nsfw", recorded when it was added or looked up since), or explicit words in its name, file or triggers."""
+    """Is this add-on 18+? The owner's own mark wins ("explicit", the per-LoRA toggle they flip to show/hide); so an
+    add-on is auto-hidden by default when 18+ is off and can be flipped visible any time. Otherwise it's guessed from
+    Civitai's NSFW flag ("nsfw", recorded when added or looked up since) or explicit words in its name/file/triggers."""
     e = e or {}
     if isinstance(e.get("explicit"), bool):
         return e["explicit"]
@@ -5911,7 +6091,7 @@ def _job_loras(requested, family, extra_always_on: bool = True, allow_explicit: 
         for fn, e in lib.items():
             if e.get("always_on") and e.get("family") == family:
                 add(fn)
-    picked = _cap_pairs(picked)
+    picked = _cap_pairs(picked, int(_tune("lora_cap", 4)))
     triggers: list[str] = []
     for fn, _, e in picked:
         for t in (trig_over[fn] if fn in trig_over else (e.get("triggers") or [])):
@@ -6205,6 +6385,45 @@ def _civitai_description(model_id: str, v: dict) -> str:
     return "\n".join(parts)
 
 
+def _civitai_model(model_id: str) -> dict:
+    """The model's own record (description, stats, creator, tags). Guarded — a failure must never break a lookup."""
+    try:
+        return _api_json(f"{CIVITAI_API}/models/{model_id}") if model_id else {}
+    except Exception:                                    # noqa: BLE001
+        return {}
+
+
+def _civitai_text(html: str, cap: int = 2000) -> str:
+    """A Civitai description (HTML) as plain text: block tags -> newlines, <li> -> '- ', the rest stripped, blank
+    runs collapsed, length capped. Untrusted creator text — the phone must show it as plain text, never as markup."""
+    import html as _htmlmod
+    s = re.sub(r"(?i)<br\s*/?>", "\n", html or "")
+    s = re.sub(r"(?i)</(p|div|li|h[1-6]|tr)>", "\n", s)
+    s = re.sub(r"(?i)<li[^>]*>", "- ", s)
+    s = _htmlmod.unescape(re.sub(r"<[^>]+>", " ", s))
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n[ \t]*\n[ \t]*\n+", "\n\n", s).strip()
+    return (s[:cap].rstrip() + "…") if len(s) > cap else s
+
+
+def _civitai_gallery(images: list, safe: bool, cap: int = 12) -> list:
+    """Example images for the card: url, size, BlurHash placeholder and nsfw level. In safe mode only PG images
+    (nsfwLevel <= 1) are kept, matching the existing thumbnail filter. Per-image generation meta is not in this
+    payload (a separate withMeta call), so it is omitted here."""
+    out = []
+    for im in (images or []):
+        if not isinstance(im, dict) or not im.get("url"):
+            continue
+        lvl = int(im.get("nsfwLevel") or 0)
+        if safe and lvl > 1:
+            continue
+        out.append({"url": im["url"], "w": im.get("width"), "h": im.get("height"),
+                    "nsfw_level": lvl, "hash": im.get("hash")})
+        if len(out) >= cap:
+            break
+    return out
+
+
 def _plan_from_descriptor(d: dict) -> dict:
     """A source descriptor -> a download plan {source, source_id, name, base, triggers, files:[...]} or a
     {choices:[...]} when the user must pick one of several files."""
@@ -6222,10 +6441,19 @@ def _plan_from_descriptor(d: dict) -> dict:
         if not rows:
             raise UserFacing("That add-on has no safetensors file.")
         name = (v.get("model") or {}).get("name") or v.get("name") or f"civitai-{version}"
+        mj = _civitai_model(model)                       # 11-21: one guarded read, reused for description + card fields
+        desc_raw = "\n".join([str(v.get("description") or ""), str(mj.get("description") or "")])
+        st = mj.get("stats") or {}
         return {"source": "civitai", "source_id": f"civitai:{model}@{version}", "name": name,
                 "nsfw": bool((v.get("model") or {}).get("nsfw")),      # 11-19: Civitai's own 18+ flag
                 "base": v.get("baseModel", ""), "triggers": v.get("trainedWords") or [], "files": rows,
-                "strength": _suggested_strength(_civitai_description(model, v))}
+                "strength": _suggested_strength(desc_raw),
+                "images": v.get("images") or [], "version": v.get("name") or "", "description": desc_raw,
+                "url": f"https://civitai.com/models/{model}" if model else "",
+                "rating": {"up": int(st.get("thumbsUpCount") or 0), "down": int(st.get("thumbsDownCount") or 0),
+                           "downloads": int(st.get("downloadCount") or 0)},
+                "creator": (mj.get("creator") or {}).get("username") or "",
+                "tags": [str(t) for t in (mj.get("tags") or [])][:12]}
     if k in ("hf_repo", "hf_file"):
         repo = d["repo"]
         if k == "hf_file":
@@ -6310,6 +6538,58 @@ def job_lora_set(p: dict, emit, cancel):
     emit({"t": "info", "library": _lora_entries()})
 
 
+def job_macros_get(p: dict, emit, cancel):
+    """The role map + macros (read fresh), plus the LoRA library so the phone can offer choices."""
+    emit({"t": "info", "macros": _macros(), "library": _lora_entries()})
+
+
+def job_macros_set(p: dict, emit, cancel):
+    """Replace the whole roles/macros document (the phone sends its full edited copy). Validates that every named
+    file is on the computer and strengths are in range, and that macro ids are unique; writes atomically and echoes
+    the stored copy back. Mirrors job_lora_set's shape."""
+    roles_in, macros_in = p.get("roles"), p.get("macros")
+    if not isinstance(roles_in, dict) or not isinstance(macros_in, list):
+        raise UserFacing("That didn't look like a valid roles/macros document.")
+    lib = _lora_lib()
+
+    def known(fn: str) -> bool:
+        return bool(fn) and (fn in lib or (COMFY_LORAS / fn).is_file())
+
+    roles = {}
+    for name, r in roles_in.items():
+        if not isinstance(r, dict):
+            continue
+        fn = str(r.get("file") or "")
+        if fn and not known(fn):
+            raise UserFacing(f"The add-on for \"{name}\" isn't on your computer.")
+        roles[str(name)] = {"file": fn, "strength": max(0.0, min(2.0, float(r.get("strength", 1.0)))),
+                            "enabled": bool(r.get("enabled"))}
+    macros, seen_ids = [], set()
+    for m in macros_in:
+        if not isinstance(m, dict):
+            continue
+        mid = str(m.get("id") or "").strip()
+        if not mid or mid in seen_ids:
+            raise UserFacing("Each macro needs its own name.")
+        seen_ids.add(mid)
+        loras = []
+        for it in (m.get("loras") or []):
+            if not isinstance(it, dict):
+                continue
+            if it.get("role"):
+                loras.append({"role": str(it["role"])})
+            elif it.get("file"):
+                if not known(str(it["file"])):
+                    raise UserFacing("A macro names an add-on that isn't on your computer.")
+                loras.append({"file": str(it["file"]), "strength": max(0.0, min(2.0, float(it.get("strength", 1.0))))})
+        macros.append({"id": mid, "name": str(m.get("name") or mid),
+                       "prompt_add": str(m.get("prompt_add") or ""), "negative_add": str(m.get("negative_add") or ""),
+                       "loras": loras, "settings": m.get("settings") if isinstance(m.get("settings"), dict) else {},
+                       "model": (str(m["model"]) if m.get("model") else None), "explicit": bool(m.get("explicit"))})
+    _macros_write({"roles": roles, "macros": macros})
+    emit({"t": "info", "macros": _macros(), "library": _lora_entries()})
+
+
 def job_lora_remove(p: dict, emit, cancel):
     """Delete a file (or a whole pair) and its library entry."""
     fn = str(p.get("file") or "")
@@ -6388,7 +6668,8 @@ def job_lora_search(p: dict, emit, cancel):
     safe = p.get("safe") is True                         # 11-19: 18+ off on the phone -> no NSFW results or previews
 
     def _page(mode: str, term: str, cur) -> dict:
-        params = [("types", "LORA"), ("nsfw", "false" if safe else "true"), ("limit", "20"), ("sort", sort)]
+        params = [("types", "LORA"), ("types", "LoCon"), ("types", "DoRA"),   # 11-21: LoCon/DoRA were invisible before
+                  ("nsfw", "false" if safe else "true"), ("limit", "20"), ("sort", sort)]
         if period:
             params.append(("period", period))              # a window turns a sort into "trending this week/month"
         if term:
@@ -6444,20 +6725,25 @@ def job_lora_search(p: dict, emit, cancel):
 
 
 def job_lora_thumb(p: dict, emit, cancel):
-    """Fetch a preview image through the PC and return a 256 px JPEG (kept in memory only)."""
+    """Fetch a preview image through the PC and return a JPEG (kept in memory only). 11-21: `max` (128..1600) sets the
+    longest side for a bigger preview or a gallery image; the default 256 keeps older phones' small thumbnails."""
     from PIL import Image
     url = str(p.get("url") or "")
     if not url:
         raise UserFacing("No preview to show.")
+    try:
+        mx = max(128, min(1600, int(p.get("max") or 256)))
+    except (TypeError, ValueError):
+        mx = 256
     r = _open_checked(url, timeout=20)
     try:
-        raw = r.read(8 * 1024 * 1024)
+        raw = r.read((16 if mx >= 640 else 8) * 1024 * 1024)
     finally:
         r.close()
     img = Image.open(io.BytesIO(raw)).convert("RGB")
-    img.thumbnail((256, 256), Image.LANCZOS)
+    img.thumbnail((mx, mx), Image.LANCZOS)
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=85)
+    img.save(buf, format="JPEG", quality=88 if mx >= 640 else 85)
     emit({"t": "info", "thumb": base64.b64encode(buf.getvalue()).decode()})
 
 
@@ -6470,12 +6756,18 @@ def job_lora_inspect(p: dict, emit, cancel):
         return
     fam, warn = _resolve_family(plan.get("base", ""), None)
     size = sum((f.get("size") or 0) for f in plan["files"])
+    safe = p.get("safe") is True                         # 11-21: a safe-mode card hides R+ example images
     emit({"t": "info", "card": {
         "name": plan["name"], "source": plan["source"], "source_id": plan["source_id"],
         "size_mb": round(size / 1024 ** 2, 1) if size else None,
         "family": fam, "fits": _family_model_name(fam) if fam else None,
         "triggers": plan.get("triggers") or [], "files": [f["name"] for f in plan["files"]],
-        "warning": warn, "needs_pick": fam is None and warn is None}})
+        "warning": warn, "needs_pick": fam is None and warn is None,
+        # 11-21: richer discovery — old phone builds ignore these keys
+        "description": _civitai_text(plan.get("description") or ""), "version": plan.get("version") or "",
+        "gallery": _civitai_gallery(plan.get("images"), safe), "rating": plan.get("rating"),
+        "creator": plan.get("creator"), "tags": plan.get("tags") or [], "url": plan.get("url"),
+        "strength": plan.get("strength")}})
 
 
 def job_lora_add(p: dict, emit, cancel):
@@ -6552,14 +6844,16 @@ JOBS = {"status": job_status, "chat": job_chat, "image": job_image, "video": job
         "make_recipes": job_make_recipes,
         "lora_search": job_lora_search, "lora_thumb": job_lora_thumb, "lora_inspect": job_lora_inspect,
         "lora_add": job_lora_add, "lora_list": job_lora_list, "lora_set": job_lora_set,
-        "lora_remove": job_lora_remove, "lora_key": job_lora_key, "song": job_song,
+        "lora_remove": job_lora_remove, "lora_key": job_lora_key,
+        "macros_get": job_macros_get, "macros_set": job_macros_set, "song": job_song,
         "song_write": job_song_write, "album": job_album, "artwork": job_artwork,
         "stop_all": _no_job, "queue": _no_job, "free_memory": _no_job,   # these answer on the event loop
         "leave": _no_job, "uninstall": job_uninstall}
 # 11-17: never wait for the line, stream as before. (comfy_recipes never needed the card: it waited behind videos and
 # left Make on "Asking your computer..." for minutes.)
 IMMEDIATE = {"status", "search", "forget", "config", "comfy_recipes", "make_recipes", "chat", "installed",
-             "song_write", "uninstall"}
+             "song_write", "uninstall", "macros_get",
+             "lora_search", "lora_thumb", "lora_inspect"}   # 11-21: read-only lookups, never queue behind a job
 ASYNC_OPS = {"queue", "stop_all", "free_memory", "leave"}
 
 

@@ -60,17 +60,22 @@ final class MediaLoader: ObservableObject {
         guard images[item.id] == nil, videos[item.id] == nil else { return }
         switch item.source {
         case .memory(let ui):
-            images[item.id] = ui
+            images[item.id] = await Self.ready(ui)
         case .sessionPicture(let rid):
-            // Decode off the main thread; only the on-screen result is faulted, so a big session never decodes them all.
-            images[item.id] = await Task.detached(priority: .userInitiated) { MakeMedia.shared.image(rid) }.value
+            // Decrypt + decode AND force-decode (preparingForDisplay) off the main thread, so the image handed to the
+            // view is draw-ready and the pager never decodes a full-res bitmap mid-swipe. Only the on-screen result is
+            // faulted, so a big session never decodes them all.
+            images[item.id] = await Task.detached(priority: .userInitiated) {
+                let ui = MakeMedia.shared.image(rid)
+                return ui.preparingForDisplay() ?? ui
+            }.value
         case .chat(let conv, let file):
-            if let ui = History.image(file, in: conv) { images[item.id] = ui } else { failed.insert(item.id) }
+            if let ui = History.image(file, in: conv) { images[item.id] = await Self.ready(ui) } else { failed.insert(item.id) }
         case .chatVideo(let url):
             videos[item.id] = url
         case .library(let lid):
             if item.kind == .picture {
-                if let ui = await LibraryStore.shared.image(lid) { images[item.id] = ui } else { failed.insert(item.id) }
+                if let ui = await LibraryStore.shared.image(lid) { images[item.id] = await Self.ready(ui) } else { failed.insert(item.id) }
             } else if let url = await LibraryStore.shared.videoURL(lid) {
                 temp.insert(lid)
                 videos[item.id] = url
@@ -78,6 +83,19 @@ final class MediaLoader: ObservableObject {
                 failed.insert(item.id)
             }
         }
+    }
+
+    /// Force-decode the bitmap off the main thread so the pager doesn't hitch decoding it on the first draw.
+    private static func ready(_ ui: UIImage) async -> UIImage {
+        await ui.byPreparingForDisplay() ?? ui
+    }
+
+    /// 11-22: keep only the pictures near what's on screen. Swiping used to leave every viewed full-res bitmap decoded
+    /// in RAM until the viewer closed — unbounded memory, and more plaintext resident than needed. Callers pass a small
+    /// window (the current item and a couple on each side, which covers the pager's own mounted pages).
+    func prune(keep: Set<UUID>) {
+        for id in images.keys where !keep.contains(id) { images.removeValue(forKey: id) }
+        failed = failed.intersection(keep)
     }
 
     func cleanUp() {
@@ -118,6 +136,14 @@ struct MediaViewer: View {
     private var item: MediaItem? { items.first { $0.id == current } }
     private var image: UIImage? { item.flatMap { loader.images[$0.id] } }
 
+    /// Keep decoded pictures only within ±2 of the current page (comfortably covers the pager's own mounted pages, so
+    /// nothing visible blanks). Pages swiped back to beyond the window are rebuilt and reloaded by their `.task`.
+    private func pruneAround(_ id: UUID) {
+        guard let i = items.firstIndex(where: { $0.id == id }) else { return }
+        let lo = max(0, i - 2), hi = min(items.count - 1, i + 2)
+        loader.prune(keep: Set(items[lo...hi].map(\.id)))
+    }
+
     var body: some View {
         ZStack(alignment: .topTrailing) {
             Color.black.ignoresSafeArea()
@@ -151,6 +177,7 @@ struct MediaViewer: View {
         }
         .onChange(of: current) { _, _ in
             strokes = []; painting = false; words = ""; localNote = nil
+            pruneAround(current)
         }
         .onChange(of: items.isEmpty) { _, empty in if empty { dismiss() } }
         .onDisappear { loader.cleanUp() }

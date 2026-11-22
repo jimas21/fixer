@@ -357,8 +357,20 @@ struct MacroRecommend: View {
             }
             ForEach(results) { r in
                 Section(r.name.isEmpty ? "Untitled" : r.name) {
-                    Text(r.summary).font(.footnote).foregroundStyle(.secondary)
                     if !r.promptAdd.isEmpty { Text(r.promptAdd).font(.footnote).lineLimit(4) }
+                    // 11-22: show exactly what the macro will use — the add-ons (with strengths), model and settings
+                    // — not just a count, so you can see what you're adopting before you add it.
+                    ForEach(r.detailRows, id: \.key) { row in
+                        HStack(alignment: .top, spacing: 8) {
+                            if row.key.isEmpty {
+                                Text(row.value).font(.caption).foregroundStyle(.secondary)
+                            } else {
+                                Text(row.key).font(.caption).foregroundStyle(.secondary)
+                                Spacer(minLength: 8)
+                                Text(row.value).font(.caption).multilineTextAlignment(.trailing)
+                            }
+                        }
+                    }
                     if added.contains(r.id) {
                         Label("Added", systemImage: "checkmark").foregroundStyle(.secondary)
                     } else {

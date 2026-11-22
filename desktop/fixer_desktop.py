@@ -3100,6 +3100,20 @@ def _sanitize_macro(raw: dict, safe: bool) -> dict | None:
         return None
     import uuid
     patch = _clean_patch(raw, safe)
+    # 11-22: enforce add-on family against the chosen model. The AI is TOLD to match family but nothing enforced it,
+    # so a suggestion could pair an sdxl add-on with a chroma model — which then reached the phone and showed up as
+    # "not available here" when used. Only a model with a known family filters; an "unknown"-family add-on still
+    # passes (the computer couldn't sort it, so Make offers it everywhere). Role add-ons are the owner's own mapping.
+    mid = patch.get("model")
+    fam = str(CREATE_RECIPES.get(mid, {}).get("lora_family") or "") if mid else ""
+    if fam and isinstance(patch.get("loras"), list):
+        lib = _lora_lib()
+        def _fits(it: dict) -> bool:
+            f = it.get("file")
+            if not f:
+                return True
+            return str((lib.get(f) or {}).get("family") or "unknown") in (fam, "unknown")
+        patch["loras"] = [it for it in patch["loras"] if _fits(it)]
     prompt_add = patch.get("prompt_add") or str(raw.get("prompt") or "")[:2000]
     name = str(raw.get("name") or "Suggested macro")[:80]
     if not prompt_add and not patch.get("loras"):
@@ -3132,8 +3146,9 @@ def _recommend_macros_system(safe: bool) -> str:
         "style, so combine complementary ones (for example a realism add-on with a specific detail add-on) rather "
         "than relying on one. Only use add-ons whose [family] matches the chosen model's family. Give each add-on a "
         "strength from 0.4 to 1.1 (about 1.0 for a strong effect, about 0.5 for a subtle touch), and say in the name "
-        "or nothing more. Prefer the owner's installed add-ons over an empty list. Always choose one of the models "
-        "listed below (never leave the model null). Keep prompts concrete and short. "
+        "or nothing more. Prefer the owner's installed add-ons over an empty list. When a macro includes add-ons, set "
+        "its model to the one listed below whose family matches them; when it includes no add-ons, leave the model "
+        "null so the owner stays on the model they are already using. Keep prompts concrete and short. "
         "Propose 2 to 4 distinct, genuinely useful macros the owner can adopt and tweak. "
         'Reply with ONLY JSON: {"macros": [{"name": "...", "prompt_add": "...", "negative_add": "...", '
         '"loras": [{"file": "<exact installed file id>", "strength": 0.8}], "settings": {"cfg": 3.5}, '

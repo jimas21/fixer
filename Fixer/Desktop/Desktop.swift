@@ -792,6 +792,20 @@ final class Desktop: ObservableObject {
             if let role { return ["role": role] }
             return ["file": file ?? "", "strength": strength]
         }
+
+        /// A readable add-on name: the role, or the file id without its folder or ".safetensors".
+        var shortLabel: String? {
+            if let role, !role.isEmpty { return role }
+            guard let f = file, !f.isEmpty else { return nil }
+            return (f as NSString).lastPathComponent.replacingOccurrences(of: ".safetensors", with: "")
+        }
+
+        /// The add-on with its strength, e.g. "detailer ×0.8" (a role shows just its name).
+        var pickLabel: String? {
+            guard let base = shortLabel else { return nil }
+            if role != nil || strength == 1 { return base }
+            return "\(base) ×\(String(format: "%.2g", strength))"
+        }
     }
 
     /// 11-21: a saved preset: text added to the prompt, the add-on stack, settings and an optional model.
@@ -851,13 +865,31 @@ final class Desktop: ObservableObject {
             if let v = a["explicit"] as? Bool { explicit = v }
         }
 
-        /// "prompt snippet · N add-ons" for the list.
+        /// "prompt snippet · add-on names" for the list — names, not just a count, so what it uses is visible.
         var summary: String {
             let t = promptAdd.trimmingCharacters(in: .whitespacesAndNewlines)
             let snippet = t.count > 40 ? String(t.prefix(40)) + "…" : t
-            let n = loras.count
-            let adds = n == 1 ? "1 add-on" : "\(n) add-ons"
-            return snippet.isEmpty ? adds : "\(snippet) · \(adds)"
+            let names = loras.compactMap { $0.shortLabel }
+            let adds: String
+            if names.isEmpty { adds = "" }
+            else if names.count <= 2 { adds = names.joined(separator: ", ") }
+            else { adds = names.prefix(2).joined(separator: ", ") + " +\(names.count - 2)" }
+            let parts = [snippet, adds].filter { !$0.isEmpty }
+            return parts.isEmpty ? "No prompt words" : parts.joined(separator: " · ")
+        }
+
+        /// Labelled detail rows for the Suggest screen: what add-ons, model and settings a macro will use.
+        var detailRows: [(key: String, value: String)] {
+            var out: [(String, String)] = []
+            let picks = loras.compactMap { $0.pickLabel }
+            if !picks.isEmpty { out.append(("Add-ons", picks.joined(separator: ", "))) }
+            if let model, !model.isEmpty { out.append(("Model", model)) }
+            var s: [String] = []
+            if let cfg { s.append("CFG \(String(format: "%.1f", cfg))") }
+            if let steps { s.append("\(Int(steps)) steps") }
+            if !s.isEmpty { out.append(("Settings", s.joined(separator: ", "))) }
+            if explicit { out.append(("", "18+")) }
+            return out
         }
     }
 

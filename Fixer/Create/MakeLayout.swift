@@ -416,12 +416,18 @@ extension CreateScreen {
         router.useMacro = nil
         mode = "picture"
         target = .new
-        var skipped: [String] = []
+        var missingModel = false
+        var unfitAddons = 0
         if m.explicit, !makeExplicit { rules.explicitNow = true }
+        // 11-22: a macro only ADDS to the picture, so keep the owner's own words and quick-pick choices across the
+        // model switch below — using a macro should never wipe what they already set up. (The owner, 11-22: "when I
+        // use macros my quick lists options always disappear".) Restore only if the switch cleared them.
+        let keepPrompt = texts["prompt"]
         if let id = m.model, !id.isEmpty {
             if shownRecipes.contains(where: { $0.id == id }) { modelChoice.wrappedValue = id }
-            else { skipped.append("its model") }
+            else { missingModel = true }
         }
+        if (texts["prompt"] ?? "").isEmpty, let keepPrompt, !keepPrompt.isEmpty { texts["prompt"] = keepPrompt }
         let add = m.promptAdd.trimmingCharacters(in: .whitespacesAndNewlines)
         if !add.isEmpty {
             let cur = (texts["prompt"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -442,14 +448,21 @@ extension CreateScreen {
         }
         let fitting = Set(fittingLoras.map(\.file))
         for l in m.loras {
-            guard fitting.contains(l.file) else { skipped.append("an add-on"); continue }
+            guard fitting.contains(l.file) else { unfitAddons += 1; continue }
             loras.removeAll { $0.name == l.file }
             loras.append(LoraPick(name: l.file, strength: l.strength))
         }
+        // 11-22: say WHY an add-on was left out — it's installed, it just doesn't fit this model (or 18+ is off) —
+        // instead of the old "not available here", which read as "you don't have it".
         let name = m.name.isEmpty ? "Macro" : m.name
-        macroResult = skipped.isEmpty ? "“\(name)” is loaded in Make."
-            : "“\(name)” is loaded in Make, without " + Set(skipped).sorted().joined(separator: " or ")
-              + " (not available here)."
+        var notes: [String] = []
+        if missingModel { notes.append("its model isn't installed here") }
+        if unfitAddons > 0 {
+            notes.append(unfitAddons == 1 ? "1 add-on doesn’t fit this model"
+                                          : "\(unfitAddons) add-ons don’t fit this model")
+        }
+        macroResult = notes.isEmpty ? "“\(name)” is loaded in Make."
+            : "“\(name)” is loaded in Make — " + notes.joined(separator: ", ") + "."
     }
 
     func tapQuick(_ option: String) {

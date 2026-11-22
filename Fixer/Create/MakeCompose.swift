@@ -165,6 +165,7 @@ extension CreateScreen {
             out.append(AnyView(drawerSection("Add-ons") { loraSection }))
             out.append(AnyView(videoSettingsPage))
         } else if let r = recipe {
+            out.append(AnyView(macrosCard))                                      // 11-21: saved macros, right in Make
             if !activeTriggerWords.isEmpty { out.append(AnyView(triggerRow)) }   // 11-21: LoRA trigger words, tap to leave out
             let tips = shownToggles(r)              // 11-19: style tips sit inside the quick-pick card now
             if hasQuickPicks || !tips.isEmpty { out.append(AnyView(quickSectionsCard(tips: tips))) }

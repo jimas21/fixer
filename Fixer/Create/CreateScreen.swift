@@ -429,6 +429,9 @@ struct CreateScreen: View {
     @State var strength = 0.6                  // "start": how much of the photo gets redrawn
     @State var chosen: Set<String> = []        // the model's style tips switched on
     @State var showModels = false
+    @State var savedMacros: [Desktop.Macro] = []       // 11-21: saved macros, shown in the in-Make "Macros" card
+    @State var macroRoles: [Desktop.Role] = []         // needed to turn a saved macro's role add-ons into files
+    @State var showMacroSuggest = false                // the AI "Suggest macros" sheet, opened from the card
     @State var mode = "picture"                // picture or video
     @State var videoPrompt = ""
     @State var videoPhoto: UIImage?            // the photo a video starts from ("Animate this photo")
@@ -590,6 +593,9 @@ struct CreateScreen: View {
                 Text("Keeps your words, add-ons and settings so you can add them to any picture later.")
             }
             .sheet(isPresented: $showModels) { MakeModelSheet(recipes: shownRecipes, chosen: modelChoice) }
+            .sheet(isPresented: $showMacroSuggest) {
+                NavigationStack { MacroRecommend(onAdded: { savedMacros = $0 }) }
+            }
             .sheet(item: $quickSheet) { g in quickPickSheet(g) }     // 11-19: every option of one group at once
             .sheet(item: $tipSheet) { g in tipPickSheet(g) }
             .onChange(of: router.clearedCount) { _, _ in
@@ -931,6 +937,9 @@ struct CreateScreen: View {
             if recipes.isEmpty { failed = "Couldn't reach your computer. Check that Fixer Desktop is on." }
         }
         loading = false
+        if let g = try? await Desktop.shared.macrosGet() {     // 11-21: fill the in-Make Macros card
+            savedMacros = g.macros; macroRoles = g.roles
+        }
     }
 
     private func apply(_ r: (recipes: [CreateRecipe], loras: [String], library: [LoraEntry], videoFamily: String)) {

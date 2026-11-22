@@ -413,6 +413,39 @@ extension CreateScreen {
         return !words.isEmpty || !activeLoras.isEmpty
     }
 
+    /// 11-21: the Macros card, right in Make: the owner's saved macros (tap one to load it into the form) and a
+    /// shortcut to let the AI suggest some — so macros live where pictures are made, not buried in Settings.
+    @ViewBuilder var macrosCard: some View {
+        drawerSection("Macros") {
+            if savedMacros.isEmpty {
+                Text("No saved macros yet. Set up a look, then press and hold the Model tile to “Save as macro” — or let the AI suggest a few.")
+                    .font(.footnote).foregroundStyle(Fx.secondaryText)
+            } else {
+                ForEach(savedMacros) { m in
+                    Button {
+                        router.useMacro = m.forMake(roles: macroRoles)     // CreateScreen's onChange applies it
+                    } label: {
+                        HStack(spacing: 10) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(m.name.isEmpty ? "Untitled" : m.name)
+                                Text(m.summary).font(.footnote).foregroundStyle(Fx.secondaryText).lineLimit(1)
+                            }
+                            Spacer(minLength: 8)
+                            Image(systemName: "paintbrush.pointed").foregroundStyle(Fx.secondaryText)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            Button { showMacroSuggest = true } label: {
+                Label("Suggest macros", systemImage: "sparkles").font(.footnote.weight(.semibold))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.tint)
+        }
+    }
+
     /// Builds a macro from the form as it is now (the user's own words, not the recipe's prefix/suffix) and saves it.
     func saveCurrentAsMacro() {
         let typed = macroName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -428,7 +461,7 @@ extension CreateScreen {
         let toSave = macro
         Task {
             do {
-                try await Desktop.shared.saveMacro(toSave)
+                savedMacros = try await Desktop.shared.saveMacro(toSave)   // 11-21: show it in the Macros card at once
                 macroResult = "Saved as a macro"
             } catch {
                 macroResult = "Couldn't save the macro. Check that your computer is on."

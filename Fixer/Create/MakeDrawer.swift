@@ -442,8 +442,7 @@ extension CreateScreen {
     /// user typed into the "extra activation words" box (so the computer adds exactly these).
     func loraSendTriggers(_ file: String) -> [String]? {
         let extra = (loraExtra[file] ?? "")
-            .split(whereSeparator: { $0 == "," || $0 == ";" || $0 == "
-" })
+            .split(whereSeparator: { $0 == "," || $0 == ";" || $0 == "\n" })
             .map { String($0).trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
         // 11-21: trigger words switched off in the trigger row are left out (an empty list sends none at all).
@@ -457,16 +456,14 @@ extension CreateScreen {
 
     /// 11-21: the trigger words switched off (lowercased), kept across launches.
     var offTriggers: Set<String> {
-        Set(offTriggersRaw.split(separator: "
-").map { String($0) })
+        Set(offTriggersRaw.split(separator: "\n").map { String($0) })
     }
 
     func toggleTrigger(_ word: String) {
         var off = offTriggers
         let k = word.lowercased()
         if off.contains(k) { off.remove(k) } else { off.insert(k) }
-        offTriggersRaw = off.sorted().joined(separator: "
-")
+        offTriggersRaw = off.sorted().joined(separator: "\n")
         quickTick += 1
     }
 

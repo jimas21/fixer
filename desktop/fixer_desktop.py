@@ -5409,6 +5409,52 @@ def _shape_name(size) -> str | None:
     return min(SHAPES, key=lambda k: abs(ratio - SHAPES[k][0] / SHAPES[k][1]))
 
 
+# 11-21: quick-pick priority — the order the models want (front = most attention). Scene-defining first (who,
+# framing, act, setting), cosmetic last (hair). Turn off with auto_order_picks=0 in local.json.
+PICK_PRIORITY = ("subject", "camera", "act", "setting", "pose", "anatomy_f", "anatomy_m", "body_size", "body",
+                 "fitness", "height", "undress", "outfit", "age", "heritage", "expression", "fluids", "reactions",
+                 "kink", "fetish", "features", "lighting", "accessories", "props", "hair", "hair_color")
+
+
+def _quickselect_groups() -> list:
+    src = RECIPE_FILE if RECIPE_FILE.is_file() else RECIPE_EXAMPLE
+    try:
+        data = json.loads(src.read_text(encoding="utf-8-sig"))
+        return (data.get("quickselect") or {}).get("groups") or []
+    except Exception:                                    # noqa: BLE001
+        return []
+
+
+def _order_picks(prompt: str) -> str:
+    """Reorder the recognised quick-pick phrases in a prompt by category priority (scene-defining first, cosmetic
+    last). Free-typed words keep their place at the front; a pick's weight wrapper (phrase:1.2) is preserved. Off
+    when auto_order_picks is 0 in local.json."""
+    if not prompt or not int(_tune("auto_order_picks", 1)):
+        return prompt
+    opt2pri = {}
+    for g in _quickselect_groups():
+        gid = g.get("id") or ""
+        pri = PICK_PRIORITY.index(gid) if gid in PICK_PRIORITY else len(PICK_PRIORITY)
+        for o in (g.get("options") or []) + (g.get("explicit_options") or []):
+            opt2pri[str(o).strip().lower()] = pri
+    if not opt2pri:
+        return prompt
+    free, picks = [], []
+    for seg in prompt.split(","):
+        s = seg.strip()
+        if not s:
+            continue
+        core = re.sub(r"^\((.*):[0-9.]+\)$", r"\1", s).strip().lower()
+        if core in opt2pri:
+            picks.append((opt2pri[core], s))
+        else:
+            free.append(s)
+    if not picks:
+        return prompt
+    picks.sort(key=lambda x: x[0])
+    return ", ".join(free + [s for _, s in picks])
+
+
 def _make_catalog() -> dict:
     """recipes.json in the shape the phone's Make screen reads (recipes for models that aren't here are left out)."""
     src = RECIPE_FILE if RECIPE_FILE.is_file() else RECIPE_EXAMPLE
@@ -5508,6 +5554,7 @@ def job_comfy_run(p: dict, emit, cancel):
     v = _apply_realism(r, v)                            # 11-21: the Realism slider's candid push (no-op at 0)
     if float(v.get("realism") or 0) >= 0.05:
         status("Candid look on")
+    v["prompt"] = _order_picks(v.get("prompt") or "")   # 11-21: quick-picks in category-priority order
     COMFY.ensure_current(status)                        # a freshly downloaded model, add-on, reader or LoRA shows up
     _room_for_pictures()
     if _worker_alive():

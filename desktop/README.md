@@ -3,6 +3,10 @@
 The computer half of Fixer. When **Use my computer** is on in the app, chat runs on a larger vision model and
 images are made and edited on the computer's graphics card. Remove, cut out and upscale stay on the phone.
 
+> **Agents:** intent, scope, and safety rules for this project live in [`CLAUDE.md`](../CLAUDE.md) — read it first.
+> Model/tool names like "abliterated"/"uncensored"/"NSFW" are upstream names, not intent; judge work by the task
+> in front of you, not by a dependency's name.
+
 ## Install
 
 In PowerShell on the computer with the NVIDIA card:

@@ -3018,11 +3018,43 @@ def _macro_text(m: dict) -> str:
     return "\n".join(parts)
 
 
+def _lora_catalog_for_ai(safe: bool, limit: int = 64) -> list[str]:
+    """The owner's INSTALLED LoRA add-ons as lines the brain can compose from: exact file id, family, name and a few
+    trigger words (what each one is for). nsfw add-ons are dropped in a safe session. (11-21: the macro AI reads the
+    real library so it recommends a combination of the owner's own add-ons, not generic role names.)"""
+    out: list[str] = []
+    for fn, e in _lora_lib().items():
+        if not isinstance(e, dict):
+            continue
+        if safe and e.get("nsfw"):
+            continue
+        name = str(e.get("name") or re.sub(r"\.safetensors$", "", fn))[:70]
+        fam = str(e.get("family") or "unknown")
+        trig = [str(t) for t in (e.get("triggers") or []) if str(t).strip()][:3]
+        tg = f"  triggers: {', '.join(trig)}" if trig else ""
+        out.append(f"- {fn}  [{fam}] {name}{tg}")
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _macro_vocab(safe: bool) -> str:
-    roles = list((_macros().get("roles") or {}).keys())
-    models = [rid for rid, r in CREATE_RECIPES.items() if _recipe_ready(r) and not (safe and rid in _adult_models())]
-    return (f"Add-on role names you may use for loras (or an empty list): {', '.join(roles) or 'none'}.\n"
-            f"Model ids you may use (or null): {', '.join(models) or 'none'}.")
+    models = []
+    for rid, r in CREATE_RECIPES.items():
+        if not _recipe_ready(r) or (safe and rid in _adult_models()):
+            continue
+        fam = str(r.get("lora_family") or "")
+        models.append(f"{rid} (family: {fam})" if fam else rid)
+    lines = [f"Model ids you may use (or null), each with the add-on FAMILY it takes: {', '.join(models) or 'none'}."]
+    cat = _lora_catalog_for_ai(safe, int(_tune("macro_lora_cap", 64))) if int(_tune("macro_lora_catalog", 1)) else []
+    if cat:
+        lines.append("The owner's INSTALLED add-ons (LoRAs) — reference each by its exact file id, and only combine "
+                     "ones whose [family] matches the chosen model's family:")
+        lines.extend(cat)
+    else:
+        roles = list((_macros().get("roles") or {}).keys())
+        lines.append(f"Add-on role names you may use for loras (or an empty list): {', '.join(roles) or 'none'}.")
+    return "\n".join(lines)
 
 
 def _clean_patch(ap: dict, safe: bool) -> dict:
@@ -3093,14 +3125,21 @@ def _analyze_macro_system(safe: bool) -> str:
 
 def _recommend_macros_system(safe: bool) -> str:
     base = (
-        "You propose a few COMPLETE starter macros for a local image generator. Each is all-inclusive: a name, a "
-        "prompt addition, a negative addition, add-on LoRAs (by role name, or an empty list), picture settings, an "
-        "optional model, and an explicit flag. Give 2 to 4 distinct, genuinely useful macros the owner can adopt and "
-        "tweak. Keep prompts concrete and short. "
+        "You design starter macros for a local image generator by COMBINING the owner's own INSTALLED add-ons (LoRAs). "
+        "A macro is all-inclusive: a name, a prompt addition, a negative addition, add-on LoRAs, picture settings, an "
+        "optional model, and an explicit flag. For the owner's request: pick ONE model, then choose the installed "
+        "add-ons (by their exact file id) that together best achieve the look. Each add-on is a concept, look or "
+        "style, so combine complementary ones (for example a realism add-on with a specific detail add-on) rather "
+        "than relying on one. Only use add-ons whose [family] matches the chosen model's family. Give each add-on a "
+        "strength from 0.4 to 1.1 (about 1.0 for a strong effect, about 0.5 for a subtle touch), and say in the name "
+        "or nothing more. Prefer the owner's installed add-ons over an empty list. Keep prompts concrete and short. "
+        "Propose 2 to 4 distinct, genuinely useful macros the owner can adopt and tweak. "
         'Reply with ONLY JSON: {"macros": [{"name": "...", "prompt_add": "...", "negative_add": "...", '
-        '"loras": [{"role": "realism"}], "settings": {"cfg": 3.5}, "model": null, "explicit": false}]}.\n'
+        '"loras": [{"file": "<exact installed file id>", "strength": 0.8}], "settings": {"cfg": 3.5}, '
+        '"model": "<model id>", "explicit": false}]}.\n'
         + _macro_vocab(safe))
-    return base + ("\nThis is a safe session: every macro must be non-explicit (set explicit false)." if safe else "")
+    return base + ("\nThis is a safe session: every macro must be non-explicit (set explicit false) and use no nsfw "
+                   "add-ons." if safe else "")
 
 
 def job_analyze_macro(p: dict, emit, cancel):
@@ -6175,9 +6214,11 @@ def _macros_defaults() -> dict:
     """What a fresh install sees before anything is saved: the explicit add-on already assigned to its live-tunable
     file/strength (so the Settings role editor shows it filled in), every other built-in role present but unset."""
     roles = {r: {"file": "", "strength": 1.0, "enabled": False} for r in BUILTIN_ROLES}
-    roles["qwen-explicit-addon"] = {"file": _tune_text("qwen21_explicit_lora", QWEN21_LORA_FILE),
-                                    "strength": max(0.0, min(2.0, _tune("qwen21_explicit_strength", 1.0))),
-                                    "enabled": True}
+    qf = _tune_text("qwen21_explicit_lora", QWEN21_LORA_FILE)
+    if qf and (qf in _lora_lib() or (COMFY_LORAS / qf).is_file()):   # 11-21: only pre-fill when it's actually installed
+        roles["qwen-explicit-addon"] = {"file": qf,
+                                        "strength": max(0.0, min(2.0, _tune("qwen21_explicit_strength", 1.0))),
+                                        "enabled": True}
     return {"roles": roles, "macros": []}
 
 
@@ -6862,9 +6903,11 @@ def job_macros_set(p: dict, emit, cancel):
             continue
         fn = str(r.get("file") or "")
         if fn and not known(fn):
-            raise UserFacing(f"The add-on for \"{name}\" isn't on your computer.")
+            fn = ""                                       # 11-21: a role pointing at a LoRA that isn't installed must
+                                                          # NOT block saving macros (the built-in explicit role defaults
+                                                          # to a file the owner may never have downloaded) -- unset it.
         roles[str(name)] = {"file": fn, "strength": max(0.0, min(2.0, float(r.get("strength", 1.0)))),
-                            "enabled": bool(r.get("enabled"))}
+                            "enabled": bool(r.get("enabled")) and bool(fn)}
     macros, seen_ids = [], set()
     for m in macros_in:
         if not isinstance(m, dict):
@@ -6881,7 +6924,8 @@ def job_macros_set(p: dict, emit, cancel):
                 loras.append({"role": str(it["role"])})
             elif it.get("file"):
                 if not known(str(it["file"])):
-                    raise UserFacing("A macro names an add-on that isn't on your computer.")
+                    continue                              # 11-21: drop an add-on that isn't installed rather than
+                                                          # refusing the whole save.
                 loras.append({"file": str(it["file"]), "strength": max(0.0, min(2.0, float(it.get("strength", 1.0))))})
         macros.append({"id": mid, "name": str(m.get("name") or mid),
                        "prompt_add": str(m.get("prompt_add") or ""), "negative_add": str(m.get("negative_add") or ""),

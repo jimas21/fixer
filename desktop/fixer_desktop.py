@@ -3132,7 +3132,6 @@ def _recommend_macros_system(safe: bool) -> str:
         "style, so combine complementary ones (for example a realism add-on with a specific detail add-on) rather "
         "than relying on one. Only use add-ons whose [family] matches the chosen model's family. Give each add-on a "
         "strength from 0.4 to 1.1 (about 1.0 for a strong effect, about 0.5 for a subtle touch), and say in the name "
-        "or nothing more. Prefer the owner's installed add-ons over an empty list. Keep prompts concrete and short"
         "or nothing more. Prefer the owner's installed add-ons over an empty list. Always choose one of the models "
         "listed below (never leave the model null). Keep prompts concrete and short. "
         "Propose 2 to 4 distinct, genuinely useful macros the owner can adopt and tweak. "

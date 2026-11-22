@@ -819,6 +819,7 @@ final class Desktop: ObservableObject {
         var steps: Double?
         var model: String?
         var explicit = false
+        var pinned = false                            // 11-22: shown as a one-tap favorite chip in Make
         private var extra: [String: Any] = [:]       // keys this version doesn't know are passed back unchanged
 
         init() {}
@@ -835,6 +836,7 @@ final class Desktop: ObservableObject {
             let m = d["model"] as? String
             model = (m?.isEmpty ?? true) ? nil : m
             explicit = d["explicit"] as? Bool ?? false
+            pinned = d["pinned"] as? Bool ?? false
         }
         var raw: [String: Any] {
             var d = extra
@@ -849,6 +851,7 @@ final class Desktop: ObservableObject {
             d["settings"] = st
             d["model"] = model ?? NSNull()
             d["explicit"] = explicit
+            d["pinned"] = pinned
             return d
         }
 
@@ -899,6 +902,22 @@ final class Desktop: ObservableObject {
         let title: String
         let detail: String
         let apply: [String: Any]?
+    }
+
+    /// 11-22: an add-on TYPE the owner doesn't have installed that would lift the suggested macros — a search phrase,
+    /// the model family it should match (empty = any) and why. Shown as a "worth getting" row that opens the browser.
+    struct Wish: Identifiable {
+        var id = UUID()
+        let find: String
+        let family: String
+        let why: String
+        init?(_ d: [String: Any]) {
+            let f = (d["find"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !f.isEmpty else { return nil }
+            find = f
+            family = d["family"] as? String ?? ""
+            why = (d["why"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        }
     }
 
     /// The editable roles, the saved macros and the installed LoRAs.
@@ -958,17 +977,20 @@ final class Desktop: ObservableObject {
     }
 
     /// Asks the local AI for a few complete macros to start from. `context` is what the user is going for (optional).
-    func recommendMacros(context: String, safe: Bool) async throws -> [Macro] {
+    /// Also returns a short "wishlist" of add-on types worth acquiring that the owner doesn't have.
+    func recommendMacros(context: String, safe: Bool) async throws -> (macros: [Macro], wishlist: [Wish]) {
         guard let link else { throw PCError.notPaired }
         var payload: [String: Any] = ["safe": safe]
         let c = context.trimmingCharacters(in: .whitespacesAndNewlines)
         if !c.isEmpty { payload["context"] = c }
         for try await f in call("recommend_macros", payload, link: link) where f["t"] as? String == "info" {
-            return (f["macros"] as? [[String: Any]] ?? []).map { raw -> Macro in
+            let macros = (f["macros"] as? [[String: Any]] ?? []).map { raw -> Macro in
                 var m = Macro(raw)
                 m.id = UUID().uuidString          // a fresh id: it is added as a new macro
                 return m
             }
+            let wishlist = (f["wishlist"] as? [[String: Any]] ?? []).compactMap { Wish($0) }
+            return (macros, wishlist)
         }
         throw PCError.bad
     }

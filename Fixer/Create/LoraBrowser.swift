@@ -218,11 +218,13 @@ struct LoraBrowser: View {
     private let categories = [("Characters", "character"), ("Style", "style"), ("Concept", "concept"),
                               ("Clothing", "clothing"), ("Poses", "poses"), ("Background", "background")]
 
-    init(family: String, modelName: String, onAdded: @escaping (LoraEntry) -> Void = { _ in }) {
+    init(family: String, modelName: String, initialQuery: String = "",
+         onAdded: @escaping (LoraEntry) -> Void = { _ in }) {
         self.family = family
         self.modelName = modelName
         self.onAdded = onAdded
         _engines = State(initialValue: family.isEmpty ? [] : [family])
+        _query = State(initialValue: initialQuery)      // 11-22: seed a search (from a macro "worth getting" row)
     }
 
     var body: some View {

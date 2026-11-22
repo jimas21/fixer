@@ -121,3 +121,40 @@ I2I enhancer restate (not just minimally edit) the subject. Seed re-randomizes e
   `C:\FixerDesktop`, checks, restarts); it refuses while a job is running — don't `--force` into a
   live generation.
 - `.md` changes don't trigger the TestFlight build (`paths-ignore`).
+
+---
+
+## STATUS 2026-11-22 — batch built, server deployed
+
+All Swift below is in ONE batch, committed together for a single TestFlight build.
+Server (`desktop/fixer_desktop.py`) is **deployed live** (fixerctl deploy, server idle, no `--force`).
+
+**Track 1 — macro workflow: DONE.** A macro loads as a full recipe (model+words+add-ons+settings
+*replace* the form); `appliedMacroID` tracked; "Update this macro" button (`MakeDock.updateCurrentMacro`);
+pinned-favorites strip + pin/unpin swipe + `Macro.pinned` now persisted through `job_macros_set` (server
+was silently dropping it — fixed); delete dialog → `.alert`; "New prompt (keep add-ons)" in the tidy menu.
+
+**Track 2 — Suggest "pro": DONE.** Server composer rewritten with pro heuristics (one add-on per concept
+slot; strength ranges + ~1.0–1.5 budget; trigger words verbatim; SDXL-only weighting; always set a model;
+family enforced; dynamic `lora_cap`, not a hard 4; strength-budget trim in `_sanitize_macro`). Client
+Suggest UI: detail rows (add-ons/model/settings); **edit-then-save** (opens `MacroEditor` from a
+suggestion); **"More like this"** (regenerate one in place); and **"Add-ons worth getting"** — a new
+server `wishlist` of uninstalled add-on *types* worth acquiring → taps open `LoraBrowser` with the search
+pre-filled (`initialQuery`). `recommendMacros` now returns `(macros, wishlist)`; added `Desktop.Wish`.
+
+**Track 3 — perf: thumbnail slice DONE; resident-memory cap DEFERRED (needs device profiling).**
+`CreateResult.thumb` — a 256px cached thumbnail (bounded `NSCache`, ~24 MB) — now feeds the make roll
+(`MakeCanvas:85`) and the video-still picker (`MakeDrawer:665`), so dozens of 44–64px tiles no longer
+decode/resample full-res bitmaps on every layout. **Still open:** capping the 70+ resident full-res
+`CreateResult.image` bitmaps. Not done blind because the Library copy is **async + encrypted**
+(`LibraryStore.image` is async, per-item DEK), so evict-and-reload on the main thread (compose preview and
+revise read `.image` synchronously) would jank or needs a redesign. Decide the eviction/reload strategy
+with on-device memory numbers before coding — pick wrong and it hurts revise/share quality or latency.
+
+**Track 4 — edit-after-make: DONE (client+server).** Edit branch of `revise()` sends
+`values["base_prompt"] = original` and reuses `base.loras`; server `_create_pictures` composes
+`prompt = "{base_prompt}. Change: {instr}."` for `image_mode == "edit"`, so an edit keeps the original
+make's intent and add-ons instead of only the bare instruction.
+
+**Quick-picks drop — fixed for good.** `activeGroups` always seeds the full everyday group set and *adds*
+applied chips (was replacing them with an 8-of-19 subset); the 18+ block is gated by `makeExplicit`.

@@ -99,6 +99,39 @@ struct CreateResult: Identifiable {
     var explicit: String?                   // a video's Explicit setting: off, on or auto
     var enhanced: String?                   // the prompt the computer wrote from my words (Enhance on)
     var loras: [LoraSetting] = []           // the add-ons it was made with (a redraw can reuse them)
+
+    /// 11-22 (perf): a small, cheap copy for the strips and grids that show every picture at once (the make roll, the
+    /// video-still picker). Making 70+ pictures used to slow the UI to a crawl because each 44–64px tile drew from the
+    /// full-resolution image, so SwiftUI decoded and resampled dozens of full-res bitmaps on every scroll. The thumb is
+    /// built once and held in a bounded cache keyed by this result's id (iOS can drop it under memory pressure and it
+    /// rebuilds on demand). The full-res `image` is still used by the viewer, save/share and revise — unchanged.
+    var thumb: UIImage {
+        let key = id.uuidString as NSString
+        if let t = Self.thumbCache.object(forKey: key) { return t }
+        let t = Self.makeThumb(image)
+        Self.thumbCache.setObject(t, forKey: key, cost: Int(t.size.width * t.size.height) * 4)
+        return t
+    }
+
+    private static let thumbCache: NSCache<NSString, UIImage> = {
+        let c = NSCache<NSString, UIImage>()
+        c.totalCostLimit = 24 * 1024 * 1024            // ~24 MB of thumbnails; also purged under memory pressure
+        return c
+    }()
+
+    private static func makeThumb(_ img: UIImage, maxSide: CGFloat = 256) -> UIImage {
+        let w = img.size.width, h = img.size.height
+        let longest = Swift.max(w, h)
+        guard longest > maxSide, longest > 0 else { return img }
+        let scale = maxSide / longest
+        let size = CGSize(width: w * scale, height: h * scale)
+        let fmt = UIGraphicsImageRendererFormat.default()
+        fmt.scale = 1                                   // 1 px per point: the tiles are tiny, no need for @2x/@3x
+        fmt.opaque = (img.cgImage?.alphaInfo == .none)
+        return UIGraphicsImageRenderer(size: size, format: fmt).image { _ in
+            img.draw(in: CGRect(origin: .zero, size: size))
+        }
+    }
 }
 
 /// Pictures made on the Create screen: in memory only (never written to disk); "Clear everything" empties it.
@@ -282,10 +315,22 @@ final class CreateStore: ObservableObject {
             values["image_mode"] = "paint"
             if let strength { values["strength"] = strength }
         } else if mode == "edit" {
+            // 11-22 (the owner: the edit "doesn't stick to the original make pic's requirements… lacks understanding"):
+            // carry the original make's words as CONTEXT the editor must preserve, and reuse the make's add-ons, so a
+            // "make it brighter" instruction is applied to a picture the model actually understands — not a bare delta
+            // sent to a literal instruction-editor with no idea what the picture is.
             values["prompt"] = change
+            values["base_prompt"] = original
             values["image_mode"] = "edit"
             values["editor"] = editor
             values["explicit"] = explicit ?? base.menus["explicit"] ?? "Auto"
+            if useLoras {
+                values["loras"] = base.loras.map { l -> [String: Any] in
+                    var d: [String: Any] = ["name": l.name, "strength": l.strength]
+                    if let t = l.triggers { d["triggers"] = t }
+                    return d
+                }
+            }
         } else {
             for (k, v) in base.texts where k != "prompt" { values[k] = v }   // keep "Leave out" and the like
             values["toggles"] = base.toggles
@@ -432,6 +477,7 @@ struct CreateScreen: View {
     @State var savedMacros: [Desktop.Macro] = []       // 11-21: saved macros, shown in the in-Make "Macros" card
     @State var macroRoles: [Desktop.Role] = []         // needed to turn a saved macro's role add-ons into files
     @State var showMacroManager = false                // 11-22: the full macro manager (use/edit/delete/suggest/new) as a sheet, opened from the Macros row
+    @State var appliedMacroID: String?                 // 11-22: the macro loaded into the form now (nil = none), so "Update this macro" can overwrite it
     @State var mode = "picture"                // picture or video
     @State var videoPrompt = ""
     @State var videoPhoto: UIImage?            // the photo a video starts from ("Animate this photo")
@@ -607,7 +653,7 @@ struct CreateScreen: View {
                 videoPhoto = nil; videoPhotoID = nil
                 texts["prompt"] = ""; videoPrompt = ""
                 stylePrefix = ""; styleSuffix = ""; videoPrefix = ""; videoSuffix = ""
-                applied = nil; target = .new
+                applied = nil; target = .new; appliedMacroID = nil
                 recipeStore.clear()
             }
             .fullScreenCover(item: $viewing) { r in
@@ -950,6 +996,25 @@ struct CreateScreen: View {
         if let g = try? await Desktop.shared.macrosGet() {
             savedMacros = g.macros; macroRoles = g.roles
         }
+    }
+
+    /// 11-22 (the owner: "a quick way to clear all settings less lora straight from the top for a new prompt"): wipe
+    /// the words, quick-picks, style and settings for a fresh prompt, but KEEP the add-ons (LoRAs) and the pictures
+    /// made this session. The trash item ("Clear everything") still resets the whole session.
+    func clearForNewPrompt() {
+        texts["prompt"] = ""
+        texts["negative"] = nil
+        videoPrompt = ""
+        chosen.removeAll()
+        applied = nil
+        stylePrefix = ""; styleSuffix = ""
+        let keepCount = numbers["count"]
+        numbers = keepCount.map { ["count": $0] } ?? [:]
+        menus = [:]
+        photo = nil; morePhotos = []
+        target = .new
+        appliedMacroID = nil
+        // add-ons (loras / videoLoras) and this session's pictures are kept on purpose
     }
 
     private func apply(_ r: (recipes: [CreateRecipe], loras: [String], library: [LoraEntry], videoFamily: String)) {

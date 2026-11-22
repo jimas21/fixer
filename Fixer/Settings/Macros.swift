@@ -32,7 +32,7 @@ struct MacroList: View {
                         Label("New macro", systemImage: "plus")
                     }
                     NavigationLink {
-                        MacroRecommend(onAdded: { macros = $0 })
+                        MacroRecommend(onAdded: { macros = $0 }, library: library, roles: roles)
                     } label: {
                         Label("Suggest macros", systemImage: "sparkles")
                     }
@@ -54,6 +54,10 @@ struct MacroList: View {
                                 Button(role: .destructive) { removing = m } label: {
                                     Label("Delete", systemImage: "trash")
                                 }
+                                Button { Task { await togglePin(m) } } label: {
+                                    Label(m.pinned ? "Unpin" : "Pin", systemImage: m.pinned ? "pin.slash" : "pin")
+                                }
+                                .tint(.orange)
                             }
                             .swipeActions(edge: .leading) {
                                 Button { router.useMacro = m.forMake(roles: roles); router.tab = .make } label: {
@@ -70,13 +74,15 @@ struct MacroList: View {
         .navigationTitle("Macros")
         .navigationBarTitleDisplayMode(.inline)
         .task { await load() }
-        .confirmationDialog("Delete \(removing?.name ?? "this macro")?", isPresented: Binding(
-            get: { removing != nil }, set: { if !$0 { removing = nil } }), titleVisibility: .visible) {
-            Button("Delete macro", role: .destructive) {
+        .alert("Delete \(removing?.name ?? "this macro")?", isPresented: Binding(
+            get: { removing != nil }, set: { if !$0 { removing = nil } })) {
+            Button("Delete", role: .destructive) {
                 if let m = removing { Task { await remove(m) } }
                 removing = nil
             }
             Button("Cancel", role: .cancel) { removing = nil }
+        } message: {
+            Text("Removes it from your saved macros. This can't be undone.")
         }
     }
 
@@ -99,6 +105,14 @@ struct MacroList: View {
         } catch {
             notice = "Couldn't delete. Try again."
         }
+    }
+
+    /// 11-22: pin/unpin a macro — pinned ones show as one-tap favorite chips in Make.
+    private func togglePin(_ m: Desktop.Macro) async {
+        var macro = m
+        macro.pinned.toggle()
+        do { macros = try await desktop.saveMacro(macro); notice = nil }
+        catch { notice = "Couldn't update. Try again." }
     }
 }
 
@@ -331,16 +345,21 @@ struct DeleteAllMacrosSection: View {
 
 // MARK: - Recommended macros
 
-/// Settings → Macros → Suggest macros: the local AI proposes a few complete macros; each can be added as a new,
-/// editable macro (with a fresh id), any, all or none.
+/// Settings → Macros → Suggest macros: the local AI proposes a few complete macros; each can be added as-is or opened
+/// in the editor first, refined one at a time, and it also lists add-ons worth acquiring that aren't installed.
 struct MacroRecommend: View {
     var onAdded: ([Desktop.Macro]) -> Void
+    var library: [LoraEntry] = []
+    var roles: [Desktop.Role] = []
     @ObservedObject private var desktop = Desktop.shared
     @State private var context = ""
     @State private var results: [Desktop.Macro] = []
+    @State private var wishlist: [Desktop.Wish] = []
     @State private var added: Set<String> = []
     @State private var working = false
+    @State private var refiningID: String?
     @State private var notice: String?
+    @State private var browseWish: Desktop.Wish?
 
     var body: some View {
         Form {
@@ -375,27 +394,92 @@ struct MacroRecommend: View {
                         Label("Added", systemImage: "checkmark").foregroundStyle(.secondary)
                     } else {
                         Button("Add as a new macro") { Task { await add(r) } }
+                        // 11-22: open it in the editor before saving — tweak words, add-ons, settings, then Save.
+                        NavigationLink {
+                            MacroEditor(macro: r, library: library, roles: roles, onSaved: { list in
+                                onAdded(list); added.insert(r.id)
+                            })
+                        } label: { Label("Edit, then save", systemImage: "slider.horizontal.3") }
+                        // 11-22: "more like this" — regenerate just this one into a fresh variation.
+                        Button {
+                            Task { await refine(r) }
+                        } label: {
+                            if refiningID == r.id { HStack { ProgressView(); Text("Refining…") } }
+                            else { Label("More like this", systemImage: "arrow.triangle.2.circlepath") }
+                        }
+                        .disabled(working || refiningID != nil)
                     }
                 }
             }
             if results.count > 1, results.contains(where: { !added.contains($0.id) }) {
                 Section { Button("Add all") { Task { for r in results where !added.contains(r.id) { await add(r) } } } }
             }
+            // 11-22: "the art of the possible" — add-ons the AI thinks are worth getting but you don't have. Each
+            // opens the add-on browser with the search already filled in.
+            if !wishlist.isEmpty {
+                Section("Add-ons worth getting") {
+                    ForEach(wishlist) { w in
+                        Button { browseWish = w } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                HStack {
+                                    Label(w.find, systemImage: "magnifyingglass")
+                                    Spacer()
+                                    if !w.family.isEmpty {
+                                        Text(LoraEntry.familyName(w.family)).font(.caption2).foregroundStyle(.secondary)
+                                    }
+                                }
+                                if !w.why.isEmpty { Text(w.why).font(.footnote).foregroundStyle(.secondary) }
+                            }
+                        }
+                    }
+                } footer: {
+                    Text("These aren't installed. Tapping one searches for it to add to your computer.")
+                }
+            }
         }
         .navigationTitle("Suggest macros")
         .navigationBarTitleDisplayMode(.inline)
+        .sheet(item: $browseWish) { w in
+            LoraBrowser(family: w.family, modelName: w.family.isEmpty ? "" : LoraEntry.familyName(w.family),
+                        initialQuery: w.find)
+        }
     }
 
     private func fetch() async {
         working = true; notice = nil
         do {
-            results = try await desktop.recommendMacros(context: context, safe: !Rules.shared.explicitNow)
+            let r = try await desktop.recommendMacros(context: context, safe: !Rules.shared.explicitNow)
+            results = r.macros; wishlist = r.wishlist
             added = []
             if results.isEmpty { notice = "No suggestions this time." }
         } catch {
             notice = "Couldn't get suggestions. Try again."
         }
         working = false
+    }
+
+    /// Regenerate a single suggestion into a variation, keeping its place in the list.
+    private func refine(_ m: Desktop.Macro) async {
+        guard let idx = results.firstIndex(where: { $0.id == m.id }) else { return }
+        refiningID = m.id; notice = nil
+        let base = context.trimmingCharacters(in: .whitespacesAndNewlines)
+        let seedName = m.name.isEmpty ? "the current idea" : "\"\(m.name)\""
+        var seed = "A fresh variation on \(seedName)"
+        if !m.promptAdd.isEmpty { seed += " (\(m.promptAdd.prefix(160)))" }
+        seed += ". Different add-ons or phrasing, same spirit."
+        let ask = base.isEmpty ? seed : "\(base). \(seed)"
+        do {
+            let r = try await desktop.recommendMacros(context: ask, safe: !Rules.shared.explicitNow)
+            if let fresh = r.macros.first, results.indices.contains(idx) {
+                results[idx] = fresh
+                added.remove(m.id)
+            } else {
+                notice = "Couldn't refine that one. Try again."
+            }
+        } catch {
+            notice = "Couldn't refine that one. Try again."
+        }
+        refiningID = nil
     }
 
     private func add(_ m: Desktop.Macro) async {
@@ -424,7 +508,7 @@ extension Desktop.Macro {
                 picks.append(MacroApply.Lora(file: f, strength: l.strength))
             }
         }
-        return MacroApply(name: name, promptAdd: promptAdd, negativeAdd: negativeAdd, loras: picks,
+        return MacroApply(macroID: id, name: name, promptAdd: promptAdd, negativeAdd: negativeAdd, loras: picks,
                           cfg: cfg, steps: steps, model: model, explicit: explicit)
     }
 }

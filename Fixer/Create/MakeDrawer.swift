@@ -662,7 +662,7 @@ extension CreateScreen {
     private func sessionStill(_ r: CreateResult) -> some View {
         let on = videoPhoto != nil && r.libraryID != nil && r.libraryID == videoPhotoID
         return Button { useForVideo(r) } label: {
-            Image(uiImage: r.image)
+            Image(uiImage: r.thumb)
                 .resizable()
                 .scaledToFill()
                 .frame(width: 64, height: 64)

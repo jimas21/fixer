@@ -413,12 +413,43 @@ extension CreateScreen {
         return !words.isEmpty || !activeLoras.isEmpty
     }
 
+    /// 11-22: pinned macros as one-tap favorite chips, right above the Macros row. Tap one to load it (recipe-replace);
+    /// the one currently loaded is highlighted. Pin/unpin from the manager. Hidden when nothing is pinned.
+    @ViewBuilder var pinnedMacrosStrip: some View {
+        let pins = savedMacros.filter(\.pinned)
+        if !pins.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(pins) { m in
+                        Button { router.useMacro = m.forMake(roles: macroRoles) } label: {
+                            HStack(spacing: 5) {
+                                Image(systemName: "pin.fill").font(.system(size: 9))
+                                Text(m.name.isEmpty ? "Untitled" : m.name).font(.caption.weight(.semibold)).lineLimit(1)
+                            }
+                            .padding(.horizontal, 10).padding(.vertical, 7)
+                            .background(Capsule().fill(appliedMacroID == m.id ? Fx.onTintStrong : Fx.tile))
+                            .foregroundStyle(appliedMacroID == m.id ? Fx.accentSoftText : Fx.secondaryText)
+                            .overlay(Capsule().strokeBorder(Fx.hairline, lineWidth: 0.5))
+                            .contentShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Macro \(m.name.isEmpty ? "untitled" : m.name)")
+                        .accessibilityHint("Load this macro")
+                    }
+                }
+                .padding(.horizontal, 1)
+            }
+        }
+    }
+
     /// 11-22: a compact Macros row, right in Make. One tap opens the full macro manager as a sheet — use, edit,
     /// delete, suggest and make a new one, all from one menu — so the saved list never grows down the form and
     /// pushes the rest of the controls off-screen. (The owner, 11-22: "their list becomes long fast and it pushes
     /// everything down… edit, delete, suggest, make all from a single menu in make.") The old always-open inline
     /// list lived here before; the manager it opens is `MacroList` (Settings → Macros), reused as a sheet.
     @ViewBuilder var macrosCard: some View {
+      VStack(spacing: 8) {
+        pinnedMacrosStrip
         Button { showMacroManager = true } label: {
             HStack(spacing: 8) {
                 Image(systemName: "wand.and.stars")
@@ -451,6 +482,20 @@ extension CreateScreen {
         .accessibilityLabel(savedMacros.isEmpty ? "Macros, none saved" : "Macros, \(savedMacros.count) saved")
         .accessibilityHint("Opens the macro manager to use, edit, delete or suggest macros")
         .accessibilityAddTraits(.isButton)
+        if let id = appliedMacroID, savedMacros.contains(where: { $0.id == id }) {
+            Button { updateCurrentMacro() } label: {
+                Label("Update this macro", systemImage: "arrow.triangle.2.circlepath")
+                    .font(.footnote.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 9)
+                    .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Fx.accent.opacity(0.15)))
+                    .foregroundStyle(Fx.accent)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint("Saves your current words, add-ons and settings back onto the loaded macro")
+        }
+      }
     }
 
     /// Builds a macro from the form as it is now (the user's own words, not the recipe's prefix/suffix) and saves it.
@@ -472,6 +517,28 @@ extension CreateScreen {
                 macroResult = "Saved as a macro"
             } catch {
                 macroResult = "Couldn't save the macro. Check that your computer is on."
+            }
+        }
+    }
+
+    /// 11-22 (the owner: "then I should be able to update the macro with the new settings"): push the current form
+    /// back onto the macro it was loaded from, keeping its id and name. Only meaningful while a macro is loaded.
+    func updateCurrentMacro() {
+        guard let id = appliedMacroID, var macro = savedMacros.first(where: { $0.id == id }) else { return }
+        macro.promptAdd = (texts["prompt"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        macro.negativeAdd = (texts["negative"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        macro.loras = activeLoras.map { Desktop.MacroLora(file: $0.name, strength: $0.strength) }
+        macro.cfg = numbers["cfg"]
+        macro.steps = numbers["steps"]
+        macro.model = recipeID.isEmpty ? nil : recipeID
+        macro.explicit = makeExplicit
+        let toSave = macro
+        Task {
+            do {
+                savedMacros = try await Desktop.shared.saveMacro(toSave)
+                macroResult = "Updated “\(toSave.name.isEmpty ? "macro" : toSave.name)”"
+            } catch {
+                macroResult = "Couldn't update the macro. Check that your computer is on."
             }
         }
     }

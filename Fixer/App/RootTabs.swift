@@ -18,7 +18,8 @@ final class AppRouter: ObservableObject {
 /// 11-21: a saved macro, ready for Make: its add-on roles already resolved to installed files.
 struct MacroApply: Equatable {
     struct Lora: Equatable { var file: String; var strength: Double }
-    var id = UUID()
+    var id = UUID()               // fresh each time, so Make's onChange fires even for the same macro twice
+    var macroID: String = ""      // 11-22: the saved macro's real id, so "Update this macro" can overwrite it
     var name: String
     var promptAdd: String
     var negativeAdd: String

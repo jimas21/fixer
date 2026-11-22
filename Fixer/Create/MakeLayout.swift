@@ -183,19 +183,27 @@ extension CreateScreen {
         return clean + adult.filter { $0.model == recipeID } + adult.filter { $0.model != recipeID }
     }
 
-    /// Quick-pick rows for the recipe in use (or the usual ones before any recipe was used).
+    /// Quick-pick rows for the recipe in use. 11-22 (the owner: "we've still lost the heritage quick select and all
+    /// of those… I don't even understand why they drop"): the everyday groups are ALWAYS on, so nothing disappears
+    /// when a style is picked or dropped, a macro switches the model, or the form is cleared. The old `defaults` list
+    /// only held 8 of the ~19 everyday groups, and a style's `chips` REPLACED it — so heritage, age, body, fitness,
+    /// features, props, accessories, act, hair_color, height, body_size only ever showed while a style that named
+    /// them was applied, then vanished. Now the full everyday set is the floor; a style's chips only ADD to it; the
+    /// 18+ groups are gated by the switch; groups with no non-18+ options are filtered when 18+ is off.
     var activeGroups: [QuickGroup] {
         guard let c = recipeStore.catalog else { return [] }
-        // 11-19: framing (Camera), Pose and Face were missing until a style was picked; the owner looked for full
-        // body / from behind / over the shoulder / focus and couldn't find them.
-        let defaults = mode == "video" ? ["motion"]
-            : ["subject", "hair", "outfit", "expression", "pose", "setting", "lighting", "camera"]
-        var ids = applied?.kind == (mode == "video" ? "video" : "picture") ? (appliedChips.isEmpty ? defaults : appliedChips) : defaults
-        // 11-20 (the owner: the 18+ quick picks were gone): they came only with an 18+ style, and with the 18+ styles
-        // folded away nobody picked one. While 18+ is on, the 18+ rows are always there, after the style's own.
+        var ids = mode == "video" ? ["motion"]
+            : ["subject", "heritage", "age", "body", "body_size", "height", "fitness",
+               "hair", "hair_color", "features", "expression", "outfit", "props", "accessories",
+               "setting", "lighting", "camera", "pose", "act"]
+        // A picked style's own quick picks are ADDED (so its extras show too), never a replacement that hides the
+        // standard categories.
+        if applied?.kind == (mode == "video" ? "video" : "picture") {
+            for chip in appliedChips where !ids.contains(chip) { ids.append(chip) }
+        }
+        // 11-20: while 18+ is on, the 18+ rows are always there too.
         if makeExplicit, mode != "video" {
-            // 11-21: "Undress" leads the 18+ rows — the first thing wanted when working an uploaded photo with 18+ on.
-            for id in ["undress", "body_size", "act", "anatomy_f", "anatomy_m", "fluids", "reactions", "kink", "fetish"]
+            for id in ["undress", "anatomy_f", "anatomy_m", "fluids", "reactions", "kink", "fetish"]
             where !ids.contains(id) { ids.append(id) }
         }
         // 11-19: with 18+ off, a row that has only 18+ options (anatomy, kink, ...) isn't shown at all.
@@ -409,8 +417,10 @@ extension CreateScreen {
         quickTick += 1
     }
 
-    /// 11-21: "Use in Make" from Settings → Macros. Loads the macro into the picture form: its words are added to
-    /// yours, its add-ons switched on (only ones installed and fitting this model), its settings and model applied.
+    /// 11-22 (the owner: a macro should "function like a full starting recipe… replacing"): using a macro loads it as
+    /// a COMPLETE recipe — its model, words, add-ons and settings REPLACE the current form (they don't layer on top).
+    /// Then you tweak and can push the changes back with "Update this macro". The keep-your-words tool is the separate
+    /// "New prompt (keep add-ons)" item. Add-ons that don't fit the macro's model (or need 18+) are left out, named.
     func applyPendingMacro() {
         guard let m = router.useMacro, !loading, !recipes.isEmpty else { return }
         router.useMacro = nil
@@ -419,41 +429,28 @@ extension CreateScreen {
         var missingModel = false
         var unfitAddons = 0
         if m.explicit, !makeExplicit { rules.explicitNow = true }
-        // 11-22: a macro only ADDS to the picture, so keep the owner's own words and quick-pick choices across the
-        // model switch below — using a macro should never wipe what they already set up. (The owner, 11-22: "when I
-        // use macros my quick lists options always disappear".) Restore only if the switch cleared them.
-        let keepPrompt = texts["prompt"]
         if let id = m.model, !id.isEmpty {
             if shownRecipes.contains(where: { $0.id == id }) { modelChoice.wrappedValue = id }
             else { missingModel = true }
         }
-        if (texts["prompt"] ?? "").isEmpty, let keepPrompt, !keepPrompt.isEmpty { texts["prompt"] = keepPrompt }
-        let add = m.promptAdd.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !add.isEmpty {
-            let cur = (texts["prompt"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            if !cur.localizedCaseInsensitiveContains(add) {
-                texts["prompt"] = cur.isEmpty ? add : (cur.hasSuffix(",") ? cur + " " + add : cur + ", " + add)
-            }
-        }
-        let neg = m.negativeAdd.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !neg.isEmpty, recipe?.controls.contains(where: { $0.key == "negative" }) == true {
-            let cur = (texts["negative"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            if !cur.localizedCaseInsensitiveContains(neg) {
-                texts["negative"] = cur.isEmpty ? neg : (cur.hasSuffix(",") ? cur + " " + neg : cur + ", " + neg)
-            }
+        applied = nil                 // a macro is its own recipe, not a style layered over the model
+        chosen.removeAll()
+        texts["prompt"] = m.promptAdd.trimmingCharacters(in: .whitespacesAndNewlines)
+        if recipe?.controls.contains(where: { $0.key == "negative" }) == true {
+            texts["negative"] = m.negativeAdd.trimmingCharacters(in: .whitespacesAndNewlines)
         }
         for (key, value) in [("cfg", m.cfg), ("steps", m.steps)] {
-            guard let value, let c = recipe?.controls.first(where: { $0.key == key }) else { continue }
-            numbers[key] = Swift.min(c.max, Swift.max(c.min, value))
+            guard let c = recipe?.controls.first(where: { $0.key == key }) else { continue }
+            numbers[key] = value.map { Swift.min(c.max, Swift.max(c.min, $0)) }   // nil -> the recipe's own default
         }
         let fitting = Set(fittingLoras.map(\.file))
+        var picks: [LoraPick] = []
         for l in m.loras {
             guard fitting.contains(l.file) else { unfitAddons += 1; continue }
-            loras.removeAll { $0.name == l.file }
-            loras.append(LoraPick(name: l.file, strength: l.strength))
+            picks.append(LoraPick(name: l.file, strength: l.strength))
         }
-        // 11-22: say WHY an add-on was left out — it's installed, it just doesn't fit this model (or 18+ is off) —
-        // instead of the old "not available here", which read as "you don't have it".
+        loras = picks                 // the macro's add-ons ARE the stack now, replacing whatever was on
+        appliedMacroID = m.macroID.isEmpty ? nil : m.macroID   // so "Update this macro" knows which one to overwrite
         let name = m.name.isEmpty ? "Macro" : m.name
         var notes: [String] = []
         if missingModel { notes.append("its model isn't installed here") }

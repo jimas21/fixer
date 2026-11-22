@@ -173,19 +173,25 @@ struct TidyCircleLabel: View {
 struct TidyMenu<Icon: View>: View {
     @ObservedObject var chat: Chat
     var onClear: () -> Void
+    var onNewPrompt: (() -> Void)?       // 11-22: Make-only "new prompt, keep add-ons"; nil elsewhere so the item is hidden
     var label: () -> Icon
     @ObservedObject private var desktop = Desktop.shared
     @StateObject private var model = TidyFree()
     @State private var askingErase = false
 
-    init(chat: Chat, onClear: @escaping () -> Void, @ViewBuilder label: @escaping () -> Icon) {
+    init(chat: Chat, onClear: @escaping () -> Void, onNewPrompt: (() -> Void)? = nil,
+         @ViewBuilder label: @escaping () -> Icon) {
         self.chat = chat
         self.onClear = onClear
+        self.onNewPrompt = onNewPrompt
         self.label = label
     }
 
     var body: some View {
         Menu {
+            if let onNewPrompt {
+                Button { onNewPrompt() } label: { Label("New prompt (keep add-ons)", systemImage: "square.and.pencil") }
+            }
             if desktop.isOn {
                 Button { model.asking = true } label: { Label(TidyText.freeTitle, systemImage: "memorychip") }
             }

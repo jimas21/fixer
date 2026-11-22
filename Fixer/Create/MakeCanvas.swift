@@ -82,7 +82,7 @@ extension CreateScreen {
                 withAnimation(Motion.snap) { workingID = r.id }
             }
         } label: {
-            Image(uiImage: r.image)
+            Image(uiImage: r.thumb)
                 .resizable()
                 .scaledToFill()
                 .frame(width: 44, height: 44)

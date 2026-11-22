@@ -3031,8 +3031,10 @@ def _lora_catalog_for_ai(safe: bool, limit: int = 64) -> list[str]:
         name = str(e.get("name") or re.sub(r"\.safetensors$", "", fn))[:70]
         fam = str(e.get("family") or "unknown")
         trig = [str(t) for t in (e.get("triggers") or []) if str(t).strip()][:3]
-        tg = f"  triggers: {', '.join(trig)}" if trig else ""
-        out.append(f"- {fn}  [{fam}] {name}{tg}")
+        st = e.get("strength")
+        rs = f" · rec ~{float(st):.2g}" if isinstance(st, (int, float)) and 0 < float(st) <= 3 else ""
+        tg = f" · triggers: {', '.join(trig)}" if trig else " · triggers: none known (do not invent)"
+        out.append(f"- {fn}  [{fam}] {name}{rs}{tg}")
         if len(out) >= limit:
             break
     return out
@@ -3045,11 +3047,13 @@ def _macro_vocab(safe: bool) -> str:
             continue
         fam = str(r.get("lora_family") or "")
         models.append(f"{rid} (family: {fam})" if fam else rid)
-    lines = [f"Model ids you may use (or null), each with the add-on FAMILY it takes: {', '.join(models) or 'none'}."]
+    lines = [f"Model ids you may use, each with the add-on FAMILY it takes: {', '.join(models) or 'none'}."]
     cat = _lora_catalog_for_ai(safe, int(_tune("macro_lora_cap", 64))) if int(_tune("macro_lora_catalog", 1)) else []
     if cat:
-        lines.append("The owner's INSTALLED add-ons (LoRAs) — reference each by its exact file id, and only combine "
-                     "ones whose [family] matches the chosen model's family:")
+        cap = int(_tune("lora_cap", 4))
+        lines.append(f"The owner's INSTALLED add-ons (LoRAs). Reference each by its exact file id; '[family]' must "
+                     f"match the chosen model's family; 'rec ~N' is the creator's recommended strength when known. You "
+                     f"may stack up to {cap}, but 2 to 4 is usually best:")
         lines.extend(cat)
     else:
         roles = list((_macros().get("roles") or {}).keys())
@@ -3114,6 +3118,20 @@ def _sanitize_macro(raw: dict, safe: bool) -> dict | None:
                 return True
             return str((lib.get(f) or {}).get("family") or "unknown") in (fam, "unknown")
         patch["loras"] = [it for it in patch["loras"] if _fits(it)]
+    # 11-22: keep the stack sane — honor the dynamic add-on cap and a total-strength budget. Stacking LoRAs is not
+    # additive (weights compound), so a summed strength much over ~1.5 "fries" the image. Trim to the cap, then scale
+    # file-add-on strengths down proportionally if their sum overshoots the budget. (Research-backed heuristics.)
+    if isinstance(patch.get("loras"), list):
+        cap = int(_tune("lora_cap", 4))
+        if len(patch["loras"]) > cap:
+            patch["loras"] = patch["loras"][:cap]
+        files = [it for it in patch["loras"] if it.get("file")]
+        total = sum(float(it.get("strength", 1.0)) for it in files)
+        budget = float(_tune("macro_strength_budget", 1.6))
+        if 0 < budget < total:
+            k = budget / total
+            for it in files:
+                it["strength"] = round(max(0.1, float(it.get("strength", 1.0)) * k), 2)
     prompt_add = patch.get("prompt_add") or str(raw.get("prompt") or "")[:2000]
     name = str(raw.get("name") or "Suggested macro")[:80]
     if not prompt_add and not patch.get("loras"):
@@ -3139,20 +3157,34 @@ def _analyze_macro_system(safe: bool) -> str:
 
 def _recommend_macros_system(safe: bool) -> str:
     base = (
-        "You design starter macros for a local image generator by COMBINING the owner's own INSTALLED add-ons (LoRAs). "
-        "A macro is all-inclusive: a name, a prompt addition, a negative addition, add-on LoRAs, picture settings, an "
-        "optional model, and an explicit flag. For the owner's request: pick ONE model, then choose the installed "
-        "add-ons (by their exact file id) that together best achieve the look. Each add-on is a concept, look or "
-        "style, so combine complementary ones (for example a realism add-on with a specific detail add-on) rather "
-        "than relying on one. Only use add-ons whose [family] matches the chosen model's family. Give each add-on a "
-        "strength from 0.4 to 1.1 (about 1.0 for a strong effect, about 0.5 for a subtle touch), and say in the name "
-        "or nothing more. Prefer the owner's installed add-ons over an empty list. When a macro includes add-ons, set "
-        "its model to the one listed below whose family matches them; when it includes no add-ons, leave the model "
-        "null so the owner stays on the model they are already using. Keep prompts concrete and short. "
+        "You are a professional image-generation prompt engineer. You design reusable MACROS — each a COMPLETE recipe: "
+        "a name, a prompt addition, a negative addition, add-on LoRAs with strengths, picture settings (cfg/steps), a "
+        "model, and an explicit flag. A macro is a full starting point, so ALWAYS set a real model from the list below "
+        "(never null). Compose like a pro:\n"
+        "- Pick ONE model first, then only add-ons whose [family] matches it (a mismatched add-on does nothing).\n"
+        "- One add-on per CONCEPT SLOT (style, subject/character, detail/lighting); never stack two of the same kind, "
+        "they fight. 2 to 4 add-ons is the sweet spot; use more only when each has a clearly distinct role.\n"
+        "- Strength: start from an add-on's 'rec ~N' when shown and treat it as the ceiling; otherwise style 0.5-0.8, "
+        "character 0.7-1.0, detail 0.3-0.5. Keep the strengths' SUM near 1.0-1.5; when stacking 3 or more, scale each "
+        "down to about 60-80%. A speed/distill add-on uses its exact recommended strength and settings.\n"
+        "- Put each used add-on's trigger words VERBATIM into the prompt addition. If an add-on lists no triggers, do "
+        "not invent any.\n"
+        "- Prompt weighting: for an sdxl model you MAY emphasise sparingly with (phrase:1.1-1.4); for qwen or chroma "
+        "models do NOT use weighting syntax (they print it literally) — use natural wording.\n"
+        "- Prompt shape: sdxl takes tags plus short phrases; chroma and qwen take full natural-language sentences.\n"
+        "- Settings: set cfg/steps only when the add-on recommends specific ones, else omit them to keep the model's "
+        "defaults. Never pair a speed/distill add-on with high cfg or many steps.\n"
         "Propose 2 to 4 distinct, genuinely useful macros the owner can adopt and tweak. "
+        "Only ever use add-ons from the INSTALLED list below in a macro's 'loras'. BUT if a kind of add-on the owner "
+        "does NOT appear to have installed would clearly lift these recipes (a better film-grain, a skin-detailer, a "
+        "specific style the catalog lacks), name it in a separate 'wishlist' (0 to 3 items) so they can go and get it "
+        "— never put an uninstalled add-on in a macro. Each wishlist item: 'find' is a 2-4 word search phrase, "
+        "'family' is the model family it should match (from the list below, or \"\" if any), 'why' is one short "
+        "sentence. Do not wishlist something that merely duplicates an installed add-on.\n"
         'Reply with ONLY JSON: {"macros": [{"name": "...", "prompt_add": "...", "negative_add": "...", '
-        '"loras": [{"file": "<exact installed file id>", "strength": 0.8}], "settings": {"cfg": 3.5}, '
-        '"model": "<model id>", "explicit": false}]}.\n'
+        '"loras": [{"file": "<exact installed file id>", "strength": 0.8}], "settings": {"cfg": 3.5, "steps": 30}, '
+        '"model": "<model id>", "explicit": false}], '
+        '"wishlist": [{"find": "film grain photo", "family": "sdxl", "why": "adds analog texture these lack"}]}.\n'
         + _macro_vocab(safe))
     return base + ("\nThis is a safe session: every macro must be non-explicit (set explicit false) and use no nsfw "
                    "add-ons." if safe else "")
@@ -3199,7 +3231,27 @@ def job_recommend_macros(p: dict, emit, cancel):
         raise UserFacing(PAUSED_TEXT if LLAMA.paused_for else "The chat model isn't available right now.")
     obj = _brain_json(text)
     macros = [m for m in (_sanitize_macro(r, safe) for r in ((obj or {}).get("macros") or [])[:6]) if m]
-    emit({"t": "info", "macros": macros})
+    emit({"t": "info", "macros": macros, "wishlist": _clean_wishlist((obj or {}).get("wishlist"))})
+
+
+def _clean_wishlist(raw) -> list[dict]:
+    """Add-on TYPES the owner doesn't have but that would help — each a search phrase, a target family and a reason.
+    Coerced, length-clamped, family validated against real model families (or '' for any). At most 3."""
+    if not isinstance(raw, list):
+        return []
+    fams = {str(r.get("lora_family") or "") for r in CREATE_RECIPES.values() if r.get("lora_family")}
+    out: list[dict] = []
+    for it in raw[:6]:
+        if not isinstance(it, dict):
+            continue
+        find = str(it.get("find") or "").strip()[:60]
+        if not find:
+            continue
+        fam = str(it.get("family") or "").strip()
+        out.append({"find": find, "family": fam if fam in fams else "", "why": str(it.get("why") or "").strip()[:160]})
+        if len(out) >= 3:
+            break
+    return out
 
 
 def _enhance_inputs(op: str, payload: dict | None):
@@ -5673,6 +5725,14 @@ def _create_pictures(r, v, w, h, count, seed, loras, photo, photo_name, mode, em
         _paint_picture(r, v, seed, loras, photo, v["mask"], emit, cancel)
         return
     prompt = v.get("prompt") or "high quality photo"
+    # 11-22: an "edit" used to send only the bare instruction to a literal instruction-editor, which then ignored the
+    # original make's requirements (the owner: "doesn't stick to the original make pic's requirements… lacks
+    # understanding"). The phone now sends the make's own words as base_prompt; fold them in as the scene to preserve,
+    # then state the change, so the editor edits a picture it understands instead of guessing from a one-line delta.
+    base_prompt = str(v.get("base_prompt") or "").strip()
+    if base_prompt and str(v.get("image_mode")) == "edit":
+        instr = str(v.get("prompt") or "").strip()
+        prompt = f"{base_prompt}. Change: {instr}." if instr else base_prompt
     editor = str(v.get("editor") or "auto")             # Make's Editor menu (11-17): auto, qwen, qwen-explicit, qwen21
     if editor == "flux":
         editor = "auto"                                  # a phone build from before 11-17: FLUX klein is gone
@@ -6946,7 +7006,8 @@ def job_macros_set(p: dict, emit, cancel):
         macros.append({"id": mid, "name": str(m.get("name") or mid),
                        "prompt_add": str(m.get("prompt_add") or ""), "negative_add": str(m.get("negative_add") or ""),
                        "loras": loras, "settings": m.get("settings") if isinstance(m.get("settings"), dict) else {},
-                       "model": (str(m["model"]) if m.get("model") else None), "explicit": bool(m.get("explicit"))})
+                       "model": (str(m["model"]) if m.get("model") else None), "explicit": bool(m.get("explicit")),
+                       "pinned": bool(m.get("pinned"))})   # 11-22: one-tap favourite in Make
     _macros_write({"roles": roles, "macros": macros})
     emit({"t": "info", "macros": _macros(), "library": _lora_entries()})
 

@@ -38,14 +38,33 @@ only on the Mac (TestFlight Action), so keep slices coherent and low-risk.
   going for?" box (`MacroRecommend`, `Settings/Macros.swift:336`).
 - **Edit before saving** — inline editor per suggestion (reuse `MacroEditor`), not accept/reject only.
 - **Refine/regenerate ONE** suggestion ("more like this"), not all-or-nothing per batch.
-- **Tell the AI the real add-on cap (4)** — `_job_loras` caps a job at 4 LoRAs. The recommend prompt
-  (`_recommend_macros_system`) never states this; add it and let it use as many as help, up to 4.
+- **Tell the AI the real, DYNAMIC add-on cap** — `_job_loras` caps a job at `int(_tune("lora_cap", 4))`
+  add-ons (`fixer_desktop.py:6452`), **currently 10** (set in `C:/FixerDesktop/local.json`; 4 is only the
+  default). The recommend prompt (`_recommend_macros_system`) never states this. Read the live tune value
+  and put it in the prompt, and tell the AI to use as many complementary add-ons as genuinely help UP TO
+  that current cap — NOT a hard 4. Must track the tune, not a literal.
 - **Weighting awareness:** strength IS applied on run (`strength_model`/`strength_clip`,
   `fixer_desktop.py:3520/3644/3755`), but the AI isn't told per-model weighting behavior
   (SDXL/Chroma honor `(phrase:1.3)`, Qwen strips it). State it so it doesn't waste weighting on Qwen.
 - **Art of the possible** — also suggest NOT-yet-installed add-ons worth acquiring, wired to the LoRA
   browser / Civitai search (`LoraBrowser.swift`, `Desktop.loraSearch`), with a "Get it" action. Keep
   these clearly separated from installed picks so they don't get dropped by the family/install filter.
+- **Per-add-on strength ranges & usage notes (make the AI a PRO at this).** Civitai import already parses
+  a suggested strength (`_suggested_strength`, `fixer_desktop.py:6808`) and keeps `description`, but the
+  library entry (`library.json`) persists only a single `strength` — no range, no notes — and
+  `_lora_catalog_for_ai` (`fixer_desktop.py:3021`) shows the AI only `file [family] name triggers`, not
+  even that strength. Work: (1) persist recommended strength + range + a short usage note per add-on at
+  import; (2) surface them in `_lora_catalog_for_ai`; (3) tell the recommend AI to respect each add-on's
+  recommended range AND adjust strengths when stacking several (they interact). Goal: it composes like a
+  practitioner, not a guesser.
+- Data availability (Jim, 2026-11-22): the recommended-strength / usage data IS coming in and is already
+  **rendered in the LoRA browser UI for Civitai-source add-ons** (HuggingFace-source ones may lack it). So
+  it's reachable both server-side (import) and client-side (browser) — persist and reuse it; don't inspect
+  the live library by hand to confirm, just wire the ingest we already have.
+- **RESEARCH FIRST (Jim, 2026-11-22): does a tool already exist** for AI-assisted LoRA/preset composition
+  (auto-selecting + weighting multiple LoRAs from an installed library + metadata, prompt-weighting best
+  practice, stacking-interaction heuristics)? Adopt vs. build decision before implementing the "pro"
+  composer. A research agent is running on this; fold its findings in here before coding Track 2's AI.
 
 ### Track 3 — Performance with many pictures (70+ slows the phone a lot)
 - Root cause: every result is a **full-res `UIImage` held in memory** (`CreateResult.image`,

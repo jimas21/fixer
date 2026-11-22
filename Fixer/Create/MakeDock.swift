@@ -413,37 +413,44 @@ extension CreateScreen {
         return !words.isEmpty || !activeLoras.isEmpty
     }
 
-    /// 11-21: the Macros card, right in Make: the owner's saved macros (tap one to load it into the form) and a
-    /// shortcut to let the AI suggest some — so macros live where pictures are made, not buried in Settings.
+    /// 11-22: a compact Macros row, right in Make. One tap opens the full macro manager as a sheet — use, edit,
+    /// delete, suggest and make a new one, all from one menu — so the saved list never grows down the form and
+    /// pushes the rest of the controls off-screen. (The owner, 11-22: "their list becomes long fast and it pushes
+    /// everything down… edit, delete, suggest, make all from a single menu in make.") The old always-open inline
+    /// list lived here before; the manager it opens is `MacroList` (Settings → Macros), reused as a sheet.
     @ViewBuilder var macrosCard: some View {
-        drawerSection("Macros") {
-            if savedMacros.isEmpty {
-                Text("No saved macros yet. Set up a look, then press and hold the Model tile to “Save as macro” — or let the AI suggest a few.")
-                    .font(.footnote).foregroundStyle(Fx.secondaryText)
-            } else {
-                ForEach(savedMacros) { m in
-                    Button {
-                        router.useMacro = m.forMake(roles: macroRoles)     // CreateScreen's onChange applies it
-                    } label: {
-                        HStack(spacing: 10) {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(m.name.isEmpty ? "Untitled" : m.name)
-                                Text(m.summary).font(.footnote).foregroundStyle(Fx.secondaryText).lineLimit(1)
-                            }
-                            Spacer(minLength: 8)
-                            Image(systemName: "paintbrush.pointed").foregroundStyle(Fx.secondaryText)
-                        }
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
+        Button { showMacroManager = true } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "wand.and.stars")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Fx.secondaryText)
+                Text("Macros").font(.footnote.weight(.semibold)).foregroundStyle(Fx.secondaryText)
+                if !savedMacros.isEmpty {
+                    Text(String(savedMacros.count))
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(Fx.accentSoftText)
+                        .frame(minWidth: 18, minHeight: 18)
+                        .padding(.horizontal, 4)
+                        .background(Capsule().fill(Fx.onTintStrong))
                 }
+                Spacer(minLength: 8)
+                Text(savedMacros.isEmpty ? "Set up & suggest" : "Use · edit · suggest")
+                    .font(.caption).foregroundStyle(Fx.secondaryText).lineLimit(1)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Fx.secondaryText)
             }
-            Button { showMacroSuggest = true } label: {
-                Label("Suggest macros", systemImage: "sparkles").font(.footnote.weight(.semibold))
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.tint)
+            .frame(minHeight: 32)
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(Fx.tile))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(savedMacros.isEmpty ? "Macros, none saved" : "Macros, \(savedMacros.count) saved")
+        .accessibilityHint("Opens the macro manager to use, edit, delete or suggest macros")
+        .accessibilityAddTraits(.isButton)
     }
 
     /// Builds a macro from the form as it is now (the user's own words, not the recipe's prefix/suffix) and saves it.

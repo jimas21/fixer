@@ -431,7 +431,7 @@ struct CreateScreen: View {
     @State var showModels = false
     @State var savedMacros: [Desktop.Macro] = []       // 11-21: saved macros, shown in the in-Make "Macros" card
     @State var macroRoles: [Desktop.Role] = []         // needed to turn a saved macro's role add-ons into files
-    @State var showMacroSuggest = false                // the AI "Suggest macros" sheet, opened from the card
+    @State var showMacroManager = false                // 11-22: the full macro manager (use/edit/delete/suggest/new) as a sheet, opened from the Macros row
     @State var mode = "picture"                // picture or video
     @State var videoPrompt = ""
     @State var videoPhoto: UIImage?            // the photo a video starts from ("Animate this photo")
@@ -593,8 +593,10 @@ struct CreateScreen: View {
                 Text("Keeps your words, add-ons and settings so you can add them to any picture later.")
             }
             .sheet(isPresented: $showModels) { MakeModelSheet(recipes: shownRecipes, chosen: modelChoice) }
-            .sheet(isPresented: $showMacroSuggest) {
-                NavigationStack { MacroRecommend(onAdded: { savedMacros = $0 }) }
+            // 11-22: the whole macro menu, in Make. The Macros row opens it; "Use in Make" (from the list or the
+            // editor) sets router.useMacro, which the onChange below catches to close this and load the macro.
+            .sheet(isPresented: $showMacroManager, onDismiss: { Task { await refreshMacros() } }) {
+                NavigationStack { MacroList() }
             }
             .sheet(item: $quickSheet) { g in quickPickSheet(g) }     // 11-19: every option of one group at once
             .sheet(item: $tipSheet) { g in tipPickSheet(g) }
@@ -615,7 +617,7 @@ struct CreateScreen: View {
                 if meta != nil { applyMakeAgain() }
             }
             .onChange(of: router.useMacro) { _, m in
-                if m != nil { applyPendingMacro() }
+                if m != nil { showMacroManager = false; applyPendingMacro() }
             }
             .sensoryFeedback(.impact, trigger: startTick)
             .sensoryFeedback(.impact(weight: .light), trigger: stopTick)
@@ -938,6 +940,14 @@ struct CreateScreen: View {
         }
         loading = false
         if let g = try? await Desktop.shared.macrosGet() {     // 11-21: fill the in-Make Macros card
+            savedMacros = g.macros; macroRoles = g.roles
+        }
+    }
+
+    /// 11-22: re-read saved macros after the macro manager sheet closes, so the Macros row's count stays right
+    /// when the owner added, edited or deleted one in there.
+    func refreshMacros() async {
+        if let g = try? await Desktop.shared.macrosGet() {
             savedMacros = g.macros; macroRoles = g.roles
         }
     }

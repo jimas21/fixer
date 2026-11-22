@@ -13,6 +13,28 @@ only on the Mac (TestFlight Action), so keep slices coherent and low-risk.
 - **Pinned favorites** strip inline in Make (one-tap apply) + the manager sheet for the full list.
 - A **"Clear for a new prompt" control at the top that wipes everything EXCEPT the add-ons (LoRAs).**
 
+## PROGRESS (2026-11-22)
+- **Track 2 server composer — DONE & LIVE** (deployed to the running server, not yet git-committed). Rewrote
+  `_recommend_macros_system`, `_lora_catalog_for_ai` (now shows `rec ~N` strength + a "don't invent triggers"
+  note), `_macro_vocab` (states the dynamic `lora_cap`), and added a strength-budget guard in `_sanitize_macro`
+  (trim to cap, scale summed strength to ~1.6). Encodes the research heuristics: one add-on per concept slot,
+  2-4 sweet spot, strength ranges by role, trigger words verbatim, per-model weighting (sdxl yes, qwen/chroma
+  no), macro = full recipe so it always sets a model. **Testable now via Suggest.**
+- **Build discipline:** `fixerctl deploy` pushes server (.py) changes live with NO Mac build. git-committing any
+  non-.md triggers the one TestFlight build, so ALL commits (server + client) are held until the full batch is
+  ready → ONE combined compile (Jim's call).
+- Research agent + edit-AI diagnosis agent: both complete; findings folded into Tracks 2 and 4 below.
+
+## Track 4 ROOT CAUSE (diagnosis agent, confirmed)
+The "edit" change mode is the DEFAULT for Qwen models (what Jim is steered to). Its `revise()` edit branch
+(`CreateScreen.swift:284-288`) sends ONLY the bare instruction with an EMPTY loras list — discarding the
+original prompt, LoRAs, negative, settings and seed. "Redraw" mode (juggernaut/chroma default,
+`CreateScreen.swift:289-304`) carries context, which is why the problem is model-dependent. FIX (client-led,
+goes in the batch): in the edit branch, pass the original prompt as preserved context (`values["base_prompt"]`)
+and reuse `base.loras`; server composes the Qwen-Edit prompt as "<original>. Change: <instruction>." in
+`_create_pictures` (`fixer_desktop.py:~5697`/qwen21 `~5685`). Consider defaulting `enhanceEdits` on + letting the
+I2I enhancer restate (not just minimally edit) the subject. Seed re-randomizes every edit (`fixer_desktop.py:5620`).
+
 ## Tracks
 
 ### Track 1 — Macro = a recipe you launch, tune, update (core workflow)
@@ -61,6 +83,11 @@ only on the Mac (TestFlight Action), so keep slices coherent and low-risk.
   **rendered in the LoRA browser UI for Civitai-source add-ons** (HuggingFace-source ones may lack it). So
   it's reachable both server-side (import) and client-side (browser) — persist and reuse it; don't inspect
   the live library by hand to confirm, just wire the ingest we already have.
+- **HuggingFace metadata gap (Jim, 2026-11-22).** Civitai-source add-ons carry recommended strength/usage;
+  HF-source ones give much less. There's heavy crossover (same LoRA on both). Likely solution: hash the
+  installed `.safetensors` (SHA256) and query Civitai `GET /model-versions/by-hash/{hash}` to enrich the
+  HF entry with recommended strength + trigger words + base model. Research agent to confirm this is the
+  cleanest path (vs. scraping HF READMEs). Enrich once at import/scan, cache in `library.json`.
 - **RESEARCH FIRST (Jim, 2026-11-22): does a tool already exist** for AI-assisted LoRA/preset composition
   (auto-selecting + weighting multiple LoRAs from an installed library + metadata, prompt-weighting best
   practice, stacking-interaction heuristics)? Adopt vs. build decision before implementing the "pro"

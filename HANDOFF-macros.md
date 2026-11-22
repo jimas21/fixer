@@ -142,14 +142,30 @@ suggestion); **"More like this"** (regenerate one in place); and **"Add-ons wort
 server `wishlist` of uninstalled add-on *types* worth acquiring → taps open `LoraBrowser` with the search
 pre-filled (`initialQuery`). `recommendMacros` now returns `(macros, wishlist)`; added `Desktop.Wish`.
 
-**Track 3 — perf: thumbnail slice DONE; resident-memory cap DEFERRED (needs device profiling).**
-`CreateResult.thumb` — a 256px cached thumbnail (bounded `NSCache`, ~24 MB) — now feeds the make roll
-(`MakeCanvas:85`) and the video-still picker (`MakeDrawer:665`), so dozens of 44–64px tiles no longer
-decode/resample full-res bitmaps on every layout. **Still open:** capping the 70+ resident full-res
-`CreateResult.image` bitmaps. Not done blind because the Library copy is **async + encrypted**
-(`LibraryStore.image` is async, per-item DEK), so evict-and-reload on the main thread (compose preview and
-revise read `.image` synchronously) would jank or needs a redesign. Decide the eviction/reload strategy
-with on-device memory numbers before coding — pick wrong and it hurts revise/share quality or latency.
+**Track 3 — perf/memory: SOLVED, O(1) resident.** New `Fixer/Create/MakeMedia.swift` is the pixel store
+behind every `CreateResult`. A result now holds **only metadata — no pixels**. Resident RAM is bounded by
+two fixed caches (decoded full-res ~96 MB, thumbnails ~24 MB), so 70, 700 or 7000 pictures cost the same
+RAM. Each result's compressed bytes + thumb are sealed into an **ephemeral-encrypted on-disk scratch**
+(`AES-GCM`, key `SymmetricKey(.bits256)` generated per launch, **RAM-only, never persisted**; dir wiped on
+launch and by Clear-everything; files carry iOS file protection). Reads fault cache → sealed scratch →
+thumb fallback, synchronously (full-res decode is a few ms and only for an *evicted* older pic; the one
+being made is always warm). The viewer maps results to a lazy `.sessionPicture(id)` source
+(`MediaViewer`) so opening a big session decodes only the on-screen item, not all of them. E2E preserved
+and strengthened: nothing plaintext hits disk, scratch is unreadable at rest, fewer plaintext bitmaps
+resident. Durable at-rest copy is still the encrypted Library. Minor follow-up: `MediaLoader.images` grows
+as you swipe within one viewer sitting (freed on close; pre-existing, also affects Library items).
+
+**E2E encryption — validated end to end (2026-11-22).** Transport: request bodies and every reply frame
+are AES-256-GCM sealed with the pairing key (`Desktop.exchange`, `fixer_desktop.py` AESGCM), key delivered
+out-of-band by QR and kept in the keychain — so **Cloudflare (TLS terminator) sees only ciphertext**, plus
+the op name in the URL path and sizes/timing (metadata). PC is **stateless**: no content on disk (pictures
+via `SaveImageWebsocket`, ComfyUI in a `rmtree`'d private dir); only `keys.json` (the shared keys) and
+models persist. Phone at rest: Library sealed per-item (DEK + master, Face ID/passcode, iOS file
+protection); keychain key is device-only. Honest caveats: static shared key (no forward secrecy); op
+name/size/timing visible to Cloudflare; `keys.json` is the PC crown-jewel (filesystem-perm protected);
+transient plaintext job intermediates (inpaint crops, video frames, song audio) exist on PC disk only
+during a job in the wiped private dir; and to *display* a picture its decoded pixels must be in RAM — the
+guarantee is at-rest + in-transit, plus capping resident plaintext (which MakeMedia now does).
 
 **Track 4 — edit-after-make: DONE (client+server).** Edit branch of `revise()` sends
 `values["base_prompt"] = original` and reuses `base.loras`; server `_create_pictures` composes

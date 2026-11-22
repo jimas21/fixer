@@ -13,6 +13,7 @@ struct MediaItem: Identifiable {
         case chat(conv: UUID, file: String)
         case library(UUID)
         case memory(UIImage)
+        case sessionPicture(UUID)       // 11-22: a Make result; its pixels are faulted from MakeMedia on demand
         case chatVideo(URL)
     }
     let id: UUID
@@ -60,6 +61,9 @@ final class MediaLoader: ObservableObject {
         switch item.source {
         case .memory(let ui):
             images[item.id] = ui
+        case .sessionPicture(let rid):
+            // Decode off the main thread; only the on-screen result is faulted, so a big session never decodes them all.
+            images[item.id] = await Task.detached(priority: .userInitiated) { MakeMedia.shared.image(rid) }.value
         case .chat(let conv, let file):
             if let ui = History.image(file, in: conv) { images[item.id] = ui } else { failed.insert(item.id) }
         case .chatVideo(let url):

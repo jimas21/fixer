@@ -85,7 +85,6 @@ enum CreateEvent {
 
 struct CreateResult: Identifiable {
     let id = UUID()
-    let image: UIImage
     let seed: Int
     var recipeID = ""
     var texts: [String: String] = [:]       // the form as it was: prompt, leave-out...
@@ -100,37 +99,25 @@ struct CreateResult: Identifiable {
     var enhanced: String?                   // the prompt the computer wrote from my words (Enhance on)
     var loras: [LoraSetting] = []           // the add-ons it was made with (a redraw can reuse them)
 
-    /// 11-22 (perf): a small, cheap copy for the strips and grids that show every picture at once (the make roll, the
-    /// video-still picker). Making 70+ pictures used to slow the UI to a crawl because each 44–64px tile drew from the
-    /// full-resolution image, so SwiftUI decoded and resampled dozens of full-res bitmaps on every scroll. The thumb is
-    /// built once and held in a bounded cache keyed by this result's id (iOS can drop it under memory pressure and it
-    /// rebuilds on demand). The full-res `image` is still used by the viewer, save/share and revise — unchanged.
-    var thumb: UIImage {
-        let key = id.uuidString as NSString
-        if let t = Self.thumbCache.object(forKey: key) { return t }
-        let t = Self.makeThumb(image)
-        Self.thumbCache.setObject(t, forKey: key, cost: Int(t.size.width * t.size.height) * 4)
-        return t
-    }
+    // 11-22 (memory): a result holds only its metadata — NO pixels. The picture and its thumbnail live in `MakeMedia`,
+    // which keeps resident RAM bounded (two fixed-size caches) no matter how many pictures a session has, and faults the
+    // rest from an ephemeral-encrypted on-disk scratch. See MakeMedia.swift. So copying a `CreateResult` is cheap, and
+    // 700 pictures cost the same RAM as 70. The full-res `image` is decoded on demand; the roll and pickers use `thumb`.
 
-    private static let thumbCache: NSCache<NSString, UIImage> = {
-        let c = NSCache<NSString, UIImage>()
-        c.totalCostLimit = 24 * 1024 * 1024            // ~24 MB of thumbnails; also purged under memory pressure
-        return c
-    }()
+    /// The full-resolution picture (viewer, compose preview, save/share, revise). Decoded on demand via `MakeMedia`.
+    var image: UIImage { MakeMedia.shared.image(id) }
+    /// A small thumbnail for the strips and still-picker — never forces a full-res decode.
+    var thumb: UIImage { MakeMedia.shared.thumb(id) }
 
-    private static func makeThumb(_ img: UIImage, maxSide: CGFloat = 256) -> UIImage {
-        let w = img.size.width, h = img.size.height
-        let longest = Swift.max(w, h)
-        guard longest > maxSide, longest > 0 else { return img }
-        let scale = maxSide / longest
-        let size = CGSize(width: w * scale, height: h * scale)
-        let fmt = UIGraphicsImageRendererFormat.default()
-        fmt.scale = 1                                   // 1 px per point: the tiles are tiny, no need for @2x/@3x
-        fmt.opaque = (img.cgImage?.alphaInfo == .none)
-        return UIGraphicsImageRenderer(size: size, format: fmt).image { _ in
-            img.draw(in: CGRect(origin: .zero, size: size))
-        }
+    init(image: UIImage, seed: Int, recipeID: String = "", texts: [String: String] = [:],
+         numbers: [String: Double] = [:], menus: [String: String] = [:], shape: String = "square",
+         toggles: [String] = [], note: String? = nil, libraryID: UUID? = nil, videoURL: URL? = nil,
+         explicit: String? = nil, enhanced: String? = nil, loras: [LoraSetting] = []) {
+        self.seed = seed
+        self.recipeID = recipeID; self.texts = texts; self.numbers = numbers; self.menus = menus
+        self.shape = shape; self.toggles = toggles; self.note = note; self.libraryID = libraryID
+        self.videoURL = videoURL; self.explicit = explicit; self.enhanced = enhanced; self.loras = loras
+        MakeMedia.shared.ingest(id, image)              // warms the caches and seals a scratch copy
     }
 }
 
@@ -184,6 +171,7 @@ final class CreateStore: ObservableObject {
         revising?.cancel(); revising = nil
         videoJob?.cancel(); videoJob = nil
         for r in results { if let u = r.videoURL { try? FileManager.default.removeItem(at: u) } }
+        MakeMedia.shared.clearAll()                      // forget cached bitmaps and wipe the encrypted scratch
         results = []; blockedNote = nil; reviseStatus = nil; reviseNote = nil; revisedResultID = nil
         reviseBaseID = nil; revisePreview = nil; reviseProgress = 0
         videoStatus = nil; videoProgress = 0; videoNote = nil
@@ -1241,7 +1229,7 @@ struct MakeMediaViewer: View {
             if let url = $0.videoURL {
                 return MediaItem(id: $0.id, kind: .video, source: .chatVideo(url), libraryID: $0.libraryID, note: $0.note)
             }
-            return MediaItem(id: $0.id, kind: .picture, source: .memory($0.image), libraryID: $0.libraryID,
+            return MediaItem(id: $0.id, kind: .picture, source: .sessionPicture($0.id), libraryID: $0.libraryID,
                              recipeID: $0.recipeID, note: $0.note, enhanced: $0.enhanced)
         }
     }
@@ -1253,8 +1241,8 @@ struct MakeMediaViewer: View {
         }
         a.cancel = { store.cancelRevise() }
         a.animate = { item, words in
-            guard case .memory(let ui) = item.source else { return }
-            store.startVideo(prompt: words, start: ui, explicit: Rules.shared.videoExplicitNow,
+            guard case .sessionPicture(let rid) = item.source else { return }
+            store.startVideo(prompt: words, start: MakeMedia.shared.image(rid), explicit: Rules.shared.videoExplicitNow,
                              parent: item.libraryID, action: "animate", seconds: videoSeconds)
         }
         // No "send to chat" (11-17): work made in Make stays in Make; the chat would switch models to pick it up.

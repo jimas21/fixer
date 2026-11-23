@@ -61,7 +61,7 @@ enum Remover {
             else { throw ToolError.model("Couldn't prepare the photo.") }
             let model = try compiledModel(.remover)
             try Task.checkCancellation()
-            let input =try MLDictionaryFeatureProvider(dictionary: [
+            let input = try MLDictionaryFeatureProvider(dictionary: [
                 "image": MLFeatureValue(pixelBuffer: inPB),
                 "mask": MLFeatureValue(pixelBuffer: maskPB),
             ])

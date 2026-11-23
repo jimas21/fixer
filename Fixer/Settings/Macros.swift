@@ -417,7 +417,7 @@ struct MacroRecommend: View {
             // 11-22: "the art of the possible" — add-ons the AI thinks are worth getting but you don't have. Each
             // opens the add-on browser with the search already filled in.
             if !wishlist.isEmpty {
-                Section("Add-ons worth getting") {
+                Section {                                  // (a title string can't be combined with a footer closure)
                     ForEach(wishlist) { w in
                         Button { browseWish = w } label: {
                             VStack(alignment: .leading, spacing: 2) {
@@ -432,6 +432,8 @@ struct MacroRecommend: View {
                             }
                         }
                     }
+                } header: {
+                    Text("Add-ons worth getting")
                 } footer: {
                     Text("These aren't installed. Tapping one searches for it to add to your computer.")
                 }

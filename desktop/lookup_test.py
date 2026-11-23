@@ -67,6 +67,12 @@ def case_gate():
     check(req is None and texts(out) == [fd.LOOKUP_FAIL_TEXT], "truncated look-up JSON is not shown")
     g, out, req = run_gate(["\n\n", "Sure"])
     check(req is None and "".join(texts(out)).strip() == "Sure", "leading blank lines don't confuse it")
+    g, out, req = run_gate(['```js', 'on\n{"tool": "lookup", ', '"what": ["jobs"]}\n```'])
+    check(req == {"what": ["jobs"]} and texts(out) == [], "a look-up inside a code fence is held and run")
+    g, out, req = run_gate(["```python\n", "print(1)\n```"])
+    check(req is None and "".join(texts(out)) == "```python\nprint(1)\n```", "a code answer with a fence is passed whole")
+    g, out, req = run_gate(["```"])
+    check(req is None and texts(out) == ["```"], "a lone fence is released at the end")
     check(fd._lookup_topics([]) == ["models", "computer", "phone", "jobs"], "no topic means all of them")
     check(fd._lookup_topics(["iPhone", "GPU", "gpu", "zzz"]) == ["phone", "computer"],
           "topic words are mapped and deduplicated")
@@ -222,6 +228,46 @@ def case_facts():
         check("couldn't be read" in fd.lookup_facts(["computer"], {}), "a topic that fails says so")
     finally:
         fd._computer_facts = orig
+
+
+def case_small_fixes():
+    """11-22: a diffusers folder is complete only with its weights, the current snapshot is the one refs/main names,
+    the model's quoted \"false\" is false, and the video length is read tolerantly."""
+    base = Path(TMP) / "snapcheck"
+    snap = base / "snap"
+    for part, files in (("transformer", ["config.json"]), ("tokenizer", ["tokenizer_config.json"])):
+        (snap / part).mkdir(parents=True)
+        for f in files:
+            (snap / part / f).write_text("{}", encoding="utf-8")
+    (snap / "model_index.json").write_text(json.dumps({"transformer": ["diffusers", "T"], "tokenizer": ["transformers", "K"],
+                                                       "scheduler": [None, None]}), encoding="utf-8")
+    check(not fd._complete(snap), "a part holding only its config.json is not complete")
+    (snap / "transformer" / "diffusion_pytorch_model.safetensors").write_bytes(b"x")
+    check(fd._complete(snap), "the part with its weights (and a tokenizer without any) is complete")
+    (snap / "transformer" / "m.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"a": "shard-1.safetensors", "b": "shard-2.safetensors"}}), encoding="utf-8")
+    (snap / "transformer" / "shard-1.safetensors").write_bytes(b"x")
+    check(not fd._complete(snap), "a sharded part with a shard missing is not complete")
+    (snap / "transformer" / "shard-2.safetensors").write_bytes(b"x")
+    check(fd._complete(snap), "all shards present: complete")
+
+    repo = "owner/two-snaps"
+    root = Path(fd.MODELS) / "hub" / "models--owner--two-snaps"
+    (root / "snapshots" / "aaaa").mkdir(parents=True)
+    (root / "snapshots" / "zzzz").mkdir(parents=True)
+    (root / "refs").mkdir()
+    (root / "refs" / "main").write_text("aaaa\n", encoding="utf-8")
+    check(fd._snapshot(repo).name == "aaaa", "the snapshot refs/main names wins over the sort order")
+    (root / "refs" / "main").unlink()
+    os.utime(root / "snapshots" / "aaaa", (1, 1))
+    check(fd._snapshot(repo).name == "zzzz", "without refs/main the newest snapshot is used")
+
+    d = lambda t: fd._parse_describe(json.dumps({"prompt": "x" * 30, "explicit": t}))["explicit"]  # noqa: E731
+    check(d("false") is False and d("False ") is False and d(False) is False and d(None) is False,
+          "a quoted false (or no) is not explicit")
+    check(d(True) is True and d("true") is True, "true is still true")
+    check(fd._asked_seconds({"seconds": None}) == 5.0 and fd._asked_seconds({"seconds": "abc"}) == 5.0
+          and fd._asked_seconds({"seconds": "7"}) == 7.0, "the video length is read tolerantly")
 
 
 if __name__ == "__main__":

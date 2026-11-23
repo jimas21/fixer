@@ -161,6 +161,18 @@ struct ClearEverythingView: View {
         ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
     }
 
+    /// Beside the temporary folder: the cached Make recipe and add-on list (Desktop's make-recipes.json, in Caches),
+    /// every cookie, and decrypted temporary copies of sealed files.
+    private func wipeLeftovers() {
+        let fm = FileManager.default
+        for caches in fm.urls(for: .cachesDirectory, in: .userDomainMask) {
+            try? fm.removeItem(at: caches.appendingPathComponent("make-recipes.json"))
+        }
+        let jar = HTTPCookieStorage.shared
+        for cookie in jar.cookies ?? [] { jar.deleteCookie(cookie) }
+        SealedFiles.removeTempCopies()
+    }
+
     private func run() async {
         let before = inventory
         let createdBefore = created
@@ -209,13 +221,19 @@ struct ClearEverythingView: View {
         }
         let songsBefore = songCount
         await step("songs") {
-            if takeSongs { return plural(SongStore.shared.deleteAll(), "song", "songs") + " deleted" }
+            if takeSongs {
+                let n = SongStore.shared.deleteAll()
+                SealedFiles.forgetAll()                    // the songs are gone: their keys go from memory too
+                return plural(n, "song", "songs") + " deleted"
+            }
             SongStore.shared.cancel()
+            SongStore.shared.draft = SongDraft.fresh()     // the typed idea, lyrics and link are not a song: they go
             return songsBefore == 0 ? "None" : plural(songsBefore, "song", "songs") + " kept (Keep my songs is on)"
         }
         await step("scratch") {
             let n = History.scratchLeft
             History.wipeScratch()
+            wipeLeftovers()
             return n == 0 ? "Nothing was there" : plural(n, "file", "files") + " deleted"
         }
         await step("brain") { Brain.shared.forget(); return nil }

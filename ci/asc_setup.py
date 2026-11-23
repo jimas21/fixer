@@ -118,7 +118,8 @@ def ensure_internal_group(app_id: str) -> None:
                          "relationships": {"betaGroups": {"data": [{"type": "betaGroups", "id": group["id"]}]}}}})
             added += 1
         except RuntimeError as e:
-            print(f"::warning::Could not add one team member to the TestFlight group ({str(e)[:200]}).")
+            # status only: Apple's detail text can name the person's email, and this log is public
+            print(f"::warning::Could not add one team member to the TestFlight group ({str(e).split(':', 1)[0][:60]}).")
     print(f"TestFlight: added {added} of {len(users)} team member(s) to the group.")
 
 

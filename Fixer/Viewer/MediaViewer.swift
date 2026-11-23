@@ -15,6 +15,7 @@ struct MediaItem: Identifiable {
         case memory(UIImage)
         case sessionPicture(UUID)       // 11-22: a Make result; its pixels are faulted from MakeMedia on demand
         case chatVideo(URL)
+        case chatClip(conv: UUID, file: String)     // a sealed chat video: its playable copy is made when it is shown
     }
     let id: UUID
     var kind: Kind
@@ -54,6 +55,7 @@ final class MediaLoader: ObservableObject {
     @Published private(set) var images: [UUID: UIImage] = [:]
     @Published private(set) var videos: [UUID: URL] = [:]
     @Published private(set) var failed: Set<UUID> = []
+    @Published private(set) var clipRound = 0       // bumped when chat videos were made playable again
     private var temp: Set<UUID> = []
 
     func load(_ item: MediaItem) async {
@@ -65,14 +67,21 @@ final class MediaLoader: ObservableObject {
             // Decrypt + decode AND force-decode (preparingForDisplay) off the main thread, so the image handed to the
             // view is draw-ready and the pager never decodes a full-res bitmap mid-swipe. Only the on-screen result is
             // faulted, so a big session never decodes them all.
-            images[item.id] = await Task.detached(priority: .userInitiated) {
-                let ui = MakeMedia.shared.image(rid)
+            // 11-22: the real full picture only. If it is gone (cache evicted and scratch not written), say so rather
+            // than showing a thumbnail that Save or Share would then hand out as the picture.
+            let loaded = await Task.detached(priority: .userInitiated) { () -> UIImage? in
+                guard let ui = MakeMedia.shared.fullImage(rid) else { return nil }
                 return ui.preparingForDisplay() ?? ui
             }.value
+            if let loaded { images[item.id] = loaded } else { failed.insert(item.id) }
         case .chat(let conv, let file):
             if let ui = History.image(file, in: conv) { images[item.id] = await Self.ready(ui) } else { failed.insert(item.id) }
         case .chatVideo(let url):
             videos[item.id] = url
+        case .chatClip(let conv, let file):
+            // Decrypted off the main thread (a clip can be large); the copy is removed when the Library locks.
+            let url = await Task.detached(priority: .userInitiated) { History.playableVideo(file, in: conv) }.value
+            if let url { videos[item.id] = url } else { failed.insert(item.id) }
         case .library(let lid):
             if item.kind == .picture {
                 if let ui = await LibraryStore.shared.image(lid) { images[item.id] = await Self.ready(ui) } else { failed.insert(item.id) }
@@ -83,6 +92,22 @@ final class MediaLoader: ObservableObject {
                 failed.insert(item.id)
             }
         }
+    }
+
+    /// A chat video's playable copy is deleted when the app goes to the background (the Library locks). When the
+    /// app is back, makes it again for every chat video whose file is gone; `clipRound` rebuilds the players.
+    func refreshClips(_ items: [MediaItem]) async {
+        var again: [MediaItem] = []
+        for item in items {
+            guard case .chatClip = item.source, let url = videos[item.id],
+                  !FileManager.default.fileExists(atPath: url.path) else { continue }
+            videos[item.id] = nil
+            failed.remove(item.id)
+            again.append(item)
+        }
+        guard !again.isEmpty else { return }
+        clipRound += 1
+        for item in again { await load(item) }
     }
 
     /// Force-decode the bitmap off the main thread so the pager doesn't hitch decoding it on the first draw.
@@ -117,6 +142,7 @@ struct MediaViewer: View {
     var note: String?                   // the host's message ("1 picture blocked…")
 
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var phase
     @ObservedObject private var library = LibraryStore.shared
     @StateObject private var loader = MediaLoader()
     @State private var painting = false
@@ -180,6 +206,9 @@ struct MediaViewer: View {
             pruneAround(current)
         }
         .onChange(of: items.isEmpty) { _, empty in if empty { dismiss() } }
+        .onChange(of: phase) { _, now in
+            if now == .active { Task { await loader.refreshClips(items) } }     // temp copies went with the lock
+        }
         .onDisappear { loader.cleanUp() }
         .confirmationDialog(deleteTitle, isPresented: $confirmDelete, titleVisibility: .visible) {
             Button("Delete", role: .destructive) { deleteCurrent() }
@@ -192,14 +221,19 @@ struct MediaViewer: View {
 
     // MARK: pages
 
+    private func failedMessage(_ it: MediaItem) -> String {
+        if case .sessionPicture = it.source { return "The full picture is no longer available." }
+        return "That item couldn't be opened."
+    }
+
     @ViewBuilder private func page(_ it: MediaItem) -> some View {
         Group {
             if it.kind == .picture, let ui = loader.images[it.id] {
                 ZoomableImage(image: ui).ignoresSafeArea()
             } else if it.kind == .video, let url = loader.videos[it.id] {
-                VideoPage(url: url, active: it.id == current)
+                VideoPage(url: url, active: it.id == current).id(loader.clipRound)
             } else if loader.failed.contains(it.id) {
-                Text("That item couldn't be opened.").foregroundStyle(.white.opacity(0.7))
+                Text(failedMessage(it)).foregroundStyle(.white.opacity(0.7))
             } else {
                 ProgressView().tint(.white)
             }

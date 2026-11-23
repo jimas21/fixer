@@ -210,13 +210,16 @@ extension CreateScreen {
     /// Which LoRAs fit what the dock would make right now: the video model, the photo editor, or the picture model.
     var loraFamily: String {
         if mode == "video" { return videoLoraFamily }
-        if photo != nil, photoMode != "start" { return editor == "qwen21" ? "qwen21" : "qwen-edit" }
+        if photo != nil, photoMode != "start" { return editsWith21 ? "qwen21" : "qwen-edit" }
         return recipe?.loraFamily ?? ""
     }
 
+    /// 11-22: the computer edits with Qwen-Image 2.1 when the editor is 2.1, or Auto on a Qwen-Image 2.1 picture model.
+    var editsWith21: Bool { editor == "qwen21" || (editor == "auto" && recipeID == "qwen21") }
+
     var loraModelName: String {
         if mode == "video" { return "Wan 2.2 video" }
-        if photo != nil, photoMode != "start" { return editor == "qwen21" ? "Qwen-Image 2.1" : "Qwen Edit" }
+        if photo != nil, photoMode != "start" { return editsWith21 ? "Qwen-Image 2.1" : "Qwen Edit" }
         return recipe?.name ?? "this model"
     }
 

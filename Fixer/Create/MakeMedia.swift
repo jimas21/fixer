@@ -18,7 +18,8 @@ import UIKit
 ///     memory** and is never written to disk or the keychain. When the app exits the key is gone, so the files are
 ///     unreadable by anyone — not recoverable at rest. The directory is also wiped on launch and by "Clear everything",
 ///     and each file carries iOS file protection as a second layer.
-///   * Nothing plaintext is written to disk. The authoritative, restart-surviving copy of a result is still the
+///   * Nothing plaintext is written to disk for pictures (a made video waits in tmp so it can play; it is deleted by
+///     "Clear everything" and swept at the next launch). The authoritative, restart-surviving copy of a result is still the
 ///     encrypted Library (per-item key); this scratch is a fast, session-only cache that works even while the Library
 ///     is locked (Make saves while locked), so you never have to unlock just to scroll back through this session.
 ///   * Fewer plaintext bitmaps are resident than before, which only reduces exposure in memory.
@@ -63,7 +64,7 @@ final class MakeMedia: @unchecked Sendable {       // internally synchronized: N
         io.async { [weak self] in
             guard let self else { return }
             let hasAlpha = image.cgImage.map { ![.none, .noneSkipLast, .noneSkipFirst].contains($0.alphaInfo) } ?? false
-            let data = (hasAlpha ? image.pngData() : image.jpegData(compressionQuality: 0.95)) ?? Data()
+            let data = (hasAlpha ? image.pngData() : (image.jpegData(compressionQuality: 0.95) ?? image.pngData())) ?? Data()
             self.writeSealed(id, "f", data)
             if let t = thumb.jpegData(compressionQuality: 0.8) { self.writeSealed(id, "t", t) }
         }
@@ -74,13 +75,19 @@ final class MakeMedia: @unchecked Sendable {       // internally synchronized: N
     /// The full-resolution picture. Warm from the cache, else decrypt+decode from the scratch (a few ms, only for an
     /// evicted older picture), else the thumbnail as a last resort so something always shows.
     func image(_ id: UUID) -> UIImage {
+        fullImage(id) ?? thumb(id)
+    }
+
+    /// The real full-resolution picture, or nil when neither the cache nor the scratch still has it. Callers that send
+    /// or keep the picture (change, animate) use this so they never pass a thumbnail off as the original.
+    func fullImage(_ id: UUID) -> UIImage? {
         let key = id.uuidString as NSString
         if let hit = full.object(forKey: key) { return hit }
         if let d = readSealed(id, "f"), let ui = UIImage(data: d) {
             full.setObject(ui, forKey: key, cost: Self.cost(ui))
             return ui
         }
-        return thumb(id)
+        return nil
     }
 
     /// A small thumbnail for the roll and still-picker. Warm from the cache, else decrypt the tiny sealed thumb, else a
@@ -123,6 +130,8 @@ final class MakeMedia: @unchecked Sendable {       // internally synchronized: N
 
     private func writeSealed(_ id: UUID, _ ext: String, _ data: Data) {
         guard !data.isEmpty, let sealed = try? AES.GCM.seal(data, using: key).combined else { return }
+        // "Clear everything" (and the system's tmp cleanup) can remove the folder; make sure it is there before writing.
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         try? sealed.write(to: file(id, ext), options: [.atomic, .completeFileProtectionUnlessOpen])
     }
 

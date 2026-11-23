@@ -7,7 +7,7 @@ set -euo pipefail
 # a code change).
 major="${XCODE_MAJOR:-26}"
 if ! xcodebuild -version | grep -q "^Xcode ${major}"; then
-  x=$(ls -d /Applications/Xcode_${major}*.app 2>/dev/null | sort -V | tail -1)
+  x=$(ls -d /Applications/Xcode_${major}*.app 2>/dev/null | sort -V | tail -1 || true)
   [ -n "$x" ] || { echo "::error::No Xcode ${major} on this runner."; exit 1; }
   sudo xcode-select -s "$x/Contents/Developer"
 fi

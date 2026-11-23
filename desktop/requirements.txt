@@ -19,6 +19,7 @@ timm==1.0.31
 kornia==0.9.2
 einops==0.8.2
 ftfy
+av==16.0.1                  # MP4 writer for video (requirements-lock.txt pins the same)
 sentencepiece==0.2.3       # T5 tokenizer (Chroma)
 protobuf==7.36.2            # needed by the T5 tokenizer conversion
 yt-dlp==2026.10.26           # 11-20: song references from a link (the owner's own recordings on YouTube etc.)

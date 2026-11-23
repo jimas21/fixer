@@ -307,6 +307,120 @@ def case_leave_free_keeps_brain_off():
         brain.paused_for, brain.resume_wanted = None, False
 
 
+def case_chat_cancel_and_stream_errors():
+    """A cancel ends a chat read that is waiting for the model's first line; an error line or a stream that ends with
+    nothing is reported, not an empty reply."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    mode = {"m": "silent"}
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            if mode["m"] == "silent":
+                time.sleep(6)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            if mode["m"] == "error":
+                self.wfile.write(b'data: {"error": {"message": "boom"}}\n\n')
+            self.wfile.flush()
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    port, p = srv.server_address[1], {"messages": [{"role": "user", "text": "hi"}]}
+    saved_key, fd.LLAMA.key = fd.LLAMA.key, None
+    try:
+        cancel = threading.Event()
+        threading.Timer(0.5, cancel.set).start()
+        t0 = time.time()
+        fd._chat_llama_once(p, lambda o: None, cancel, port)
+        check(time.time() - t0 < 4, "a cancel ends a chat that is still waiting for the model's first line")
+        for m, what in (("error", "an error line in the stream"), ("empty", "a stream that ends with nothing")):
+            mode["m"] = m
+            try:
+                fd._chat_llama_once(p, lambda o: None, threading.Event(), port)
+                err = ""
+            except fd.UserFacing as e:
+                err = str(e)
+            check(err != "", f"{what} is reported to the phone")
+    finally:
+        fd.LLAMA.key = saved_key
+        srv.shutdown()
+        srv.server_close()
+
+
+def case_stop_during_a_start():
+    """A chat model start (download, load) does not hold the lock: stop() returns at once and the start gives up."""
+    brain = fd.LLAMA
+    real = (fd.ensure_files, fd.subprocess.Popen)
+    in_download, release = threading.Event(), threading.Event()
+    popened: list[int] = []
+
+    def slow_files(repo, files, status, kind="model"):
+        in_download.set()
+        release.wait(20)                               # a multi-GB download
+        return TMP
+    fd.ensure_files = slow_files
+    fd.subprocess.Popen = lambda *a, **k: popened.append(1)
+    result: dict = {}
+
+    def chat():
+        try:
+            brain.ensure("test/brain-gguf", ([], "w.gguf", None), lambda s: None)
+            result["port"] = True
+        except fd.UserFacing as e:
+            result["err"] = str(e)
+    try:
+        t = threading.Thread(target=chat)
+        t.start()
+        check(in_download.wait(10), "the start reached the download")
+        check(brain.state() == "loading", "state says loading during the download")
+        t0 = time.time()
+        brain.stop()
+        check(time.time() - t0 < 2, "stop() does not wait for the download")
+        release.set()
+        t.join(10)
+        check("err" in result and not popened and not brain.running(), f"the stopped start gives up and starts nothing ({result})")
+        check(brain.state() == "off", "state is off afterwards")
+    finally:
+        release.set()
+        fd.ensure_files, fd.subprocess.Popen = real
+        brain.stop()
+
+
+def case_queued_start_gives_up_after_a_stop():
+    """11-22: a chat queued on start_lock behind another start, when the model is then stopped (free memory, leave),
+    must not start it again once it gets the lock: it read the generation before it queued."""
+    brain = fd.LLAMA
+    real = (fd.ensure_files, fd.subprocess.Popen)
+    downloads, popened = [], []
+    fd.ensure_files = lambda *a, **k: downloads.append(1) or TMP
+    fd.subprocess.Popen = lambda *a, **k: popened.append(1)
+    result: dict = {}
+
+    def chat():
+        try:
+            brain.ensure("test/brain-gguf", ([], "w.gguf", None), lambda s: None)
+            result["port"] = True
+        except fd.UserFacing as e:
+            result["err"] = str(e)
+    try:
+        with brain.start_lock:                         # another start is under way
+            t = threading.Thread(target=chat)
+            t.start()
+            time.sleep(0.4)                            # the chat is now waiting on start_lock
+            brain.stop()                               # the model is stopped while it waits
+        t.join(10)
+        check("stopped before it was ready" in result.get("err", ""), f"the queued chat gives up ({result})")
+        check(not downloads and not popened and not brain.running(), "and it starts nothing")
+    finally:
+        fd.ensure_files, fd.subprocess.Popen = real
+        brain.stop()
+
+
 # ------------------------------------------------------------------ HTTP: leave, /local/state, /local/quit
 
 PHONE = "testphone"

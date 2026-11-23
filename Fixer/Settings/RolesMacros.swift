@@ -88,7 +88,7 @@ struct RolesMacros: View {
     private func save() async {
         saving = true; notice = nil
         do {
-            let r = try await desktop.macrosSet(roles: roles, macros: macros)
+            let r = try await desktop.saveRoles(roles)
             roles = r.roles; macros = r.macros; library = r.library
             notice = "Saved."
         } catch {

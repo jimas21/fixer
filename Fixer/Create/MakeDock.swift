@@ -604,7 +604,7 @@ extension CreateScreen {
     var changeTiles: some View {
         let redraw = changeMode == "redraw"
         let enhanceOn = enhanceEdits
-        return TileRow(weights: [1.6, 1, 1]) {
+        return TileRow(weights: redraw ? [1.6, 1, 1, 1] : [1.6, 1, 1]) {      // Redraw adds the Add-ons tile: four children
             Menu {
                 Picker("Editor", selection: $editor) {
                     Text("Auto").tag("auto")
@@ -803,7 +803,8 @@ struct WeightedRow: Layout {
     var spacing: CGFloat = 6
 
     private func widths(_ total: CGFloat, count: Int) -> [CGFloat] {
-        let w = Array(weights.prefix(count))
+        var w = Array(weights.prefix(count))
+        while w.count < count { w.append(1) }              // a child without a weight still gets placed
         let sum = w.reduce(0, +)
         guard sum > 0 else { return [] }
         let inner = total - spacing * CGFloat(Swift.max(0, count - 1))

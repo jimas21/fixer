@@ -240,6 +240,7 @@ struct ModelPicker: View {
     @State private var sort: HubCatalog.Sort = .trending
     @State private var results: [ModelEntry] = []
     @State private var loading = false
+    @State private var loadRun = 0                 // which load() is the latest; an older one's answer is dropped
     @State private var failed: String?
     @State private var search = ""
     @State private var customID = ""
@@ -348,11 +349,20 @@ struct ModelPicker: View {
     }
 
     private func load() async {
+        loadRun += 1
+        let run = loadRun
         loading = true
         failed = nil
         await loadInstalled()
-        do { results = try await HubCatalog.list(slot, sort: sort, search: search) }
-        catch { failed = "Couldn't reach Hugging Face. Pull down to try again." }
+        guard run == loadRun else { return }           // a newer load has started: its answer is the one to show
+        do {
+            let found = try await HubCatalog.list(slot, sort: sort, search: search)
+            guard run == loadRun else { return }
+            results = found
+        } catch {
+            guard run == loadRun else { return }
+            failed = "Couldn't reach Hugging Face. Pull down to try again."
+        }
         loading = false
     }
 

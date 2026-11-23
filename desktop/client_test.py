@@ -56,16 +56,13 @@ class TestPhone:
     def __enter__(self):
         self.id = "test-" + secrets.token_hex(4)
         self.key = secrets.token_bytes(32)
-        d = pair.load()
-        d["phones"][self.id] = {"name": "client_test", "key": base64.urlsafe_b64encode(self.key).decode().rstrip("=")}
-        pair.save(d)
+        entry = {"name": "client_test", "key": base64.urlsafe_b64encode(self.key).decode().rstrip("=")}
+        pair.update(lambda d: d["phones"].__setitem__(self.id, entry))   # locked, from a fresh read
         time.sleep(0.05)
         return self
 
     def __exit__(self, *a):
-        d = pair.load()
-        d["phones"].pop(self.id, None)
-        pair.save(d)
+        pair.update(lambda d: d["phones"].pop(self.id, None))
 
 
 def b64file(p: str) -> str:

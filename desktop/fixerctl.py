@@ -35,7 +35,7 @@ ROOT = Path(os.environ.get("FIXER_HOME", r"C:\FixerDesktop"))
 PORT = int(os.environ.get("FIXER_PORT", "8765"))
 TRAY_MUTEX = os.environ.get("FIXER_TRAY_MUTEX", r"Global\FixerDesktopTray")
 NO_WINDOW = 0x08000000
-DEPLOY_FILES = ["fixer_desktop.py", "comfy_guard.py", "tray.py", "taehv.py", "pair.py", "fixerctl.py", "client_test.py", "uninstall.ps1",
+DEPLOY_FILES = ["fixer_desktop.py", "fixer_secure.py", "comfy_guard.py", "tray.py", "taehv.py", "pair.py", "fixerctl.py", "client_test.py", "uninstall.ps1",
                 "trace_test.py"]
 SHELLS = {"powershell.exe", "pwsh.exe", "cmd.exe", "conhost.exe", "bash.exe", "sh.exe"}
 OWN_SCRIPTS = re.compile(r"""(^|[\\/"\s])(tray|pair|fixerctl)\.py\b""")
@@ -75,6 +75,8 @@ def is_leftover(pid, exe, cmdline, ppid, root, protect=()) -> bool:
     named = re.compile(re.escape(r) + r"\\(fixer_desktop\.py|comfyui|comfy-private)(?=$|[\\\"'\s])")
     if e and _under(e, r):
         if name in ("python.exe", "pythonw.exe") and _under(e, r + "\\venv\\scripts"):
+            if "multiprocessing.spawn" in c and "spawn_main" in c:        # the server's spawned helper names no path
+                return True
             return bool(named.search(c)) and "fixer_desktop.py" in c      # the venv launcher of the server
         return _under(e, r + "\\llama") or _under(e, r + "\\comfyui") or _under(e, r + "\\comfy-private") \
             or bool(named.search(c))
@@ -241,11 +243,14 @@ def resume_process(proc) -> bool:
         return False
 
 
-def _ps(script: str, env: dict | None = None, timeout: int = 30) -> str:
+def _ps(script: str, env: dict | None = None, timeout: int = 30, strict: bool = False) -> str:
+    """strict: a non-zero exit code raises (callers that must tell "failed" from "nothing there")."""
     e = dict(os.environ, **(env or {}))
     r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
                         "[Console]::OutputEncoding=[Text.Encoding]::UTF8;" + script],
                        capture_output=True, creationflags=NO_WINDOW, timeout=timeout, env=e)
+    if strict and r.returncode:
+        raise RuntimeError(f"powershell exited {r.returncode}")
     return r.stdout.decode("utf-8", "replace")
 
 
@@ -292,9 +297,9 @@ def port_pids(port: int = PORT) -> list[int]:
 
 def process_rows(root=ROOT) -> list[dict]:
     """One Get-CimInstance call, filtered inside PowerShell: processes that mention root or a tray/pair/fixerctl
-    script. Returns [{pid, ppid, name, exe, cmd}]. Empty list if the call fails."""
+    script. Returns [{pid, ppid, name, exe, cmd}]. None if the call fails (so "could not look" is not "nothing there")."""
     script = (
-        "$r=$env:FX_ROOT;"
+        "$ErrorActionPreference='Stop';$r=$env:FX_ROOT;"
         "$rows=@(Get-CimInstance Win32_Process | Where-Object {"
         "($_.ExecutablePath -and $_.ExecutablePath.IndexOf($r,[StringComparison]::OrdinalIgnoreCase) -ge 0) -or "
         "($_.CommandLine -and ($_.CommandLine.IndexOf($r,[StringComparison]::OrdinalIgnoreCase) -ge 0 -or "
@@ -302,9 +307,13 @@ def process_rows(root=ROOT) -> list[dict]:
         "Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine);"
         "ConvertTo-Json -InputObject $rows -Compress")
     try:
-        data = json.loads(_ps(script, {"FX_ROOT": str(root)}, timeout=40) or "[]")
+        # a successful listing always prints JSON ("[]" when empty): blank output or a non-zero exit is a failed call
+        out = _ps(script, {"FX_ROOT": str(root)}, timeout=40, strict=True)
+        if not out.strip():
+            return None
+        data = json.loads(out)
     except Exception:
-        return []
+        return None
     if isinstance(data, dict):
         data = [data]
     return [{"pid": d.get("ProcessId"), "ppid": d.get("ParentProcessId"), "name": d.get("Name") or "",
@@ -313,17 +322,21 @@ def process_rows(root=ROOT) -> list[dict]:
 
 def find_leftovers(root=ROOT, protect=(), rows=None) -> list[dict]:
     rows = process_rows(root) if rows is None else rows
-    return [d for d in rows if is_leftover(d["pid"], d["exe"], d["cmd"], d["ppid"], root, protect)]
+    return [d for d in rows or [] if is_leftover(d["pid"], d["exe"], d["cmd"], d["ppid"], root, protect)]
 
 
 def find_trays(protect=(), rows=None) -> list[dict]:
     rows = process_rows(ROOT) if rows is None else rows
-    return [d for d in rows if d["pid"] not in protect and is_tray(d["exe"], d["cmd"])]
+    return [d for d in rows or [] if d["pid"] not in protect and is_tray(d["exe"], d["cmd"])]
 
 
-def install_owned(pid, root=ROOT, protect=()) -> bool:
-    """Is this pid one of the install's own processes (is_leftover rule)? Used before killing a port owner."""
-    for d in process_rows(root):
+def install_owned(pid, root=ROOT, protect=()) -> bool | None:
+    """Is this pid one of the install's own processes (is_leftover rule)? Used before killing a port owner.
+    None when the process list could not be read: unknown, which is not the same as "not ours"."""
+    rows = process_rows(root)
+    if rows is None:
+        return None
+    for d in rows:
         if d["pid"] == pid:
             return is_leftover(d["pid"], d["exe"], d["cmd"], d["ppid"], root, protect)
     return False
@@ -355,7 +368,7 @@ def stop_everything(root=ROOT, port=PORT, proc=None, job=None, protect=(), wait=
     11-18: never raises on a kill: a pid that could not be killed is listed in report["unkilled"]."""
     protect = set(protect)
     rep = {"polite": False, "old_server": False, "forced": False, "killed": [], "swept": [], "port_closed": False,
-           "remaining": [], "ok": False, "foreign": [], "unkilled": []}
+           "remaining": [], "ok": False, "foreign": [], "unkilled": [], "unlisted": False}
 
     def kill(pid, into):
         """11-18: kill_tree, noting the pid in rep["unkilled"] when it could not be killed (ok is then False)."""
@@ -368,15 +381,26 @@ def stop_everything(root=ROOT, port=PORT, proc=None, job=None, protect=(), wait=
     spid = (st or {}).get("pid")
     # 11-20: the server on this port may be ANOTHER install's (the live one, while a test install in another folder
     # is stopped or uninstalled). Asking it to quit stopped the owner's live server once; only this install's own.
-    if spid and pid_alive(spid) and spid not in protect and not install_owned(spid, root, protect):
+    owned = install_owned(spid, root, protect) if spid and pid_alive(spid) and spid not in protect else True
+    if owned is None:
+        # the process list could not be read (a PC that is thrashing): whose server this is, is not known. Touch
+        # nothing and do not report a stop that did not happen.
+        say(f"could not list the running programs, so cannot tell whether the server on port {port} (pid {spid}) is "
+            "this install's; not touching it")
+        rep["remaining"] = [spid]
+        rep["port_closed"] = not port_open(port)
+        return rep                                         # ok stays False
+    if not owned:
         say(f"the server on port {port} belongs to another install (pid {spid}); not touching it")
         rep["foreign"].append(spid)
         st = spid = None
         for d in find_leftovers(root, protect):
             kill(d["pid"], "swept")
-        rep["remaining"] = [d["pid"] for d in find_leftovers(root, protect)]
+        rows = process_rows(root)
+        rep["unlisted"] = rows is None
+        rep["remaining"] = [d["pid"] for d in find_leftovers(root, protect, rows)] if rows is not None else []
         rep["port_closed"] = True                          # nothing of THIS install holds it
-        rep["ok"] = not rep["remaining"]
+        rep["ok"] = not rep["remaining"] and not rep["unlisted"]
         return rep
     alive = port_open(port) or (proc is not None and proc.poll() is None) or bool(spid and pid_alive(spid))
     clean = not alive
@@ -403,11 +427,14 @@ def stop_everything(root=ROOT, port=PORT, proc=None, job=None, protect=(), wait=
             for pid in port_pids(port):
                 if pid in protect:
                     continue
-                if install_owned(pid, root, protect):
+                owner = install_owned(pid, root, protect)
+                if owner:
                     kill(pid, "killed")
                 else:
                     rep["foreign"].append(pid)
-                    say(f"port {port} is held by another program (pid {pid}); not touching it")
+                    say(f"port {port} is held by another program (pid {pid}); not touching it" if owner is not None
+                        else f"could not list the running programs to tell who holds port {port} (pid {pid}); "
+                             "not touching it")
         _wait(port, proc, spid, 5)
     left = find_leftovers(root, protect)
     for d in left:
@@ -415,11 +442,15 @@ def stop_everything(root=ROOT, port=PORT, proc=None, job=None, protect=(), wait=
     if left:
         say("swept leftovers: " + ", ".join(f'{d["name"]} {d["pid"]}' for d in left))
         _sleep(1)
-    rep["remaining"] = [d["pid"] for d in find_leftovers(root, protect)]
+    rows = process_rows(root)
+    rep["unlisted"] = rows is None                         # the final listing could not be read: not a confirmed stop
+    if rows is None:
+        say("could not list the running programs to confirm nothing is left")
+    rep["remaining"] = [d["pid"] for d in find_leftovers(root, protect, rows)] if rows is not None else []
     rep["port_closed"] = not port_open(port)
     # 11-18: a pid we could not kill that is still alive is not a stop (one that died anyway does not count)
     still = [p for p in rep["unkilled"] if pid_alive(p)]
-    rep["ok"] = rep["port_closed"] and not rep["remaining"] and not still
+    rep["ok"] = rep["port_closed"] and not rep["remaining"] and not still and not rep["unlisted"]
     return rep
 
 
@@ -460,6 +491,9 @@ def _me() -> set:
 
 def cmd_status(args) -> int:
     rows = process_rows(ROOT)
+    if rows is None:
+        print("could not list the running programs (the PC may be busy); the lists below may be incomplete")
+        rows = []
     me = _me()
     trays = find_trays(me, rows)
     print(f"install: {ROOT}   port: {PORT}")
@@ -481,7 +515,11 @@ def cmd_status(args) -> int:
 
 def cmd_stop(args) -> int:
     rep = stop_everything(ROOT, PORT, protect=_me(), say=print)
-    trays = find_trays(_me())
+    # 11-22: one listing, and a failed one (None) is "could not confirm", never "no trays". It is listed again only
+    # after trays were ended (the first listing is stale then), and that one can fail the same way.
+    rows = process_rows(ROOT)
+    unlisted = rows is None
+    trays = find_trays(_me(), rows or [])
     for t in trays:
         kill_tree(t["pid"])
     if trays:
@@ -490,14 +528,18 @@ def cmd_stop(args) -> int:
         rep2 = find_leftovers(ROOT, _me())              # a tray's end closes its job: catch anything still there
         for d in rep2:
             kill_tree(d["pid"])
-    left_trays = find_trays(_me())
+        rows = process_rows(ROOT)
+        unlisted = rows is None
+    left_trays = find_trays(_me(), rows or [])
     print(f"server: {'stopped by asking it' if rep['polite'] else 'stopped by force' if rep['forced'] else 'was not running'}")
     print(f"port {PORT}: {'closed' if rep['port_closed'] else 'STILL OPEN'}")
     if rep["swept"]:
         print("swept leftovers: " + ", ".join(map(str, rep["swept"])))
     if rep["remaining"] or left_trays:
         print("STILL RUNNING: " + ", ".join(map(str, rep["remaining"] + [t["pid"] for t in left_trays])))
-    ok = rep["ok"] and not left_trays
+    if rep.get("unlisted") or unlisted:
+        print("could not list the running programs, so a leftover cannot be ruled out")
+    ok = rep["ok"] and not left_trays and not unlisted
     print("everything is stopped" if ok else "NOT everything stopped")
     return 0 if ok else 1
 
@@ -541,6 +583,21 @@ def _differs(a: Path, b: Path) -> bool:
     return not b.is_file() or a.read_bytes() != b.read_bytes()
 
 
+def _put(src: Path, dst: Path):
+    """Copies via a temp file beside dst, then swaps it in, so a file is never left half written."""
+    tmp = dst.with_name(dst.name + ".new")
+    shutil.copyfile(src, tmp)
+    os.replace(tmp, dst)
+
+
+def _autostarts() -> bool:
+    """Does the tray start the server by itself? (tray.json, the same default as the tray: yes)"""
+    try:
+        return bool(json.loads((ROOT / "tray.json").read_text(encoding="utf-8")).get("on_at_login", True))
+    except Exception:
+        return True
+
+
 def cmd_deploy(args) -> int:
     if HERE.resolve() == ROOT.resolve():
         print("this fixerctl.py already runs from the install; run it from the repo's desktop folder to deploy")
@@ -563,12 +620,53 @@ def cmd_deploy(args) -> int:
         if r.returncode:
             print(f"{n} does not compile; nothing was copied:\n{r.stderr.strip()[-400:]}")
             return 1
-    for n in todo:
-        shutil.copyfile(HERE / n, ROOT / n)
-        print(f"copied {n}")
+    backed = []
+
+    def put_back() -> bool:
+        ok = True
+        for n in backed:                                 # every file that was backed up, even if one restore fails
+            try:
+                _put(ROOT / (n + ".bak"), ROOT / n)
+                print(f"restored {n}")
+            except Exception as ex:
+                ok = False
+                print(f"could not restore {n}: {ex}")
+        return ok
+
+    try:
+        for n in todo:
+            if (ROOT / n).is_file():                     # keep the working file as n.bak until the server is seen back
+                shutil.copyfile(ROOT / n, ROOT / (n + ".bak"))
+                backed.append(n)
+            _put(HERE / n, ROOT / n)
+            print(f"copied {n}")
+    except Exception as ex:                              # a copy failed part way: do not leave a mix of old and new
+        print(f"copying failed ({ex}); putting the previous files back")
+        put_back()
+        return 1
     if not todo:
         print("install already matches this folder")
-    return cmd_restart(args)
+    rc = cmd_restart(args)
+    if not todo:
+        return rc
+    if rc:
+        print(f"the restart failed (code {rc}) after the new files were copied; putting the previous ones back")
+    elif not st or not _autostarts():
+        return 0                                         # only check the server when it was up and starts by itself
+    else:
+        end = _mono() + 90
+        while _mono() < end:
+            if state(PORT) is not None:
+                return 0
+            _sleep(1)
+        print("the server did not come back within 90 s with the new files; putting the previous ones back")
+    if not put_back():
+        print("some previous files could not be put back; check the .bak files in the install folder")
+        return 1
+    rc = cmd_restart(args)
+    print("the previous files are back; see server.log in the install folder for why the new ones failed"
+          if not rc else "the previous files are back but the restart failed too")
+    return 1
 
 
 COMMANDS = {"status": cmd_status, "stop": cmd_stop, "start": cmd_start, "restart": cmd_restart, "deploy": cmd_deploy}

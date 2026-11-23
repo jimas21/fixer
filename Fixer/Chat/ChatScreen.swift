@@ -256,7 +256,8 @@ struct ChatMediaViewer: View {
                                  enhanced: m.enhanced)
             }
             if let video = m.video {
-                return MediaItem(id: m.id, kind: .video, source: .chatVideo(History.videoURL(video, in: conv)),
+                // The viewer makes the playable copy itself when the page appears (and again after the app was away).
+                return MediaItem(id: m.id, kind: .video, source: .chatClip(conv: conv, file: video),
                                  libraryID: m.libraryID)
             }
             return nil
@@ -286,7 +287,8 @@ struct ChatMediaViewer: View {
     }
 
     var body: some View {
-        MediaViewer(items: items, current: $current, actions: actions, busy: chat.busy)
+        MediaViewer(items: items, current: $current, actions: actions,
+                    busy: chat.busy ?? (chat.phoneWork ? "Drawing on this iPhone…" : nil))
     }
 }
 
@@ -307,6 +309,44 @@ struct EnhancedPromptNote: View {
         }
         .padding(.horizontal, 10)
         .frame(maxWidth: 260)
+    }
+}
+
+/// A video in the conversation. Its file is sealed, so the player gets a decrypted temporary copy; those copies are
+/// deleted when the app goes to the background. The copy is made when the row appears and made again when the app
+/// becomes active (or the file is gone), and a clip that can't be read right now shows a plain placeholder.
+private struct ChatVideo: View {
+    let name: String
+    let conversation: UUID
+    var onFull: () -> Void
+    @Environment(\.scenePhase) private var phase
+    @State private var url: URL?
+    @State private var round = 0            // a new player is built whenever the copy was made again
+
+    var body: some View {
+        Group {
+            if let url {
+                InlineVideo(url: url, onFull: onFull).id(round)
+            } else {
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(Color.black.opacity(0.85))
+                    .frame(width: 260, height: 146)
+                    .overlay {
+                        Label("Video unavailable", systemImage: "lock.fill")
+                            .font(.footnote).foregroundStyle(.white.opacity(0.7))
+                    }
+            }
+        }
+        .task(id: name) { await resolve() }
+        .onChange(of: phase) { _, now in if now == .active { Task { await resolve() } } }
+    }
+
+    private func resolve() async {
+        if let url, FileManager.default.fileExists(atPath: url.path) { return }
+        let (file, conv) = (name, conversation)
+        let fresh = await Task.detached(priority: .userInitiated) { History.playableVideo(file, in: conv) }.value
+        if fresh != nil || url != nil { round += 1 }
+        url = fresh
     }
 }
 
@@ -338,7 +378,7 @@ struct MessageView: View {
                     if let enhanced = message.enhanced, !enhanced.isEmpty { EnhancedPromptNote(text: enhanced) }
                 }
                 if let name = message.video {
-                    InlineVideo(url: History.videoURL(name, in: conversation), onFull: onOpenVideo)
+                    ChatVideo(name: name, conversation: conversation, onFull: onOpenVideo)
                 }
                 if let thought = message.thought, !thought.isEmpty {
                     DisclosureGroup {
@@ -500,18 +540,26 @@ struct HistorySheet: View {
     @ObservedObject var chat: Chat
     var onCleared: () -> Void = {}
     @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var library = LibraryStore.shared
     @State private var items: [Conversation] = []
+    @State private var lockedCount = 0          // conversations that stay sealed until the owner unlocks
+    @State private var lockedNote: String?
 
     var body: some View {
         NavigationStack {
             List {
-                if items.isEmpty {
+                if items.isEmpty, lockedCount == 0 {
                     Text("No saved conversations yet.").foregroundStyle(.secondary)
+                }
+                if lockedCount > 0, library.state != .unlocked {
+                    lockedRow
+                }
+                if let lockedNote {
+                    Text(lockedNote).font(.footnote).foregroundStyle(.red)
                 }
                 ForEach(items) { c in
                     Button {
-                        chat.open(c)
-                        dismiss()
+                        Task { await openConversation(c) }
                     } label: {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(c.title).lineLimit(1)
@@ -520,7 +568,7 @@ struct HistorySheet: View {
                     }
                 }
                 .onDelete { idx in
-                    for i in idx { History.delete(items[i].id) }
+                    for i in idx { chat.deleteConversation(items[i].id) }
                     items.remove(atOffsets: idx)
                 }
                 TidyFreeSection()
@@ -531,7 +579,65 @@ struct HistorySheet: View {
                 ToolbarItem(placement: .topBarLeading) { Button("New chat") { chat.newChat(); dismiss() } }
                 ToolbarItem(placement: .topBarTrailing) { Button("Done") { dismiss() } }
             }
-            .onAppear { chat.save(); items = History.list() }
+            .onAppear { chat.save(); reload() }
+            .task { await askIfLocked() }
+            .onChange(of: library.state) { _, now in if now != .unlocking { reload() } }
+        }
+    }
+
+    private func reload() {
+        items = History.list()
+        lockedCount = History.lockedCount
+    }
+
+    /// Sealed conversations need the owner: asked once when the sheet opens (Cancel leaves the Unlock row).
+    private func askIfLocked() async {
+        // automatic: a Face ID prompt the owner cancelled isn't raised again each time History opens (the row's
+        // Unlock button still asks).
+        if History.lockedCount > 0, library.state != .unlocked { await library.unlock(automatic: true); reload() }
+    }
+
+    private func unlockAndReload() async {
+        await library.unlock()
+        reload()
+    }
+
+    /// Opens a saved conversation. Its pictures and videos may be sealed too (the conversation can be readable
+    /// because it was written this run); the owner is asked before it opens so nothing shows up blank.
+    private func openConversation(_ c: Conversation) async {
+        lockedNote = nil
+        if History.hasLockedFiles(c.id), library.state != .unlocked { await library.unlock() }
+        if History.hasLockedFiles(c.id) {
+            lockedNote = "Unlock with Face ID or your passcode to open this conversation."
+            reload()
+            return
+        }
+        chat.open(History.load(c.id) ?? c)          // the saved copy, with any results that arrived while it was locked
+        dismiss()
+    }
+
+    private var lockedRow: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "lock.fill").font(.title3).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(lockedCount) \(lockedCount == 1 ? "conversation is" : "conversations are") locked")
+                if case .unavailable(let why) = library.state {
+                    Text(why).font(.footnote).foregroundStyle(.secondary)
+                } else {
+                    Text("Unlock with Face ID or your passcode to see \(lockedCount == 1 ? "it" : "them").")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            if library.state == .unlocking {
+                ProgressView()
+            } else if case .unavailable = library.state {
+                EmptyView()
+            } else {
+                Button("Unlock") { Task { await unlockAndReload() } }
+                    .buttonStyle(.borderedProminent)
+                    .frame(minHeight: 44)
+            }
         }
     }
 }

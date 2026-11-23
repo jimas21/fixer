@@ -28,6 +28,8 @@ struct Conversation: Identifiable, Codable, Equatable {
 }
 
 /// Conversations saved on the phone: Application Support/Conversations/<id>/conversation.json + images.
+/// Everything in there is sealed (SealedFiles): readable with no prompt for what this run wrote or opened, and for
+/// the rest only after the Library's Face ID unlock.
 enum History {
     static var root: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -35,32 +37,149 @@ enum History {
     }
     static func folder(_ id: UUID) -> URL { root.appendingPathComponent(id.uuidString, isDirectory: true) }
 
+    private static let conversationName = "conversation.json"
+    /// Results that arrived for a conversation that was sealed and locked at that moment: a sealed list of messages
+    /// beside conversation.json, folded in (and deleted) the next time the conversation can be read.
+    private static let pendingPrefix = "pending-"
+    /// Serialises conversation.json writes with the launch upgrade of older plain files, so the upgrade can never
+    /// put an older copy back over a newer save.
+    private static let fileLock = NSLock()
+    private static var activeID: UUID?          // the open conversation (guarded by fileLock)
+    private static let imageCache: NSCache<NSString, UIImage> = {
+        let c = NSCache<NSString, UIImage>()
+        c.countLimit = 16
+        return c
+    }()
+
+    private static func conversationFile(_ id: UUID) -> URL { folder(id).appendingPathComponent(conversationName) }
+
+    private static func contents(of dir: URL) -> [URL] {
+        (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
+    }
+
+    private static func isPending(_ url: URL) -> Bool {
+        url.lastPathComponent.hasPrefix(pendingPrefix) && url.pathExtension.lowercased() == "json"
+    }
+
+    /// Drops decoded pictures held in memory (the app is leaving the screen, or files were deleted).
+    static func dropCaches() { imageCache.removeAllObjects() }
+
     static func list() -> [Conversation] {
-        let dirs = (try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? []
-        return dirs.compactMap { dir in
-            guard let data = try? Data(contentsOf: dir.appendingPathComponent("conversation.json")) else { return nil }
-            return try? JSONDecoder().decode(Conversation.self, from: data)
+        contents(of: root).compactMap { dir in
+            guard let data = SealedFiles.read(dir.appendingPathComponent(conversationName)),
+                  let c = try? JSONDecoder().decode(Conversation.self, from: data) else { return nil }
+            return merged(c, in: dir)
         }.sorted { $0.updated > $1.updated }
     }
 
-    static func save(_ c: Conversation) {
-        guard !c.messages.isEmpty else { return }
-        let dir = folder(c.id)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        if let data = try? JSONEncoder().encode(c) {
-            try? data.write(to: dir.appendingPathComponent("conversation.json"),
-                            options: [.atomic, .completeFileProtectionUnlessOpen])
-        }
+    /// How many saved conversations are sealed and can't be opened until the owner unlocks.
+    static var lockedCount: Int {
+        contents(of: root).filter { SealedFiles.isLocked($0.appendingPathComponent(conversationName)) }.count
+    }
+
+    @discardableResult
+    static func save(_ c: Conversation) -> Bool {
+        guard !c.messages.isEmpty, let data = try? JSONEncoder().encode(c) else { return false }
+        return fileLock.withLock { SealedFiles.write(data, to: conversationFile(c.id)) }
     }
 
     /// One saved conversation by id (11-17: a result that arrives for a chat that isn't the open one goes into its file).
+    /// nil when it is gone, or sealed and locked (`isLocked`).
     static func load(_ id: UUID) -> Conversation? {
-        guard let data = try? Data(contentsOf: folder(id).appendingPathComponent("conversation.json")) else { return nil }
-        return try? JSONDecoder().decode(Conversation.self, from: data)
+        guard let data = SealedFiles.read(conversationFile(id)),
+              let c = try? JSONDecoder().decode(Conversation.self, from: data) else { return nil }
+        return merged(c, in: folder(id))
     }
 
-    static func delete(_ id: UUID) { try? FileManager.default.removeItem(at: folder(id)) }
-    static func deleteAll() { try? FileManager.default.removeItem(at: root) }
+    /// True when the conversation is there but sealed and not readable until the owner unlocks.
+    static func isLocked(_ id: UUID) -> Bool { SealedFiles.isLocked(conversationFile(id)) }
+
+    /// True when any file of the conversation (its pictures, videos, pending results) is sealed and not readable now.
+    static func hasLockedFiles(_ id: UUID) -> Bool {
+        contents(of: folder(id)).contains { SealedFiles.isLocked($0) }
+    }
+
+    /// A result for a conversation that isn't open can be filed: it is readable, or sealed and locked (then it goes
+    /// into a pending file). False when the conversation is gone.
+    static func canReceive(_ id: UUID) -> Bool { isLocked(id) || load(id) != nil }
+
+    /// Files a message for a conversation that can't be read right now: a sealed side file in its folder.
+    @discardableResult
+    static func addPending(_ m: Message, to id: UUID) -> Bool {
+        guard let data = try? JSONEncoder().encode([m]) else { return false }
+        return SealedFiles.write(data, to: folder(id).appendingPathComponent(pendingPrefix + UUID().uuidString + ".json"))
+    }
+
+    /// `c` with its pending results folded in (by date) and saved; the pending files go only after that save worked.
+    /// A pending file that can't be read or decoded is left where it is.
+    private static func merged(_ c: Conversation, in dir: URL) -> Conversation {
+        let files = contents(of: dir).filter(isPending).sorted { $0.lastPathComponent < $1.lastPathComponent }
+        guard !files.isEmpty else { return c }
+        var out = c
+        var known = Set(out.messages.map { $0.id })
+        var taken: [URL] = []
+        for url in files {
+            guard let data = SealedFiles.read(url),
+                  let arrived = try? JSONDecoder().decode([Message].self, from: data) else { continue }
+            for m in arrived where known.insert(m.id).inserted {
+                let at = out.messages.firstIndex { $0.date > m.date } ?? out.messages.count
+                out.messages.insert(m, at: at)
+            }
+            taken.append(url)
+        }
+        guard !taken.isEmpty else { return c }
+        if let newest = out.messages.map({ $0.date }).max() { out.updated = max(out.updated, newest) }
+        if save(out) {
+            for url in taken {
+                try? FileManager.default.removeItem(at: url)
+                SealedFiles.forget(url)
+            }
+        }
+        return out
+    }
+
+    /// Called when a conversation is opened: files an older build wrote in the clear are sealed now with their key
+    /// kept, then every key in the folder is kept, so the conversation on screen stays readable after the Library
+    /// locks (switching to another app and back).
+    static func keepOpen(_ id: UUID) {
+        let dir = folder(id)
+        fileLock.withLock { activeID = id }
+        for url in contents(of: dir) where !SealedFiles.isSealed(url) {
+            sealOlder(url, keepKey: true)
+        }
+        SealedFiles.keep(folder: dir)
+    }
+
+    /// Launch migration: seals every file an older build wrote in the clear. Never deletes anything; a file that
+    /// appears or disappears meanwhile is simply skipped. The open conversation's folder is left to `keepOpen`.
+    static func sealLegacy() {
+        guard let walk = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey]) else { return }
+        for case let url as URL in walk {
+            guard (try? url.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true else { continue }
+            let open = fileLock.withLock { activeID }
+            if let open, url.deletingLastPathComponent().lastPathComponent == open.uuidString { continue }
+            if !SealedFiles.isSealed(url) { sealOlder(url, keepKey: false) }
+        }
+    }
+
+    /// Seals one older plain file. Only the small JSON files are done under `fileLock` (a save rewrites those, and the
+    /// upgrade must not put an older copy back); pictures and videos are never rewritten, so sealing a large one
+    /// doesn't hold up a save on the main thread.
+    private static func sealOlder(_ url: URL, keepKey: Bool) {
+        if url.pathExtension.lowercased() == "json" {
+            fileLock.withLock { _ = SealedFiles.seal(inPlace: url, keepKey: keepKey) }
+        } else {
+            SealedFiles.seal(inPlace: url, keepKey: keepKey)
+        }
+    }
+
+    static func delete(_ id: UUID) {
+        let dir = folder(id)
+        for url in contents(of: dir) { SealedFiles.forget(url) }
+        try? FileManager.default.removeItem(at: dir)
+        dropCaches()
+    }
+    static func deleteAll() { try? FileManager.default.removeItem(at: root); dropCaches() }
 
     static let pictureTypes: Set<String> = ["jpg", "jpeg", "png", "heic", "heif", "webp", "gif"]
     static let videoTypes: Set<String> = ["mp4", "mov", "m4v"]
@@ -81,7 +200,7 @@ enum History {
             let ext = url.pathExtension.lowercased()
             if pictureTypes.contains(ext) { inv.pictures += 1 }
             else if videoTypes.contains(ext) { inv.videos += 1 }
-            else if url.lastPathComponent != "conversation.json" { inv.other += 1 }
+            else if url.lastPathComponent != conversationName, !isPending(url) { inv.other += 1 }   // pending results are part of their conversation
         }
         return inv
     }
@@ -93,8 +212,9 @@ enum History {
         guard let walk = fm.enumerator(at: root, includingPropertiesForKeys: nil) else { return 0 }
         var n = 0
         for case let url as URL in walk where types.contains(url.pathExtension.lowercased()) {
-            if (try? fm.removeItem(at: url)) != nil { n += 1 }
+            if (try? fm.removeItem(at: url)) != nil { SealedFiles.forget(url); n += 1 }
         }
+        dropCaches()
         return n
     }
 
@@ -126,27 +246,31 @@ enum History {
     }
 
     static func store(_ image: UIImage, in id: UUID) -> String? {
-        let dir = folder(id)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let alpha = image.cgImage.map { ![.none, .noneSkipLast, .noneSkipFirst].contains($0.alphaInfo) } ?? false
         let name = UUID().uuidString + (alpha ? ".png" : ".jpg")
         guard let data = alpha ? image.pngData() : image.jpegData(compressionQuality: 0.92) else { return nil }
-        do { try data.write(to: dir.appendingPathComponent(name), options: .completeFileProtectionUnlessOpen); return name }
-        catch { return nil }
+        return SealedFiles.write(data, to: folder(id).appendingPathComponent(name)) ? name : nil
     }
 
     static func storeVideo(_ data: Data, in id: UUID) -> String? {
-        let dir = folder(id)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let name = UUID().uuidString + ".mp4"
-        do { try data.write(to: dir.appendingPathComponent(name), options: .completeFileProtectionUnlessOpen); return name }
-        catch { return nil }
+        return SealedFiles.write(data, to: folder(id).appendingPathComponent(name)) ? name : nil
     }
 
-    static func videoURL(_ name: String, in id: UUID) -> URL { folder(id).appendingPathComponent(name) }
+    /// A playable (decrypted, temporary) copy of a conversation's video, for a player or a thumbnail. The copy is
+    /// deleted when the Library locks (the app goes to the background) and at launch, so never hold on to the URL:
+    /// ask again when the view appears and when the app becomes active. nil when the video can't be read right now.
+    static func playableVideo(_ name: String, in id: UUID) -> URL? {
+        SealedFiles.tempCopy(of: folder(id).appendingPathComponent(name))
+    }
 
     static func image(_ name: String, in id: UUID) -> UIImage? {
-        UIImage(contentsOfFile: folder(id).appendingPathComponent(name).path)
+        let url = folder(id).appendingPathComponent(name)
+        let key = url.path as NSString
+        if let hit = imageCache.object(forKey: key) { return hit }
+        guard let data = SealedFiles.read(url), let ui = UIImage(data: data) else { return nil }
+        imageCache.setObject(ui, forKey: key)
+        return ui
     }
 }
 
@@ -172,6 +296,7 @@ final class Chat: ObservableObject {
     private var photoUnseen = false        // the brain hasn't been shown the current photo yet
     private var photoLibraryID: UUID?      // the Library copy of the photo being worked on (the parent of what comes next)
     private var task: Task<Void, Never>?
+    private var sendGen = 0                // which send() is the latest (a stopped one must not touch busy)
     private var thinkingLabel = "Thinking…"    // "Writing the prompt…" while a picture's prompt is being written
 
     /// Computer work this chat started (11-17): runs in the background, so the conversation stays usable meanwhile.
@@ -214,7 +339,26 @@ final class Chat: ObservableObject {
         Brain.shared.resetChat()
     }
 
+    /// Deletes a saved conversation. If it is the open one, the in-memory copy goes too (without saving), so the
+    /// next New chat or send can't write the deleted chat back.
+    func deleteConversation(_ id: UUID) {
+        if id == conversation.id {
+            stopThisChat()
+            stop()
+            conversation = Conversation()
+            photo = nil
+            photoLibraryID = nil
+            undoStack = []
+            clearMask()
+            pendingPlan = nil
+            photoUnseen = false
+            Brain.shared.resetChat()
+        }
+        History.delete(id)
+    }
+
     func open(_ c: Conversation) {
+        History.keepOpen(c.id)        // keeps every key in its folder, so it stays readable after the Library re-locks
         stop()
         save()
         conversation = c
@@ -280,7 +424,12 @@ final class Chat: ObservableObject {
     /// A message into conversation `conv`: the open one in memory, any other straight into its saved file.
     private func post(_ m: Message, to conv: UUID) {
         if conv == conversation.id { append(m); save(); return }
-        guard var c = History.load(conv) else { return }        // deleted meanwhile: dropped
+        guard var c = History.load(conv) else {
+            // Sealed and locked right now: the message waits in a sealed side file and joins the conversation the next
+            // time it can be read. Otherwise the conversation was deleted meanwhile: dropped.
+            if History.isLocked(conv) { History.addPending(m, to: conv) }
+            return
+        }
         c.messages.append(m)
         c.updated = Date()
         History.save(c)
@@ -352,7 +501,7 @@ final class Chat: ObservableObject {
         guard !Task.isCancelled else { return }        // stopped job: nothing is kept
         if let conv, conv != conversation.id {
             // 11-17: the result of work started in another chat lands in that chat, not in the one on screen.
-            guard History.load(conv) != nil else { return }
+            guard History.canReceive(conv) else { return }        // gone (a locked one still takes it, see `post`)
             let ui = UIImage(cgImage: cg)
             var m = Message(role: .fixer, text: caption, image: History.store(ui, in: conv))
             m.enhanced = made?.enhanced
@@ -390,12 +539,12 @@ final class Chat: ObservableObject {
     func commitVideo(_ data: Data, made: Made? = nil, into conv: UUID? = nil) {
         guard !Task.isCancelled else { return }        // stopped job: nothing is kept
         if let conv, conv != conversation.id {
-            guard History.load(conv) != nil else { return }
+            guard History.canReceive(conv) else { return }        // gone (a locked one still takes it, see `post`)
             let name = History.storeVideo(data, in: conv)
             var m = Message(role: .fixer, text: name == nil ? "Couldn't save the video." : "", video: name)
             if let made {
                 m.libraryID = LibraryStore.shared.addVideo(data, meta: made.meta(kind: .video, conversation: conv),
-                                                           source: name.map { History.videoURL($0, in: conv) })
+                                                           source: nil)     // the Library takes the first frame from `data`
             }
             post(m, to: conv)
             doneCount += 1
@@ -407,7 +556,7 @@ final class Chat: ObservableObject {
             var info = made
             info.parent = info.parent ?? photoLibraryID
             m.libraryID = LibraryStore.shared.addVideo(data, meta: info.meta(kind: .video, conversation: conversation.id),
-                                                       source: name.map { History.videoURL($0, in: conversation.id) })
+                                                       source: nil)         // the Library takes the first frame from `data`
         }
         append(m)
         doneCount += 1
@@ -589,6 +738,8 @@ final class Chat: ObservableObject {
         let recapText = recap()
         let replyID = append(Message(role: .fixer, text: ""))
         busy = pc ? "Thinking…" : "Thinking…"
+        sendGen += 1
+        let gen = sendGen
         task = Task {
             do {
                 // A normal assistant by default; the photo tools ride along only on photo messages.
@@ -601,6 +752,7 @@ final class Chat: ObservableObject {
                     + (painted ? "\n(I painted an area of the photo.)" : "")
                     + (pc && image != nil ? "\n(This is the current photo.)" : "")
                 var full = try await think(prompt, image: image, history: history, recap: recapText, pc: pc, into: replyID)
+                try Task.checkCancellation()        // Stop ends the stream quietly: don't parse the half reply or start work
                 if image != nil, !pc { photoUnseen = false }
                 var plan = Plan.parse(full)
                 // A search nobody needed ("Test" went to the web, 11-17): answer directly instead.
@@ -608,6 +760,7 @@ final class Chat: ObservableObject {
                     busy = "Thinking…"
                     full = try await think("Answer my last message directly. Do not search the web.", image: nil,
                                            history: pc ? pcHistory() : [], recap: "", pc: pc, into: replyID)
+                    try Task.checkCancellation()
                     plan = Plan.parse(full)
                     plan.actions.removeAll { if case .search = $0 { return true } else { return false } }
                     if plan.say.isEmpty, plan.actions.isEmpty { plan.say = full.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -622,6 +775,7 @@ final class Chat: ObservableObject {
                     busy = pc ? "Thinking…" : "Thinking…"
                     let followUp = "Web results for \"\(query)\":\n\(results)\n\nUse these to answer my last message. Mention the sources you used."
                     full = try await think(followUp, image: nil, history: pc ? pcHistory() : [], recap: "", pc: pc, into: replyID)
+                    try Task.checkCancellation()
                     plan = Plan.parse(full)
                 }
                 plan.actions.removeAll { if case .search = $0 { return true } else { return false } }
@@ -633,6 +787,7 @@ final class Chat: ObservableObject {
                     busy = pc ? "Thinking…" : "Thinking…"
                     let retry = "Answer my last message in plain text. Do not make an image."
                     full = try await think(retry, image: nil, history: pc ? pcHistory() : [], recap: "", pc: pc, into: replyID)
+                    try Task.checkCancellation()
                     plan = Plan.parse(full)
                     plan.actions.removeAll { if case .make = $0 { return true } else { return false } }
                     if plan.say.isEmpty, plan.actions.isEmpty { plan.say = full.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -644,6 +799,7 @@ final class Chat: ObservableObject {
                 var work = plan
                 work.actions.removeAll { $0.isQueueControl }
                 if !control.isEmpty { await Agent.control(control, chat: self, said: !plan.say.isEmpty) }
+                try Task.checkCancellation()
                 if !work.actions.isEmpty {
                     // Photo changes just run. Only a video (minutes of the computer's time) asks first.
                     let hasVideo = work.actions.contains { if case .video = $0 { return true } else { return false } }
@@ -656,12 +812,16 @@ final class Chat: ObservableObject {
                     }
                 }
             } catch is CancellationError {
+                dropIfEmpty(replyID)                // stopped before any words came: no empty "…" bubble left behind
             } catch {
                 dropIfEmpty(replyID)
                 fail(error, retry: text)
             }
-            busy = nil
-            progress = nil
+            // A stopped send must not clear the busy state of a newer one that is already running.
+            if gen == sendGen {
+                busy = nil
+                progress = nil
+            }
             save()
         }
     }

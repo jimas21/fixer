@@ -283,7 +283,7 @@ class Tray:
                     self.set("off", STOP_FAILED if self.stop_failed else "Off")
             elif s.get("busy"):
                 self.set("busy", "Working…")
-            elif s.get("loaded"):
+            elif s.get("loaded") or s.get("comfy") or s.get("llama"):   # ComfyUI and the chat model hold memory too
                 self.set("loaded", "On, ready")
             else:
                 self.set("idle", "On, ready")

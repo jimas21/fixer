@@ -1,4 +1,5 @@
 import AVFoundation
+import Combine
 import MediaPlayer
 import PhotosUI
 import SwiftUI
@@ -138,13 +139,17 @@ enum MusicBrainz {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard q.count >= 2 else { return [] }
         var c = URLComponents(string: "https://musicbrainz.org/ws/2/artist")!
-        c.queryItems = [URLQueryItem(name: "query", value: q), URLQueryItem(name: "fmt", value: "json"),
+        // MusicBrainz reads the query as Lucene: a name like AC/DC or an open bracket is a parse error unless escaped.
+        let special = Set("+-&|!(){}[]^\"~*?:\\/")
+        let escaped = q.map { special.contains($0) ? "\\\($0)" : String($0) }.joined()
+        c.queryItems = [URLQueryItem(name: "query", value: escaped), URLQueryItem(name: "fmt", value: "json"),
                         URLQueryItem(name: "limit", value: "8")]
         guard let url = c.url else { return [] }
         var r = URLRequest(url: url)
         r.timeoutInterval = 8
         r.setValue("Fixer/1.0 (private iPhone app)", forHTTPHeaderField: "User-Agent")
-        let (data, _) = try await URLSession.shared.data(for: r)
+        let (data, response) = try await URLSession.shared.data(for: r)
+        if let http = response as? HTTPURLResponse, http.statusCode != 200 { throw URLError(.badServerResponse) }
         guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let list = obj["artists"] as? [[String: Any]] else { return [] }
         return list.compactMap { a in
@@ -180,7 +185,15 @@ final class SongStore: ObservableObject {
         }
     }
     @Published var writing = false
+    /// True while the saved list exists but can't be read yet (sealed, and the Library hasn't been unlocked this run).
+    @Published private(set) var locked = false
+    /// True once the saved list has been read (or there is none). Until then `save()` refuses to write: the list is one
+    /// file rewritten from `songs`, so writing it before it is read would replace every saved song with this run's few.
+    private var indexLoaded = false
+    private var unlockWatch: AnyCancellable?
+    private var sealing: Task<Void, Never>?                     // upgrading an older build's plain files, one at a time
     private var job: Task<Void, Never>?
+    private var artJobs: [String: Task<Void, Never>] = [:]      // artwork being painted, by key (Clear everything cancels them)
     private var token: UUID?
 
     var running: Bool { status != nil }
@@ -194,21 +207,112 @@ final class SongStore: ObservableObject {
     private static var index: URL { folder.appendingPathComponent("songs.json") }
 
     private init() {
-        if let d = try? Data(contentsOf: Self.index), let s = try? JSONDecoder().decode([SongItem].self, from: d) {
-            songs = s.filter { FileManager.default.fileExists(atPath: Self.folder.appendingPathComponent($0.file).path) }
+        reload()
+        // The Library opening (Face ID or passcode) is what makes a sealed list readable.
+        unlockWatch = LibraryStore.shared.$state.sink { [weak self] state in
+            guard state == .unlocked else { return }
+            Task { @MainActor in self?.reload() }          // after the state has changed, with the keys already in place
         }
     }
 
+    // MARK: the saved list (sealed)
+
+    /// The saved list: [] when there is none yet, nil when it is there but can't be read now (sealed and shut).
+    private func readIndex() -> [SongItem]? {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: Self.index.path) else { return [] }
+        guard let d = SealedFiles.read(Self.index) else { return nil }
+        if let list = try? JSONDecoder().decode([SongItem].self, from: d) { return list }
+        // Readable but not a song list: set it aside rather than write over it.
+        let aside = Self.folder.appendingPathComponent("songs-damaged-\(Int(Date().timeIntervalSince1970)).json")
+        try? fm.moveItem(at: Self.index, to: aside)
+        return fm.fileExists(atPath: Self.index.path) ? nil : []
+    }
+
+    /// Reads the saved list when it can be read, folds in songs made while it couldn't, and picks up side files left
+    /// by an earlier run. Called at launch and every time the Library opens. Never writes the list before it is read.
+    func reload() {
+        if !indexLoaded {
+            let fm = FileManager.default
+            let legacy = fm.fileExists(atPath: Self.index.path) && !SealedFiles.isSealed(Self.index)
+            guard let stored = readIndex() else { locked = true; return }
+            let known = Set(stored.map(\.id))
+            let fresh = songs.filter { !known.contains($0.id) }          // made this run while the list was shut
+            let alive = stored.filter { fm.fileExists(atPath: url(of: $0).path) }
+            songs = fresh + alive
+            indexLoaded = true
+            locked = false
+            artVersion += 1
+            if legacy || !fresh.isEmpty { save() }                       // seals an older build's plain list at once
+            SealedFiles.keep(Self.index)
+            let folder = Self.folder
+            Task.detached(priority: .utility) { SealedFiles.keep(folder: folder) }   // files stay readable after a re-lock
+            sealOlderFiles()
+        }
+        mergePending()
+    }
+
+    /// An older build left every file in the clear: seal each one (this run keeps their keys, so they keep playing).
+    /// Never deletes. Runs on the main actor one file at a time, so it can't race a save, a delete or a new cover.
+    private func sealOlderFiles() {
+        let urls = (try? FileManager.default.contentsOfDirectory(at: Self.folder, includingPropertiesForKeys: nil)) ?? []
+        guard urls.contains(where: { !SealedFiles.isSealed($0) }) else { return }
+        sealing?.cancel()
+        sealing = Task(priority: .utility) {
+            for u in urls {
+                if Task.isCancelled { return }
+                if FileManager.default.fileExists(atPath: u.path), !SealedFiles.isSealed(u) {
+                    SealedFiles.seal(inPlace: u, keepKey: true)
+                }
+                await Task.yield()
+            }
+        }
+    }
+
+    /// Songs made while the list was shut each sit in their own sealed `pending-<id>.json`. Once the list is loaded
+    /// they join it, the list is saved, and only then are the side files deleted.
+    private func mergePending() {
+        guard indexLoaded else { return }
+        let fm = FileManager.default
+        var read: [URL] = []
+        var added: [SongItem] = []
+        for u in (try? fm.contentsOfDirectory(at: Self.folder, includingPropertiesForKeys: nil)) ?? []
+        where u.lastPathComponent.hasPrefix("pending-") && u.pathExtension == "json" {
+            guard let d = SealedFiles.read(u), let s = try? JSONDecoder().decode(SongItem.self, from: d) else { continue }
+            read.append(u)
+            if !songs.contains(where: { $0.id == s.id }), fm.fileExists(atPath: url(of: s).path) { added.append(s) }
+        }
+        guard !read.isEmpty else { return }
+        if !added.isEmpty { songs = (songs + added).sorted { $0.made > $1.made } }   // newest first, as ever
+        guard save() else { return }                                     // keep the side files until the list has them
+        for u in read { try? fm.removeItem(at: u); SealedFiles.forget(u) }
+    }
+
+    private func pendingURL(_ s: SongItem) -> URL { Self.folder.appendingPathComponent("pending-\(s.id.uuidString).json") }
+
     func url(of s: SongItem) -> URL { Self.folder.appendingPathComponent(s.file) }
     func coverURL(_ key: String) -> URL { Self.folder.appendingPathComponent("cover-\(key).png") }
-    func cover(_ key: String) -> UIImage? { artVersion >= 0 ? UIImage(contentsOfFile: coverURL(key).path) : nil }
+    /// The song's audio, or nil when it can't be read now.
+    func audio(of s: SongItem) -> Data? { SealedFiles.read(url(of: s)) }
+    /// Decoded covers, by key and artVersion: the list asks for every cover on each redraw (a song plays 4 times a second).
+    private let covers = NSCache<NSString, UIImage>()
+    func cover(_ key: String) -> UIImage? {
+        guard artVersion >= 0 else { return nil }
+        let k = "\(key)|\(artVersion)" as NSString
+        if let hit = covers.object(forKey: k) { return hit }
+        guard let d = SealedFiles.read(coverURL(key)), let img = UIImage(data: d) else { return nil }
+        covers.setObject(img, forKey: k)
+        return img
+    }
     /// Bumped whenever a cover file changes, so the list redraws its pictures.
     @Published private(set) var artVersion = 0
+    /// Bumped by deleteAll(), so the screen can drop what it holds in memory (a loaded recording).
+    @Published private(set) var erased = 0
     /// Artwork being painted on the computer, by key.
     @Published private(set) var painting: Set<String> = []
 
     func setArt(_ key: String, png: Data) {
-        try? png.write(to: coverURL(key), options: .atomic)
+        SealedFiles.write(png, to: coverURL(key))
         artVersion += 1
     }
 
@@ -227,6 +331,7 @@ final class SongStore: ObservableObject {
 
     func removeArt(_ key: String) {
         try? FileManager.default.removeItem(at: coverURL(key))
+        SealedFiles.forget(coverURL(key))
         artVersion += 1
     }
 
@@ -236,21 +341,28 @@ final class SongStore: ObservableObject {
         painting.insert(key)
         let p: [String: Any] = ["art_id": key, "title": title, "tags": tags, "lyrics": String(lyrics.prefix(1500)),
                                 "idea": idea, "prompt": wish, "label": "Artwork: " + (title.isEmpty ? "song" : title)]
-        Task {
+        artJobs[key] = Task {
             do {
                 try await Desktop.shared.music("artwork", p, slot: "make:art:" + key) { [weak self] f in
-                    guard let self else { return }
+                    // painting no longer holds the key once Clear everything has cancelled it: a late cover is dropped.
+                    guard let self, self.painting.contains(key) else { return }
                     if f["t"] as? String == "cover" { self.handle(f, idea: idea) }
                 }
+            } catch is CancellationError {
             } catch {
-                note = (error as? LocalizedError)?.errorDescription ?? "The artwork couldn't be painted."
+                if painting.contains(key) {
+                    note = (error as? LocalizedError)?.errorDescription ?? "The artwork couldn't be painted."
+                }
             }
-            painting.remove(key)
+            if !Task.isCancelled { painting.remove(key); artJobs[key] = nil }
         }
     }
 
-    private func save() {
-        if let d = try? JSONEncoder().encode(songs) { try? d.write(to: Self.index, options: .atomic) }
+    /// The only place that writes songs.json. Refuses until the saved list has been read (see `indexLoaded`).
+    @discardableResult
+    private func save() -> Bool {
+        guard indexLoaded, let d = try? JSONEncoder().encode(songs) else { return false }
+        return SealedFiles.write(d, to: Self.index)
     }
 
     /// Songs and albums for the list, newest first; an album's tracks in running order.
@@ -407,9 +519,21 @@ final class SongStore: ObservableObject {
                          albumTitle: meta["album_title"] as? String, track: int("track"), bpm: int("bpm"),
                          key: meta["key"] as? String, language: meta["language"] as? String, seed: int("seed"),
                          art: meta["art_id"] as? String)
-        do { try data.write(to: url(of: s), options: .atomic) } catch { note = "The song couldn't be saved."; return }
-        songs.insert(s, at: 0)
-        save()
+        guard SealedFiles.write(data, to: url(of: s)) else { note = "The song couldn't be saved."; return }
+        if indexLoaded {
+            songs.insert(s, at: 0)
+            save()
+        } else {
+            // The saved list is sealed and unread: it must not be rewritten from this run's songs alone. The song gets
+            // its own sealed side file instead, and joins the list when it can be read (`mergePending`).
+            guard let d = try? JSONEncoder().encode(s), SealedFiles.write(d, to: pendingURL(s)) else {
+                try? FileManager.default.removeItem(at: url(of: s))
+                SealedFiles.forget(url(of: s))
+                note = "The song couldn't be saved."
+                return
+            }
+            songs.insert(s, at: 0)
+        }
     }
 
     /// Finished while Fixer was closed: filed by JobInbox.
@@ -418,18 +542,25 @@ final class SongStore: ObservableObject {
     }
 
     func delete(_ s: SongItem) {
+        guard indexLoaded else { note = "Unlock to see your songs first."; return }     // the list is rewritten from `songs`
         if SongPlayer.shared.playing == s.id { SongPlayer.shared.stop() }
         try? FileManager.default.removeItem(at: url(of: s))
+        SealedFiles.forget(url(of: s))
         songs.removeAll { $0.id == s.id }
         if s.album == nil || !songs.contains(where: { $0.album == s.album }) {
             try? FileManager.default.removeItem(at: coverURL(s.artKey))
+            SealedFiles.forget(coverURL(s.artKey))
+            covers.removeAllObjects()
         }
         save()
     }
 
     func deleteAlbum(_ id: String) {
+        guard indexLoaded else { note = "Unlock to see your songs first."; return }
         for s in songs where s.album == id { delete(s) }
         try? FileManager.default.removeItem(at: coverURL(id))
+        SealedFiles.forget(coverURL(id))
+        covers.removeAllObjects()
     }
 
     /// Erase everything with "songs too": every song, cover and the list.
@@ -438,8 +569,22 @@ final class SongStore: ObservableObject {
         let n = songs.count
         SongPlayer.shared.stop()
         cancel()
-        try? FileManager.default.removeItem(at: Self.folder)
+        for (key, t) in artJobs {                              // artwork still being painted would recreate its cover
+            t.cancel()
+            Desktop.shared.cancel(slot: "make:art:" + key)
+        }
+        artJobs = [:]
+        painting = []
+        covers.removeAllObjects()
+        sealing?.cancel(); sealing = nil
+        try? FileManager.default.removeItem(at: Self.folder)    // removes files; needs nothing readable, so works while locked
         songs = []
+        if !FileManager.default.fileExists(atPath: Self.index.path) {
+            indexLoaded = true                                 // nothing is left to protect: the next save starts a new list
+            locked = false
+        }
+        draft = SongDraft.fresh()                              // the typed idea, lyrics, link and artists
+        erased += 1                                            // the screen drops its loaded recording
         return n
     }
 }
@@ -511,7 +656,13 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         player?.stop()
         AudioFocus.take()
         setUpCommands()
-        guard let p = try? AVAudioPlayer(contentsOf: SongStore.shared.url(of: s)) else { current = nil; next(); return }
+        guard let data = SongStore.shared.audio(of: s), let p = try? AVAudioPlayer(data: data) else {
+            if SealedFiles.isLocked(SongStore.shared.url(of: s)) {          // shut since the list was read: ask again
+                SongStore.shared.note = "Unlock to play your songs."
+                Task { await LibraryStore.shared.unlock() }
+            }
+            current = nil; next(); return
+        }
         p.delegate = self
         p.play()
         player = p
@@ -617,6 +768,18 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 }
 
+/// A song for the share sheet. The file on disk is sealed, so it is decrypted into a temporary copy only when it is
+/// actually shared (the copy is removed on lock, at launch and by Clear everything).
+struct SongShare: Transferable {
+    let url: URL
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(exportedContentType: .mp3) { item in
+            guard let copy = SealedFiles.tempCopy(of: item.url) else { throw CocoaError(.fileReadNoPermission) }
+            return SentTransferredFile(copy)
+        }
+    }
+}
+
 // MARK: - Screen
 
 struct SongMakerView: View {
@@ -634,6 +797,7 @@ struct SongMakerView: View {
     @State private var artTarget: ArtTarget?                 // "Paint new artwork…" is asking for a wish
     @State private var artWish = ""
     @State private var photoKey: String?                     // "Choose from Photos" is open for this key
+    @State private var photoTarget: String?                  // the key the chosen photo is for (survives the picker closing)
     @State private var photoItem: PhotosPickerItem?
     @FocusState private var focus: Bool
 
@@ -653,8 +817,9 @@ struct SongMakerView: View {
                 form
                 if let s = store.status { statusCard(s) }
                 if let n = store.note { noteCard(n) }
+                if store.locked { lockedCard }
                 if store.songs.isEmpty && !store.running {
-                    emptyCard
+                    if !store.locked { emptyCard }
                 } else {
                     ForEach(store.entries) { e in
                         switch e {
@@ -686,6 +851,8 @@ struct SongMakerView: View {
             if case .success(let url) = result { Task { await loadReference(url) } }
         }
         .task(id: artistQuery) { await searchArtists() }
+        .task { if store.locked { await LibraryStore.shared.unlock(automatic: true) } }   // once, when the list appears
+        .onChange(of: store.erased) { _, _ in reference = nil; artistQuery = ""; artistHits = []; artistNote = nil }
         .alert("Paint new artwork", isPresented: Binding(get: { artTarget != nil }, set: { if !$0 { artTarget = nil } })) {
             TextField("Describe it (optional)", text: $artWish)
             Button("Paint") {
@@ -702,13 +869,14 @@ struct SongMakerView: View {
         .photosPicker(isPresented: Binding(get: { photoKey != nil }, set: { if !$0 { photoKey = nil } }),
                       selection: $photoItem, matching: .images)
         .onChange(of: photoItem) { _, item in
-            guard let item, let key = photoKey else { return }
+            guard let item, let key = photoTarget else { return }     // photoKey may already be cleared by the picker closing
             Task {
                 if let data = try? await item.loadTransferable(type: Data.self), let img = UIImage(data: data) {
                     store.setArt(key, image: img)
                 }
                 photoItem = nil
                 photoKey = nil
+                photoTarget = nil
             }
         }
     }
@@ -723,7 +891,7 @@ struct SongMakerView: View {
 
     @ViewBuilder private func artMenu(_ key: String, _ title: String, _ songs: [SongItem]) -> some View {
         Button("Paint new artwork…", systemImage: "paintbrush") { paint(key, title, songs) }
-        Button("Choose artwork from Photos", systemImage: "photo") { photoKey = key }
+        Button("Choose artwork from Photos", systemImage: "photo") { photoTarget = key; photoKey = key }
         if store.cover(key) != nil {
             Button("Remove artwork", systemImage: "photo.badge.minus") { store.removeArt(key) }
         }
@@ -1010,7 +1178,7 @@ struct SongMakerView: View {
     }
 
     private func useSong(_ s: SongItem) {
-        guard let data = try? Data(contentsOf: store.url(of: s)) else { return }
+        guard let data = store.audio(of: s) else { store.note = "Unlock to use your songs."; return }
         reference = SongReference(name: s.displayTitle, data: data, ext: "mp3", seconds: s.seconds > 0 ? s.seconds : nil)
         store.draft.link = ""
         store.draft.album = false
@@ -1020,7 +1188,8 @@ struct SongMakerView: View {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
         guard let data = try? Data(contentsOf: url) else { store.note = "That file couldn't be read."; return }
-        guard data.count <= 30 * 1024 * 1024 else { store.note = "That recording is too large (30 MB at most)."; return }
+        // It travels as base64 (a third larger) and the computer takes 40 MiB a request, so 28 MiB is the most that fits.
+        guard data.count <= 28 * 1024 * 1024 else { store.note = "That recording is too large (28 MB at most)."; return }
         let secs = try? await AVURLAsset(url: url).load(.duration).seconds
         reference = SongReference(name: url.deletingPathExtension().lastPathComponent, data: data,
                                   ext: url.pathExtension.lowercased(),
@@ -1124,6 +1293,27 @@ struct SongMakerView: View {
         .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(Fx.tile))
     }
 
+    /// The saved songs are sealed and not open yet (same unlock as the Library).
+    private var lockedCard: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "lock.fill").font(.system(size: 28)).foregroundStyle(Fx.secondaryText)
+            Text("Your songs are locked").font(.subheadline.weight(.semibold))
+            Text("Unlock with Face ID or your passcode to see and play them.")
+                .font(.caption).foregroundStyle(Fx.secondaryText).multilineTextAlignment(.center)
+            Button { Task { await LibraryStore.shared.unlock() } } label: {
+                Text("Unlock").font(.footnote.weight(.semibold))
+                    .foregroundStyle(Fx.onSolid)
+                    .padding(.horizontal, 20).frame(minHeight: 44)
+                    .background(Capsule().fill(Fx.solid))
+                    .contentShape(Capsule())
+            }
+            .buttonStyle(.plain)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(16)
+        .background(RoundedRectangle(cornerRadius: 20, style: .continuous).fill(Fx.tile))
+    }
+
     private var emptyCard: some View {
         VStack(spacing: 8) {
             Image(systemName: "music.note").font(.system(size: 34, weight: .light)).foregroundStyle(Fx.secondaryText)
@@ -1215,7 +1405,7 @@ struct SongMakerView: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityHint(s.instrumental ? "Instrumental" : (shownLyrics == s.id ? "Hides the lyrics" : "Shows the lyrics"))
-                ShareLink(item: store.url(of: s)) {
+                ShareLink(item: SongShare(url: store.url(of: s)), preview: SharePreview(s.displayTitle)) {
                     Image(systemName: "square.and.arrow.up").frame(width: 44, height: 44)
                 }
                 .accessibilityLabel("Share \(s.displayTitle)")

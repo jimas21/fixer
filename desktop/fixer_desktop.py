@@ -109,6 +109,8 @@ SEARCH_URL = os.environ.get("FIXER_SEARCH_URL") or LOCAL.get("search_url", "")  
 IDLE_UNLOAD = float(os.environ.get("FIXER_IDLE_MINUTES", "20")) * 60   # give the GPU and RAM back after this
 
 # Must be set before huggingface_hub / transformers / diffusers are imported.
+import fixer_secure as sec  # noqa: E402  (DPAPI at-rest sealing for keys.json, macros.json, library.json, tokens)
+
 os.environ["HF_HOME"] = str(MODELS)
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
@@ -117,7 +119,10 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # Hugging Face read token (for gated models): first of these that exists. `hf auth login` writes the last one.
 for _t in (ROOT / "hf_token", MODELS / "token", Path.home() / ".cache" / "huggingface" / "token"):
     if _t.is_file() and not os.environ.get("HF_TOKEN"):
-        os.environ["HF_TOKEN"] = _t.read_text(encoding="utf-8").strip()
+        try:
+            os.environ["HF_TOKEN"] = (sec.read_text(_t) or "").strip()   # ROOT/hf_token may be sealed (DPAPI)
+        except Exception:                              # noqa: BLE001  (unreadable token: carry on without one)
+            pass
 
 from aiohttp import web  # noqa: E402
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # noqa: E402
@@ -181,21 +186,53 @@ class Keys:
         self.path = path
         self.mtime = None
         self.keys: dict[str, bytes] = {}
+        self.failed_mtime = None                         # a file version whose bytes couldn't be read (maybe only for a moment)
+        self.retry_at = 0.0
+        self.warned_mtime = None
+
+    def _load(self, m: float) -> None:
+        """Read keys.json for file version m. A file that was read but is invalid counts as no keys for that version
+        (cached, read again when the file changes). A file whose bytes couldn't be read at all (a virus scanner or
+        backup holding it, a brief DPAPI error) is NOT cached: it is tried 3 times now, and again every 2 s after."""
+        err = None
+        for attempt in range(3):
+            try:
+                data = sec.load_json_object(self.path)
+                phones = data.get("phones", {})
+                keys = {pid: b64d(p["key"]) for pid, p in phones.items()}
+                expires = {pid: float(p["expires"]) for pid, p in phones.items() if p.get("expires")}
+                # 11-19: a fresh pairing code must be used within 60 s ("pair_by", written by pair.py); the phone's first
+                # request confirms it (confirm_pairing removes the deadline). Unused past it: refused, then deleted.
+                pair_by = {pid: float(p["pair_by"]) for pid, p in phones.items() if p.get("pair_by")}
+                self.keys, self.expires, self.pair_by = keys, expires, pair_by
+                self.mtime, self.failed_mtime = m, None
+                return
+            except Exception as e:                       # noqa: BLE001  (corrupt / truncated / unreadable keys.json)
+                err = e
+                if not getattr(e, "read_failed", False) or attempt == 2:
+                    break
+                time.sleep(0.05)
+        # No keys for now (every phone is refused). The file is never written from here: the writers refuse to touch a
+        # file they can't read, so pairings aren't wiped. Logged once per version of the file.
+        if self.warned_mtime != m:
+            self.warned_mtime = m
+            log.warning("keys.json can't be read, so no phone can connect until it is fixed or reset "
+                        "(on the PC: python pair.py --reset keys, then pair each phone again): %s",
+                        err if isinstance(err, sec.ConfigUnreadable) else err.__class__.__name__)   # never file content
+        self.keys, self.expires, self.pair_by = {}, {}, {}
+        if getattr(err, "read_failed", False):
+            self.failed_mtime, self.retry_at = m, time.monotonic() + 2.0      # try again soon: it may only be busy
+        else:
+            self.mtime = m                                                    # invalid contents: wait for the file to change
 
     def get(self, phone: str) -> bytes | None:
         try:
             m = self.path.stat().st_mtime
         except FileNotFoundError:
-            self.keys, self.mtime = {}, None
+            self.keys, self.mtime, self.failed_mtime = {}, None, None
             return None
-        if m != self.mtime:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-            self.keys = {pid: b64d(p["key"]) for pid, p in data.get("phones", {}).items()}
-            self.expires = {pid: float(p["expires"]) for pid, p in data.get("phones", {}).items() if p.get("expires")}
-            # 11-19: a fresh pairing code must be used within 60 s ("pair_by", written by pair.py); the phone's first
-            # request confirms it (confirm_pairing removes the deadline). Unused past it: refused, then deleted.
-            self.pair_by = {pid: float(p["pair_by"]) for pid, p in data.get("phones", {}).items() if p.get("pair_by")}
-            self.mtime = m
+        if m != self.mtime and not (m == self.failed_mtime and time.monotonic() < self.retry_at):
+            self._load(m)
         now = time.time()
         if now > getattr(self, "expires", {}).get(phone, float("inf")):
             return None
@@ -210,17 +247,18 @@ class Keys:
 
 def confirm_pairing(phone: str) -> None:
     """11-19: the phone's first authenticated request: the pairing is complete, so its 60 s deadline goes."""
-    try:
-        data = json.loads(KEYS.read_text(encoding="utf-8"))
+    def confirm(data: dict):
         entry = data.get("phones", {}).get(phone)
         if not entry or "pair_by" not in entry:
-            return
+            return False                               # nothing to change (checked on the fresh copy, inside the lock)
         entry.pop("pair_by")
         entry["paired_at"] = int(time.time())
-        tmp = KEYS.with_name(f"keys.{os.getpid()}.confirm.tmp")
-        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        os.replace(tmp, KEYS)
-        log.warning("pairing confirmed for phone %s", phone)
+
+    try:
+        # 8: read-change-write under the keys.json lock (shared with pair.py and the expiry sweep), from a fresh read;
+        # a file that can't be read is left alone. A short wait; the request handler runs this in the executor.
+        if sec.update_json(KEYS, confirm, timeout=3.0):    # sealed at rest (DPAPI)
+            log.warning("pairing confirmed for phone %s", phone)
     except Exception as e:                             # noqa: BLE001
         log.warning("couldn't confirm a pairing: %s", e.__class__.__name__)
 
@@ -291,8 +329,29 @@ def _complete(path: Path) -> bool:
                      if isinstance(v, list) and len(v) == 2 and v[0] is not None]
         except Exception:
             return False
-        return all((path / k).is_dir() and any((path / k).iterdir()) for k in parts)
+        return all((path / k).is_dir() and any((path / k).iterdir()) and _part_has_weights(path / k) for k in parts)
     return any(path.iterdir())
+
+
+def _part_has_weights(part: Path) -> bool:
+    """A diffusers part that is a model (it has a config.json) counts only once its weights are there too: the small
+    json files are linked into the snapshot as they finish, while a big .safetensors is still downloading, so an
+    interrupted download leaves a folder with just its config. Parts without a config.json (tokenizer, scheduler)
+    hold small files only. With a weights index, every file it names must be present."""
+    if not (part / "config.json").is_file():
+        return True
+    try:
+        indexes = list(part.glob("*.index.json"))
+        for ix in indexes:
+            names = set(json.loads(ix.read_text(encoding="utf-8")).get("weight_map", {}).values())
+            if names and all((part / n).is_file() for n in names):
+                return True
+        if indexes:
+            return False
+        return any(f.is_file() and f.suffix.lower() in (".safetensors", ".bin", ".pt", ".pth", ".ckpt")
+                   for f in part.iterdir())
+    except Exception:                                # noqa: BLE001
+        return False
 
 
 def ensure_model(repo: str, patterns: list[str], status, kind: str = "model") -> str:
@@ -332,7 +391,19 @@ def ensure_files(repo: str, files: list[tuple[str, int]], status, kind: str = "m
     # marked "On your computer").
     try:
         cache = scan_cache_dir(MODELS / "hub")
-        here = sum(r.size_on_disk for r in cache.repos if r.repo_id == repo)
+        # Only the requested files that are already on disk come off `used` (`need` counts them); the repo's other
+        # files (another quant, a projector) stay counted.
+        wanted_names, seen_blobs, here = set(names), set(), 0
+        for r in cache.repos:
+            if r.repo_id != repo:
+                continue
+            for rev in r.revisions:
+                for f in rev.files:
+                    if f.blob_path in seen_blobs:
+                        continue
+                    if f.file_path.relative_to(rev.snapshot_path).as_posix() in wanted_names:
+                        seen_blobs.add(f.blob_path)
+                        here += f.size_on_disk
         used = cache.size_on_disk - here
     except Exception:
         used = 0
@@ -490,7 +561,9 @@ class LlamaBrain:
         self.repo: str | None = None
         self.vision = False
         self.on_gpu = True
-        self.lock = threading.RLock()
+        self.lock = threading.RLock()        # held only while the process state changes, never across a download or a wait
+        self.start_lock = threading.RLock()  # one start at a time (a second chat waits here, not on `lock`)
+        self.gen = 0                         # bumped by stop / pause / stop_for_good: a start that finds it changed gives up
         self.moe = False                     # 11-17: running as the mixture-of-experts brain (experts in RAM)
         self.paused_for: str | None = None   # "video": the brain was stopped to give a video the memory
         self.resume_wanted = False
@@ -509,52 +582,81 @@ class LlamaBrain:
     def running(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
-    def ensure(self, repo: str, choice, status) -> int:
-        """Starts (or keeps) the server for `repo`; returns its port."""
-        with self.lock:
-            if self.paused_for:
-                raise UserFacing(PAUSED_TEXT)            # chat during a video that took the memory
-            moe = _is_moe(repo)
-            gpu = moe or not VIDEO_BUSY.is_set()         # the MoE never moves to RAM-only for a video: it keeps its share
-            if self.running() and self.repo == repo and (self.on_gpu == gpu or not gpu):
-                return self.port
-            self._start(repo, choice, status, gpu)
-            return self.port
+    def ensure(self, repo: str, choice, status, epoch: int | None = None) -> int:
+        """Starts (or keeps) the server for `repo`; returns its port. One start at a time (start_lock); `lock` is held
+        only while the process state changes, not across the download or the wait for the model to load, so stop,
+        pause and resume never wait minutes behind a start. `epoch`: the resume path gives up if a leave / quit came in.
+        11-22: `gen` is read BEFORE queueing on start_lock, so a caller that waited behind another start while the model
+        was stopped (free memory, leave, a video) gives up instead of starting it again."""
+        asked_at = self.gen
+        with self.start_lock:
+            with self.lock:
+                if epoch is not None and self.epoch != epoch:
+                    raise UserFacing("The chat model was stopped before it was ready. Try again.")
+                self._cancelled(asked_at)                # a stop / pause / leave came in while this call was queued
+                if self.paused_for:
+                    raise UserFacing(PAUSED_TEXT)            # chat during a video that took the memory
+                moe = _is_moe(repo)
+                gpu = moe or not VIDEO_BUSY.is_set()         # the MoE never moves to RAM-only for a video: it keeps its share
+                if self.running() and self.repo == repo and (self.on_gpu == gpu or not gpu):
+                    return self.port
+                gen = self.gen
+            return self._start(repo, choice, status, gpu, gen)
 
-    def _start(self, repo: str, choice, status, gpu: bool = True):
-        self._stop()
+    def _cancelled(self, gen: int) -> None:
+        """Under `lock`: a stop, pause or leave came in while this start was under way; give up (it has already
+        stopped whatever was running)."""
+        if self.gen != gen:
+            raise UserFacing(PAUSED_TEXT if self.paused_for else "The chat model was stopped before it was ready. Try again.")
+
+    def _stop_if(self, proc) -> None:
+        with self.lock:
+            if self.proc is proc:
+                self._stop()
+
+    def _start(self, repo: str, choice, status, gpu: bool = True, gen: int | None = None) -> int:
+        if gen is None:
+            gen = self.gen
         self.starting = True
         try:
             files, weights, proj = choice
+            # The download takes no lock. The model that is running now is stopped only once the new files are on disk,
+            # so a switch that fails (cap, offline) leaves the working chat model alone.
             path = Path(ensure_files(repo, files, status))
-            status("Loading model…")
-            port = _free_port()
-            moe = _is_moe(repo) and gpu
-            keyed = _tune("llama_key", 1) >= 1          # 11-18: 0 = the old start (no key, CORS default)
-            key = secrets.token_urlsafe(32) if keyed else None
-            args = _llama_args(repo, path, weights, proj, gpu, port, keyed=keyed)
-            if gpu and not moe and "COMFY" in globals():
-                COMFY.free()          # dense only: the MoE fits beside ComfyUI (ComfyUI starts with --reserve-vram)
-            try:
-                before = _gpu_info()[1] if gpu else 0.0
-            except Exception:                            # noqa: BLE001
-                before = 0.0
-            self.key = key
-            self.proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                         stderr=subprocess.DEVNULL, env=_llama_env(key),
-                                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            _JOB.add(self.proc)
-            deadline = time.time() + 300
+            with self.lock:
+                self._cancelled(gen)
+                self._stop()
+                status("Loading model…")
+                port = _free_port()
+                moe = _is_moe(repo) and gpu
+                keyed = _tune("llama_key", 1) >= 1          # 11-18: 0 = the old start (no key, CORS default)
+                key = secrets.token_urlsafe(32) if keyed else None
+                args = _llama_args(repo, path, weights, proj, gpu, port, keyed=keyed)
+                if gpu and not moe and "COMFY" in globals():
+                    COMFY.free()          # dense only: the MoE fits beside ComfyUI (ComfyUI starts with --reserve-vram)
+                try:
+                    before = _gpu_info()[1] if gpu else 0.0
+                except Exception:                            # noqa: BLE001
+                    before = 0.0
+                self.key = key
+                proc = self.proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                                    stderr=subprocess.DEVNULL, env=_llama_env(key),
+                                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                _JOB.add(proc)
+            deadline = time.time() + 300                     # the wait for the model to load: no lock held
             while time.time() < deadline:
-                if self.proc.poll() is not None:
-                    self.proc = None
-                    self.key = None
+                if proc.poll() is not None:
+                    with self.lock:
+                        self._cancelled(gen)
+                        if self.proc is proc:
+                            self.proc = None
+                            self.key = None
                     raise UserFacing("The model couldn't start. Try another model.")
                 if _llama_status(port, "GET", "/health", timeout=2) == 200:
                     break
                 time.sleep(0.25)
             else:
-                self.stop()
+                self._stop_if(proc)
                 raise UserFacing("The model took too long to start.")
             if keyed:
                 # 11-18: prove the key is required before anything is sent: a keyless request to a protected endpoint
@@ -562,21 +664,25 @@ class LlamaBrain:
                 proof = _llama_key_proof(port, key)
                 if proof is not True:
                     log.warning("chat model key check failed (%s); chat model stopped", proof)
-                    self.stop()
+                    self._stop_if(proc)
                     raise UserFacing("The model couldn't start. Try another model.")
-            self.keyed = keyed
-            self.slots = int(args[args.index("-np") + 1])     # 11-19: what this start really has
-            self.port, self.repo, self.vision, self.on_gpu = port, repo, bool(proj), gpu
-            self.moe = moe
-            try:
-                self.card_gb = max(0.0, before - _gpu_info()[1]) if gpu else 0.0
-            except Exception:                            # noqa: BLE001
-                self.card_gb = 0.0
+            with self.lock:
+                self._cancelled(gen)                         # a stop during the load has already ended the process
+                self.keyed = keyed
+                self.slots = int(args[args.index("-np") + 1])     # 11-19: what this start really has
+                self.port, self.repo, self.vision, self.on_gpu = port, repo, bool(proj), gpu
+                self.moe = moe
+                try:
+                    self.card_gb = max(0.0, before - _gpu_info()[1]) if gpu else 0.0
+                except Exception:                            # noqa: BLE001
+                    self.card_gb = 0.0
+            return port
         finally:
             self.starting = False
 
     def stop(self):
         with self.lock:
+            self.gen += 1                    # a start under way gives up
             self._stop()
 
     def _stop(self):
@@ -597,7 +703,8 @@ class LlamaBrain:
         """11-17: a job that needs the RAM the experts hold (a video): stop the brain and refuse chats until resume()."""
         with self.lock:
             # back-to-back videos: the first pause already stopped it; keep "bring it back afterwards"
-            self.resume_wanted = self.resume_wanted or self.running()
+            self.resume_wanted = self.resume_wanted or self.running() or self.starting   # a start under way counts
+            self.gen += 1                    # ...and gives up: the video needs the memory now
             self._stop()
             self.paused_for = why
         status("Pausing the chat for this video: your computer needs the memory. It comes back when the video is done.")
@@ -614,15 +721,19 @@ class LlamaBrain:
             choice = gguf_choice(LAST_BRAIN)
             if choice is not None:
                 def back():
-                    with self.lock:                      # re-entrant: ensure() takes it again
-                        if self.epoch == epoch:          # 11-18: not after a leave-free / quit stopped everything
-                            self.ensure(LAST_BRAIN, choice, lambda s: None)
+                    # 11-18: not after a leave-free / quit stopped everything (ensure checks the epoch again under its
+                    # own lock). No lock is held across the start: the download must not block a stop.
+                    with self.lock:
+                        if self.epoch != epoch:
+                            return
+                    self.ensure(LAST_BRAIN, choice, lambda s: None, epoch)
                 _quietly(back)
 
     def stop_for_good(self) -> None:
         """11-18: the phone left (or the server quits): stop, forget any pause, and never come back by itself."""
         with self.lock:
             self.epoch += 1
+            self.gen += 1                    # a start under way gives up
             self.resume_wanted = False
             self.paused_for = None
             self._stop()
@@ -646,10 +757,12 @@ _BRAIN_KEY = object()                                  # "the running brain's ke
 
 
 def _llama_request(port: int, method: str, path: str, body: bytes | None = None, headers: dict | None = None,
-                   timeout: float = 600, key=_BRAIN_KEY):
+                   timeout: float = 600, key=_BRAIN_KEY, hold: list | None = None):
     """11-18: the ONE way Fixer talks to llama-server: every request carries "Authorization: Bearer <key>" (the
     running brain's key unless one is given; key=None sends none, only for the start-up proof). Returns
-    (connection, response); the caller reads the response and closes the connection."""
+    (connection, response); the caller reads the response and closes the connection. `hold`: the connected socket is
+    appended to it once the request is sent (the connection drops its own reference when the answer says "close"), so
+    another thread can end a request that is still waiting for its answer."""
     import http.client
     k = LLAMA.key if key is _BRAIN_KEY else key
     h = dict(headers or {})
@@ -658,6 +771,8 @@ def _llama_request(port: int, method: str, path: str, body: bytes | None = None,
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     try:
         conn.request(method, path, body=body, headers=h)
+        if hold is not None and conn.sock is not None:
+            hold.append(conn.sock)
         return conn, conn.getresponse()
     except BaseException:
         conn.close()
@@ -786,9 +901,30 @@ def _chat_llama_once(p: dict, emit, cancel, port: int):
         body["id_slot"] = p["_slot"]                   # 11-19: chat and the prompt writer each keep their own slot
     conn = None
     said = False
+    held: list = []
+    done = threading.Event()
+
+    def _watch():
+        # 11-22: while the model reads a long prompt or a photo no line arrives, and the read below cannot see a
+        # cancel until one does. Closing the socket itself ends that read at once (and a request still waiting for
+        # its answer) and tells llama-server to stop; the cancel is then the normal end of the turn. The low-level
+        # close is deliberate: socket.close() waits for the response's file object, which the reader is inside of.
+        import _socket
+        import socket
+        while not done.wait(0.5):
+            if cancel.is_set() and held:
+                try:
+                    sock = held[0]
+                    sock.shutdown(socket.SHUT_RDWR)
+                    _socket.socket.close(sock)
+                except Exception:                       # noqa: BLE001
+                    pass
+                return
+
+    threading.Thread(target=_watch, daemon=True, name="chat-cancel-watch").start()
     try:
         conn, r = _llama_request(port, "POST", "/v1/chat/completions", body=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"}, timeout=600)
+                                 headers={"Content-Type": "application/json"}, timeout=600, hold=held)
         if r.status != 200:
             try:
                 msg = json.loads(r.read()).get("error", {}).get("message", "")
@@ -797,17 +933,22 @@ def _chat_llama_once(p: dict, emit, cancel, port: int):
             if "context" in msg.lower():
                 raise UserFacing("This conversation is too long for the model. Start a new chat.")
             raise UserFacing("The model couldn't answer that. Try again.")
-        thinking = said = False
+        thinking = said = finished = False
         for raw in r:
             if cancel.is_set():
                 break                                   # closing the connection stops the generation
             line = raw.strip()
+            if line.startswith(b"error:"):              # 11-22: llama-server's own way to report a failure mid-stream
+                raise UserFacing("The model hit a problem while answering. Try again.")
             if not line.startswith(b"data:"):
                 continue
             data = line[5:].strip()
             if data == b"[DONE]":
+                finished = True
                 break
             obj = json.loads(data)
+            if obj.get("error"):
+                raise UserFacing("The model hit a problem while answering. Try again.")
             if isinstance(obj.get("timings"), dict) and obj["timings"].get("predicted_per_second"):
                 LAST_SPEED["tok_s"] = round(float(obj["timings"]["predicted_per_second"]), 1)   # for the "models" look-up
             d = ((obj.get("choices") or [{}])[0] or {}).get("delta", {})
@@ -836,14 +977,19 @@ def _chat_llama_once(p: dict, emit, cancel, port: int):
             if out:
                 said = True
                 emit({"t": "text", "v": out})
+        if not finished and not said and not think and not cancel.is_set():
+            raise UserFacing("The model stopped before it answered. Try again.")   # the stream ended with nothing
     except (ConnectionError, http.client.HTTPException, OSError) as e:
         if isinstance(e, UserFacing):
             raise
+        if cancel.is_set():
+            return                                      # the cancel ended the read: not an error
         if not LLAMA.running():
             LLAMA.stop()
             raise UserFacing("The model stopped unexpectedly. Try again.")
         raise
     finally:
+        done.set()
         if conn is not None:
             conn.close()
     if think and not said and not cancel.is_set():
@@ -1146,8 +1292,17 @@ class _RemoteLlama:
 
     def stop(self):
         if self._running:
+            import queue
+            while True:                                  # an ack that came in late for an earlier stop is not this one's
+                try:
+                    self._acks.get_nowait()
+                except queue.Empty:
+                    break
             self._send(("ctl", "stop_llama"))
-            self._acks.get(timeout=60)
+            try:
+                self._acks.get(timeout=60)
+            except queue.Empty:
+                raise UserFacing("Your computer didn't free the chat model's memory in time. Try again.") from None
         self._running = False
 
 
@@ -1621,12 +1776,24 @@ class _LookupGate:
             s = self.buf.lstrip()
             if not s:
                 return
+            fenced = s.startswith("```")
+            if fenced:
+                # A reply that opens with a code fence (```json): wait for the end of the fence line, then judge what
+                # follows it. A look-up request inside the fence is held and run like a bare one.
+                nl = s.find("\n")
+                if nl < 0:
+                    return
+                s = s[nl + 1:].lstrip()
+                if not s:
+                    return
             if not s.startswith("{"):
                 self._release()
                 return
             compact = re.sub(r"\s+", "", s)
             if compact.startswith(_LOOKUP_HEAD):
                 self.mode = "hold"
+                if fenced:
+                    self.buf = s                      # the fence is not part of the request
             elif not _LOOKUP_HEAD.startswith(compact):
                 self._release()
 
@@ -1865,7 +2032,9 @@ def _computer_facts() -> str:
     try:
         if sys.platform == "win32":
             import ctypes
-            ms = ctypes.windll.kernel32.GetTickCount64()
+            tick = ctypes.windll.kernel32.GetTickCount64
+            tick.restype = ctypes.c_ulonglong            # 64-bit: ctypes reads it as a 32-bit int by default (negative after 24.8 days)
+            ms = tick()
             L.append(f"- up for {ms // 3600000} h {ms // 60000 % 60} min")
     except Exception:                                    # noqa: BLE001
         pass
@@ -2194,7 +2363,7 @@ TINY_DECODER = ("lightx2v/Autoencoders", "lighttaew2_2_v2.safetensors")   # Apac
 FAST_DECODE = os.environ.get("FIXER_FAST_DECODE", "1") == "1"
 
 
-def _tiny_decode(latents, status, vae_cfg):
+def _tiny_decode(latents, status, vae_cfg, parallel: bool = True):
     """Normalised Wan 2.2 latents (C, T, H, W) -> frames (T, H, W, 3) in 0..1, with the tiny decoder.
 
     The pipeline hands back latents normalised by the VAE's per-channel mean/std; the tiny decoder wants them raw,
@@ -2213,7 +2382,7 @@ def _tiny_decode(latents, status, vae_cfg):
     z = z * std + mean                                                              # back to the VAE's own scale
     x = z.unsqueeze(0).permute(0, 2, 1, 3, 4).half()                                # NCTHW -> NTCHW
     with torch.inference_mode():
-        frames = tae.decode_video(x, parallel=True, show_progress_bar=False)[0]   # T, C, H, W
+        frames = tae.decode_video(x, parallel=parallel, show_progress_bar=False)[0]   # T, C, H, W
     return frames.permute(0, 2, 3, 1).float().cpu().numpy()
 
 
@@ -2317,7 +2486,7 @@ def _video_run(p: dict, emit, cancel, status, mode: str, repo: str):
     guidance = p.get("guidance")
     if guidance is None:
         guidance = 1.0 if turbo else (5.0 if wan else 3.0)
-    seconds = max(1.0, min(10.0, float(p.get("seconds", 5))))
+    seconds = max(1.0, min(10.0, _asked_seconds(p)))   # the same tolerant reading job_video uses
     mult = 4 if wan else 8                             # frame counts must be k*mult + 1
     frames = int(round(seconds * fps / mult)) * mult + 1
     longest = int(p.get("longest", 1280))           # Wan 2.2 5B is trained at 1280x704; smaller came out cooked
@@ -2390,7 +2559,14 @@ def _video_run(p: dict, emit, cancel, status, mode: str, repo: str):
         return
     if fast:
         status("Finishing video…")
-        out = _tiny_decode(out, status, pipe.vae.config)
+        short = False
+        try:
+            out = _tiny_decode(out, status, pipe.vae.config)
+        except torch.OutOfMemoryError:
+            short = True                               # (retried below, once the failed attempt's memory is released)
+        if short:
+            _free()
+            out = _tiny_decode(out, status, pipe.vae.config, parallel=False)   # frame by frame: slower, far less memory
     mp4 = _encode_mp4(out, fps)
     del out
     emit({"t": "progress", "v": 1.0})
@@ -2596,8 +2772,18 @@ RETIRED_PICTURE_IDS = {   # old phone ids the app may still send -> the model th
 
 
 def _snapshot(repo: str) -> Path | None:
-    snaps = MODELS / "hub" / f"models--{repo.replace('/', '--')}" / "snapshots"
-    return next(iter(sorted(snaps.glob("*"))), None) if snaps.is_dir() else None
+    root = MODELS / "hub" / f"models--{repo.replace('/', '--')}"
+    snaps = root / "snapshots"
+    if not snaps.is_dir():
+        return None
+    try:                                                 # the revision the cache itself calls current (refs/main)
+        cur = snaps / (root / "refs" / "main").read_text(encoding="utf-8").strip()
+        if cur.parent == snaps and cur.is_dir():
+            return cur
+    except OSError:
+        pass
+    found = [d for d in snaps.glob("*") if d.is_dir()]
+    return max(found, key=lambda d: (d.stat().st_mtime, d.name)) if found else None   # else the newest one
 
 
 def _comfy_paths_yaml() -> str:
@@ -2805,6 +2991,7 @@ ENHANCE_BUILTIN_I2I = (
     "change and where. Do not change what the person said to keep, and do not add changes they did not ask for.")
 ENHANCE_MIN_KEEP = 0.6                    # a reply shorter than this share of the original is not an enhancement
 _ENHANCE_TEXT: dict[bool, str] = {}
+_ENHANCE_RETRY_AT: dict[bool, float] = {}      # a failed fetch is not tried again before this (time.monotonic)
 
 
 def _fetch_text(repo: str, filename: str) -> str:
@@ -2820,13 +3007,15 @@ def _fetch_text(repo: str, filename: str) -> str:
 def _enhance_system(edit: bool) -> str:
     """Qwen's published instruction for this kind of request (T2I or I2I), else a short built-in one, then our rules."""
     text = _ENHANCE_TEXT.get(edit)
-    if not text:
+    if not text and time.monotonic() >= _ENHANCE_RETRY_AT.get(edit, 0.0):
         try:
             text = _fetch_text(*(ENHANCE_I2I if edit else ENHANCE_T2I))
         except Exception:                                # noqa: BLE001
             text = ""
         if text:
             _ENHANCE_TEXT[edit] = text
+        else:
+            _ENHANCE_RETRY_AT[edit] = time.monotonic() + 600     # offline or moved: the built-in text, and no new network wait for 10 min
     return (text or (ENHANCE_BUILTIN_I2I if edit else ENHANCE_BUILTIN_T2I)) + "\n\n" + ENHANCE_RULES
 
 
@@ -2931,8 +3120,11 @@ def _parse_describe(text: str) -> dict | None:
     prompt = str(obj.get("prompt") or "").strip()
     if not prompt:
         return None
+    flag = obj.get("explicit")
+    if isinstance(flag, str) and flag.strip().lower() in ("", "false", "no", "off", "0", "none", "null"):
+        flag = False                                     # a quoted "false" from the model is false, not a non-empty string
     return {"prompt": prompt[:4000], "negative": str(obj.get("negative") or "").strip()[:1000],
-            "explicit": bool(obj.get("explicit"))}
+            "explicit": bool(flag)}
 
 
 def describe_photo(image_b64: str, safe: bool, cancel) -> tuple[dict | None, str]:
@@ -2949,7 +3141,8 @@ def describe_photo(image_b64: str, safe: bool, cancel) -> tuple[dict | None, str
     msg = {"role": "user", "text": "Describe this photo as an image prompt.", "image": image_b64}
     out: list[str] = []
     p = {"instructions": _describe_system(safe), "messages": [msg], "think": False,
-         "temperature": _tune("describe_temp", 0.3), "max_tokens": int(_tune("describe_max_tokens", 1100)),
+         "temperature": _tune("describe_temp", 0.3), "presence_penalty": 0.0,
+         "max_tokens": int(_tune("describe_max_tokens", 1100)),
          "_slot": PROMPT_SLOT}
     try:
         _chat_llama(p, lambda o: out.append(o.get("v", "")) if o.get("t") == "text" else None, cancel, port)
@@ -2978,7 +3171,7 @@ def _brain_chat(system: str, user_text: str, cancel, temperature: float = 0.4, m
         return None
     out: list[str] = []
     p = {"instructions": system, "messages": [{"role": "user", "text": user_text[:8000]}], "think": False,
-         "temperature": temperature, "max_tokens": int(max_tokens), "_slot": PROMPT_SLOT}
+         "temperature": temperature, "presence_penalty": 0.0, "max_tokens": int(max_tokens), "_slot": PROMPT_SLOT}
     try:
         _chat_llama(p, lambda o: out.append(o.get("v", "")) if o.get("t") == "text" else None, cancel, port)
     except Exception:                                    # noqa: BLE001
@@ -3023,10 +3216,10 @@ def _lora_catalog_for_ai(safe: bool, limit: int = 64) -> list[str]:
     trigger words (what each one is for). nsfw add-ons are dropped in a safe session. (11-21: the macro AI reads the
     real library so it recommends a combination of the owner's own add-ons, not generic role names.)"""
     out: list[str] = []
-    for fn, e in _lora_lib().items():
+    for fn, e in (_lora_lib() or {}).items():
         if not isinstance(e, dict):
             continue
-        if safe and e.get("nsfw"):
+        if safe and _lora_is_explicit(fn, e):
             continue
         name = str(e.get("name") or re.sub(r"\.safetensors$", "", fn))[:70]
         fam = str(e.get("family") or "unknown")
@@ -3061,13 +3254,55 @@ def _macro_vocab(safe: bool) -> str:
     return "\n".join(lines)
 
 
-def _clean_patch(ap: dict, safe: bool) -> dict:
-    """Keep only valid, provided macro fields from a brain-proposed change, coerced and allow-listed."""
+def _recipe_family(mid) -> str:
+    """The add-on family a model id takes ("" when the model or its family is unknown: nothing then filters)."""
+    return str(CREATE_RECIPES.get(mid, {}).get("lora_family") or "") if mid else ""
+
+
+def _lora_fits(it: dict, fam: str, lib: dict) -> bool:
+    """A file add-on fits a model family when its own family matches, or is unknown (the computer couldn't sort it, so
+    Make offers it everywhere). Role add-ons are the owner's own mapping and always fit."""
+    f = it.get("file")
+    if not f or not fam:
+        return True
+    return str((lib.get(f) or {}).get("family") or "unknown") in (fam, "unknown")
+
+
+def _fit_loras(loras: list, fam: str) -> list:
+    """The rules for an add-on stack, shared by a whole macro (_sanitize_macro) and an 'apply' patch (_clean_patch with
+    context): keep the add-ons that fit the model's family, honor the dynamic add-on cap, then scale file-add-on
+    strengths down proportionally when their sum is over the budget. Stacking LoRAs is not additive (weights compound),
+    so a summed strength much over ~1.5 "fries" the image. (Research-backed heuristics.)"""
+    if fam:
+        lib = _lora_lib() or {}
+        loras = [it for it in loras if _lora_fits(it, fam, lib)]
+    cap = int(_tune("lora_cap", 4))
+    if len(loras) > cap:
+        loras = loras[:cap]
+    files = [it for it in loras if it.get("file")]
+    total = sum(float(it.get("strength", 1.0)) for it in files)
+    budget = float(_tune("macro_strength_budget", 1.6))
+    if 0 < budget < total:
+        k = budget / total
+        for it in files:
+            it["strength"] = round(max(0.1, float(it.get("strength", 1.0)) * k), 2)
+    return loras
+
+
+def _clean_patch(ap: dict, safe: bool, ctx: dict | None = None) -> dict:
+    """Keep only valid, provided macro fields from a brain-proposed change, coerced and allow-listed.
+    `ctx` (11-22, finding 21): the macro being analysed (its "model" and "loras"). With it, the patch gets the same
+    family / cap / budget trimming as a saved macro (_fit_loras), against the model the macro WOULD have after the
+    patch; add-ons the trimming empties are left out (never written as []). A model switch that would leave the macro's
+    own add-ons on the wrong family, with no add-on list of its own in the patch, is left out (the phone's merge keeps
+    the old add-ons, so the switch would break them). Without ctx nothing of this applies."""
     out: dict = {}
-    if "prompt_add" in ap:
-        out["prompt_add"] = str(ap["prompt_add"] or "")[:2000]
-    if "negative_add" in ap:
-        out["negative_add"] = str(ap["negative_add"] or "")[:1000]
+    # 11-22: a key whose cleaned value is empty (null, invalid, every entry dropped) is left OUT, not written as ""/[]:
+    # the phone's Macro.merge overwrites whatever key is present, so an empty one would blank the owner's own text.
+    if isinstance(ap.get("prompt_add"), str) and ap["prompt_add"].strip():
+        out["prompt_add"] = ap["prompt_add"][:2000]
+    if isinstance(ap.get("negative_add"), str) and ap["negative_add"].strip():
+        out["negative_add"] = ap["negative_add"][:1000]
     if "explicit" in ap:
         out["explicit"] = bool(ap["explicit"]) and not safe
     if isinstance(ap.get("settings"), dict):
@@ -3078,23 +3313,52 @@ def _clean_patch(ap: dict, safe: bool) -> dict:
                     s[k] = float(ap["settings"][k])
                 except (TypeError, ValueError):
                     pass
-        out["settings"] = s
+        if s:
+            out["settings"] = s
     if "model" in ap:
         mid = str(ap["model"] or "")
         if mid in CREATE_RECIPES and _recipe_ready(CREATE_RECIPES[mid]) and not (safe and mid in _adult_models()):
             out["model"] = mid
     if isinstance(ap.get("loras"), list):
-        roles = set((_macros().get("roles") or {}).keys())
-        lib = _lora_lib()
+        role_map = _macros().get("roles") or {}
+        roles = set(role_map.keys())
+        lib = _lora_lib() or {}
         kept = []
         for it in ap["loras"]:
             if not isinstance(it, dict):
                 continue
             if it.get("role") and str(it["role"]) in roles:
-                kept.append({"role": str(it["role"])})
+                rn = str(it["role"])
+                if safe:                                 # 11-22: a safe session takes no explicit role (name or its file)
+                    rf = str((role_map.get(rn) or {}).get("file") or "")
+                    if rn in ("undress-helper", "qwen-explicit-addon") or (rf and _lora_is_explicit(rf, lib.get(rf))):
+                        continue
+                kept.append({"role": rn})
             elif it.get("file") and str(it["file"]) in lib:
-                kept.append({"file": str(it["file"]), "strength": max(0.0, min(2.0, float(it.get("strength", 1.0))))})
-        out["loras"] = kept
+                fn = str(it["file"])
+                if safe and _lora_is_explicit(fn, lib.get(fn)):
+                    continue                             # 11-22: the same 18+ test as the rest of the app
+                try:
+                    st = float(it.get("strength", 1.0))
+                except (TypeError, ValueError):
+                    st = 1.0                             # null or a range like "0.5-0.8": use the default strength
+                kept.append({"file": fn, "strength": max(0.0, min(2.0, st))})
+        if kept:
+            out["loras"] = kept
+    if isinstance(ctx, dict):
+        mid = out.get("model") or str(ctx.get("model") or "")
+        fam = _recipe_family(mid)
+        if "loras" in out:
+            fitted = _fit_loras(out["loras"], fam)
+            if fitted:
+                out["loras"] = fitted
+            else:
+                del out["loras"]                         # all of them were the wrong family: leave the add-ons alone
+        elif out.get("model") and fam:
+            lib = _lora_lib() or {}
+            have = [it for it in (ctx.get("loras") or []) if isinstance(it, dict)]
+            if not all(_lora_fits(it, fam, lib) for it in have):
+                del out["model"]                         # the macro's own add-ons would no longer match this model
     return out
 
 
@@ -3109,29 +3373,8 @@ def _sanitize_macro(raw: dict, safe: bool) -> dict | None:
     # "not available here" when used. Only a model with a known family filters; an "unknown"-family add-on still
     # passes (the computer couldn't sort it, so Make offers it everywhere). Role add-ons are the owner's own mapping.
     mid = patch.get("model")
-    fam = str(CREATE_RECIPES.get(mid, {}).get("lora_family") or "") if mid else ""
-    if fam and isinstance(patch.get("loras"), list):
-        lib = _lora_lib()
-        def _fits(it: dict) -> bool:
-            f = it.get("file")
-            if not f:
-                return True
-            return str((lib.get(f) or {}).get("family") or "unknown") in (fam, "unknown")
-        patch["loras"] = [it for it in patch["loras"] if _fits(it)]
-    # 11-22: keep the stack sane — honor the dynamic add-on cap and a total-strength budget. Stacking LoRAs is not
-    # additive (weights compound), so a summed strength much over ~1.5 "fries" the image. Trim to the cap, then scale
-    # file-add-on strengths down proportionally if their sum overshoots the budget. (Research-backed heuristics.)
     if isinstance(patch.get("loras"), list):
-        cap = int(_tune("lora_cap", 4))
-        if len(patch["loras"]) > cap:
-            patch["loras"] = patch["loras"][:cap]
-        files = [it for it in patch["loras"] if it.get("file")]
-        total = sum(float(it.get("strength", 1.0)) for it in files)
-        budget = float(_tune("macro_strength_budget", 1.6))
-        if 0 < budget < total:
-            k = budget / total
-            for it in files:
-                it["strength"] = round(max(0.1, float(it.get("strength", 1.0)) * k), 2)
+        patch["loras"] = _fit_loras(patch["loras"], _recipe_family(mid))
     prompt_add = patch.get("prompt_add") or str(raw.get("prompt") or "")[:2000]
     name = str(raw.get("name") or "Suggested macro")[:80]
     if not prompt_add and not patch.get("loras"):
@@ -3202,19 +3445,26 @@ def job_analyze_macro(p: dict, emit, cancel):
     if text is None:
         raise UserFacing(PAUSED_TEXT if LLAMA.paused_for else "The chat model isn't available right now.")
     obj = _brain_json(text)
+    if not isinstance(obj, dict) or not isinstance(obj.get("suggestions"), list):
+        # 11-22: a cut-off or garbled reply is a failure, not "it looks good" (an empty list means the model reviewed it)
+        raise UserFacing("Couldn't review it. Try again.")
     import uuid
     out = []
-    for s in ((obj or {}).get("suggestions") or [])[:8]:
+    for s in (obj.get("suggestions") or [])[:8]:
         if not isinstance(s, dict):
             continue
         title = str(s.get("title") or "").strip()
         if not title:
             continue
         item = {"id": uuid.uuid4().hex[:8], "title": title[:120], "detail": str(s.get("detail") or "")[:300]}
-        if isinstance(s.get("apply"), dict):
-            patch = _clean_patch(s["apply"], safe)
-            if patch:
-                item["apply"] = patch
+        if isinstance(s.get("apply"), dict) and s["apply"]:
+            try:
+                patch = _clean_patch(s["apply"], safe, macro)
+            except Exception:                            # noqa: BLE001  (one odd suggestion must not sink the rest)
+                continue
+            if not patch:
+                continue                                 # its change was all invalid (an invented add-on...): drop it
+            item["apply"] = patch                        # (advice only: no apply, or {}, is kept as plain advice)
         out.append(item)
     emit({"t": "info", "suggestions": out})
 
@@ -3230,8 +3480,17 @@ def job_recommend_macros(p: dict, emit, cancel):
     if text is None:
         raise UserFacing(PAUSED_TEXT if LLAMA.paused_for else "The chat model isn't available right now.")
     obj = _brain_json(text)
-    macros = [m for m in (_sanitize_macro(r, safe) for r in ((obj or {}).get("macros") or [])[:6]) if m]
-    emit({"t": "info", "macros": macros, "wishlist": _clean_wishlist((obj or {}).get("wishlist"))})
+    if not isinstance(obj, dict) or not isinstance(obj.get("macros"), list):
+        raise UserFacing("Couldn't come up with macros. Try again.")   # 11-22: not "no suggestions" when the reply was cut off
+    macros = []
+    for r in obj["macros"][:6]:
+        try:
+            m = _sanitize_macro(r, safe)
+        except Exception:                                # noqa: BLE001  (one odd macro must not sink the others)
+            m = None
+        if m:
+            macros.append(m)
+    emit({"t": "info", "macros": macros, "wishlist": _clean_wishlist(obj.get("wishlist"))})
 
 
 def _clean_wishlist(raw) -> list[dict]:
@@ -3445,6 +3704,8 @@ class Comfy:
                 self.guarded = guarded
                 _timing(engine_start_s=round(time.monotonic() - t_spawn, 1))
                 return
+            log.warning("ComfyUI did not answer within 180 s; stopped so a later job starts it fresh and proven")
+            self._kill_locked()                        # never leave an unproven half-started process for ensure() to trust
             raise UserFacing("The picture engine on your computer is taking too long to start.")
 
     def ensure_current(self, status=lambda s: None):
@@ -4777,12 +5038,12 @@ def _analyse_audio(path: Path, seconds: float = 90.0) -> tuple[int | None, str |
     return bpm, best_key if best_key in SONG_KEYS else None
 
 
-def _song_reference(p: dict) -> tuple[str, Path] | None:
+def _song_reference(p: dict, followed: str | None = None) -> tuple[str, Path] | None:
     """11-20: the owner's own recording or one of their songs ("reference", base64), written to ComfyUI's private
-    input folder for this one job (job_song deletes it). None when there is none."""
+    input folder for this one job (job_song deletes it). None when there is none. `followed`: see _song_reference_url."""
     url = str(p.get("reference_url") or "").strip()
     if url:
-        return _song_reference_url(url, p)
+        return _song_reference_url(url, p, followed)
     b64 = p.get("reference")
     if not isinstance(b64, str) or not b64:
         return None
@@ -4805,18 +5066,25 @@ def _song_reference(p: dict) -> tuple[str, Path] | None:
 SONG_URL_MAX_S = 15 * 60                                # a linked recording: 15 minutes at most
 
 
-def _song_reference_url(url: str, p: dict) -> tuple[str, Path]:
-    """11-20 (the owner: "I have stuff on YouTube ... of my old recordings, don't make me download those"): the
-    audio of a web link (YouTube and the other sites yt-dlp knows), fetched for this one job into ComfyUI's private
-    input folder and deleted after it, like a sent recording. Its length is put in p["reference_seconds"]."""
+def _song_check_url(url: str) -> str:
+    """11-22: the cheap part of a link, no download: its scheme, then every redirect hop and what it resolves to must
+    be public. Returns the URL after its redirects. job_song runs it BEFORE the (slow) picture-engine start."""
     import urllib.parse
-    import uuid
     u = urllib.parse.urlparse(url)
     if u.scheme not in ("http", "https") or not u.netloc:
         raise UserFacing("That link isn't a web address.")
-    host = (u.hostname or "").lower()
-    if host in ("localhost",) or host.endswith((".local", ".lan", ".internal")) or _is_private_host(host):
-        raise UserFacing("That link points inside your own network.")
+    return _song_follow(url)
+
+
+def _song_reference_url(url: str, p: dict, followed: str | None = None) -> tuple[str, Path]:
+    """11-20 (the owner: "I have stuff on YouTube ... of my old recordings, don't make me download those"): the
+    audio of a web link (YouTube and the other sites yt-dlp knows), fetched for this one job into ComfyUI's private
+    input folder and deleted after it, like a sent recording. Its length is put in p["reference_seconds"].
+    `followed`: the URL job_song already checked with _song_check_url (a value from this process, never from the phone);
+    without it the link is checked here."""
+    import urllib.parse
+    import uuid
+    url = followed or _song_check_url(url)             # 11-22: every hop (and what it resolves to) must be public
     try:
         import yt_dlp
     except ImportError:
@@ -4830,10 +5098,29 @@ def _song_reference_url(url: str, p: dict) -> tuple[str, Path]:
         return "too long" if d and d > SONG_URL_MAX_S else None
     opts = {"format": "bestaudio[ext=m4a]/bestaudio/best", "outtmpl": str(folder / (stem + ".%(ext)s")),
             "quiet": True, "no_warnings": True, "noplaylist": True, "max_filesize": SONG_REF_MAX,
-            "match_filter": short, "noprogress": True, "cachedir": False, "socket_timeout": 20, "retries": 2}
+            "match_filter": short, "noprogress": True, "cachedir": False, "socket_timeout": 20, "retries": 2,
+            "proxy": ""}                               # "" = direct (yt-dlp's no-proxy setting; not tried here)
+    # 11-22: no external downloader is asked for here. The real check is _SongNetGuard below (connect level, see
+    # _song_follow for what it does not cover); _CheckedDL is the friendly first line.
+    class _CheckedDL(yt_dlp.YoutubeDL):
+        def urlopen(self, req):                        # every request yt-dlp itself makes: its host must be public
+            _song_host_public(urllib.parse.urlsplit(getattr(req, "url", None) or str(req)).hostname)
+            res = super().urlopen(req)
+            final = getattr(res, "url", None)          # a redirect yt-dlp followed itself: refuse to read from a private end
+            try:
+                if final:
+                    _song_host_public(urllib.parse.urlsplit(final).hostname)
+            except UserFacing:
+                try:
+                    res.close()
+                except Exception:                      # noqa: BLE001
+                    pass
+                raise
+            return res
     try:
-        with yt_dlp.YoutubeDL(opts) as y:
-            info = y.extract_info(url, download=True)
+        with _SongNetGuard():                          # extract AND download: no connection to a private address
+            with _CheckedDL(opts) as y:
+                info = y.extract_info(url, download=True)
     except Exception as e:                             # noqa: BLE001
         for f in folder.glob(stem + ".*"):
             f.unlink(missing_ok=True)
@@ -4857,6 +5144,172 @@ def _is_private_host(host: str) -> bool:
     except ValueError:
         return False
     return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+
+
+def _ip_not_public(ip) -> bool:
+    if getattr(ip, "ipv4_mapped", None):
+        ip = ip.ipv4_mapped                            # ::ffff:127.0.0.1 is 127.0.0.1
+    return (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast
+            or ip.is_unspecified or not ip.is_global)  # not is_global also covers 100.64.0.0/10 (Tailscale, CGNAT)
+
+
+def _song_host_public(host: str | None) -> None:
+    """11-22: refuse a link host that is, or RESOLVES to, a private / loopback / link-local / reserved address. Numeric
+    forms (2130706433, 127.1, 0x7f000001) are read the way the network stack reads them, and a name is resolved, so
+    127.0.0.1.nip.io or a LAN hostname is caught too. A name that does not resolve at all is let through: yt-dlp then
+    fails on its own with the plain 'couldn't get the audio' message."""
+    import ipaddress
+    import socket
+    h = (host or "").strip().strip("[]").rstrip(".").lower()
+    if not h:
+        raise UserFacing("That link isn't a web address.")
+    inside = UserFacing("That link points inside your own network.")
+    if h == "localhost" or h.endswith((".localhost", ".local", ".lan", ".internal")):
+        raise inside
+    try:
+        if _ip_not_public(ipaddress.ip_address(socket.inet_aton(h))):
+            raise inside
+    except (OSError, ValueError):
+        pass                                           # not a numeric IPv4 form
+    try:
+        infos = socket.getaddrinfo(h, None)
+    except (OSError, ValueError):                      # ValueError: a malformed name (empty or over-long label)
+        return
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(str(info[4][0]).split("%")[0])
+        except ValueError:
+            continue
+        if _ip_not_public(ip):
+            raise inside
+
+
+import socket as _socket_for_guard
+# 11-22: .depth > 0 in a thread = a song-link fetch is running there. Kept on the socket module, beside the wrappers
+# that read it, so a second copy of this module (run as __main__ and imported) shares the one the wrappers use.
+_SONG_NET = getattr(_socket_for_guard, "_fixer_song_net", None) or threading.local()
+_socket_for_guard._fixer_song_net = _SONG_NET
+
+
+class _SongNetGuard:
+    """Context manager: while it is open, THIS thread may not connect a socket to a private, loopback, link-local,
+    reserved, multicast or unspecified address (see _install_song_net_guard). Nests; cleared on the way out."""
+
+    def __enter__(self):
+        _SONG_NET.depth = getattr(_SONG_NET, "depth", 0) + 1
+        return self
+
+    def __exit__(self, *exc):
+        _SONG_NET.depth = max(0, getattr(_SONG_NET, "depth", 1) - 1)
+        return False
+
+
+class _PrivatePeer(OSError):
+    """The guard's refusal (an OSError, so every caller's own error handling already copes with it)."""
+
+
+def _checked_peer(family: int, address):
+    """The address to connect to, or OSError when it is not a public one. A literal is checked as it stands (IPv6
+    scope ids cut off, IPv4-mapped IPv6 read as the IPv4 inside). A NAME (connect accepts them) is resolved here, once,
+    and the checked answer is what gets connected to, so DNS cannot change between the check and the connect."""
+    import errno
+    import ipaddress
+    import socket
+    if family not in (socket.AF_INET, socket.AF_INET6) or not isinstance(address, tuple) or len(address) < 2:
+        return address                                 # AF_UNIX and the like: not a link's business
+    host = address[0]
+    if isinstance(host, (bytes, bytearray)):
+        host = bytes(host).decode("latin-1")
+    host = str(host)
+    refused = _PrivatePeer(errno.EACCES, "A song link may not connect to an address inside your own network.")
+    try:
+        ip = ipaddress.ip_address(host.split("%")[0])
+    except ValueError:
+        if host in ("", "<broadcast>"):                # INADDR_ANY / broadcast
+            raise refused
+        infos = [i for i in socket.getaddrinfo(host, address[1], family, socket.SOCK_STREAM) if i[0] == family]
+        if not infos:
+            raise OSError(errno.EADDRNOTAVAIL, "That link's host has no usable address.")
+        address = infos[0][4]
+        ip = ipaddress.ip_address(str(address[0]).split("%")[0])
+    if _ip_not_public(ip):
+        raise refused
+    return address
+
+
+def _install_song_net_guard() -> None:
+    """11-22 (finding 25/79): thin wrappers around socket.socket.connect and connect_ex, installed once at import.
+    ONLY in a thread with a _SongNetGuard open do they refuse a private peer address (raise OSError); in every other
+    thread (the asyncio loop, ComfyUI and llama traffic, localhost) they pass straight through. This is the real
+    check: it sees the address actually connected to, after DNS and after any redirect, whoever follows it. ssl's
+    SSLSocket.connect / connect_ex reach socket.socket.connect through super() (Lib/ssl.py, _real_connect), so https
+    is covered too."""
+    import socket
+    if getattr(socket.socket.connect, "_fixer_song_guard", False):
+        return
+    real_connect, real_connect_ex = socket.socket.connect, socket.socket.connect_ex
+
+    def connect(self, address):
+        if getattr(_SONG_NET, "depth", 0):
+            address = _checked_peer(self.family, address)
+        return real_connect(self, address)
+
+    def connect_ex(self, address):
+        if getattr(_SONG_NET, "depth", 0):
+            try:
+                address = _checked_peer(self.family, address)
+            except _PrivatePeer as e:
+                return e.errno                         # connect_ex reports a refusal as an error number, never raises it
+        return real_connect_ex(self, address)
+    connect._fixer_song_guard = connect_ex._fixer_song_guard = True
+    socket.socket.connect, socket.socket.connect_ex = connect, connect_ex
+
+
+_install_song_net_guard()
+
+
+def _song_follow(url: str, max_redirects: int = 5) -> str:
+    """11-22: the URL after its redirects, followed by hand so each hop is checked (scheme, then host via
+    _song_host_public) BEFORE anything is fetched from it. yt-dlp is then given the last hop. The walk uses a GET (its
+    body is never read), since a server can answer HEAD and GET differently. A server that errors just ends the walk:
+    that URL goes to yt-dlp as it is. No proxy from the environment is used (it would hide the real peer).
+    The host checks are the friendly first line (they say why). The strict line is _SongNetGuard, held here and around
+    the whole yt-dlp run: a connection to a private address is refused at connect time, so a redirect yt-dlp follows
+    itself is never sent and DNS that changes between the check and the connect cannot get through.
+    NOT covered: an external downloader subprocess (ffmpeg, which yt-dlp can pick by itself for some HLS streams;
+    this code passes no external-downloader option, so it never asks for one), a request handler that does not use
+    Python sockets (curl_cffi), and a thread yt-dlp starts itself (the guard is per thread; these options start none)."""
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):            # a 3xx surfaces as HTTPError below instead of being followed
+            return None
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+    for _ in range(max_redirects + 1):
+        u = urllib.parse.urlsplit(url)
+        if u.scheme not in ("http", "https") or not u.netloc:
+            raise UserFacing("That link isn't a web address.")
+        _song_host_public(u.hostname)
+        try:
+            with _SongNetGuard():
+                opener.open(urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Range": "bytes=0-0"}),
+                            timeout=8).close()
+            return url
+        except urllib.error.HTTPError as e:
+            loc = e.headers.get("Location") if e.headers else None
+            code = e.code
+            e.close()
+            if code in (301, 302, 303, 307, 308) and loc:
+                url = urllib.parse.urljoin(url, loc)
+                continue
+            return url
+        except Exception as e:                         # noqa: BLE001
+            if isinstance(e, _PrivatePeer) or isinstance(getattr(e, "reason", None), _PrivatePeer):
+                raise UserFacing("That link points inside your own network.")   # it resolved inward after the check
+            return url
+    raise UserFacing("That link redirected too many times.")
 
 
 def _song_card(status) -> None:
@@ -4901,9 +5354,26 @@ def job_song(p: dict, emit, cancel):
             emit({"t": "note", "v": "The chat model couldn't write lyrics just now, so this one is instrumental."})
     if s["instrumental"] or not lyrics:
         lyrics = "[Instrumental]"
+    carded = False
+    link = str(p.get("reference_url") or "").strip()
+    followed = None
+    if link:
+        # 11-22: the cheap link check (scheme, redirects, where it resolves; nothing is downloaded) comes BEFORE the
+        # engine start, which can take minutes: a bad link is refused at once
+        status("Checking the link…")
+        followed = _song_check_url(link)
+        if cancel.is_set():
+            return
+    if p.get("reference_url") or p.get("reference"):
+        # 11-22: ComfyUI starts BEFORE the recording is written into its private input folder (Comfy.ensure wipes that
+        # folder when it starts the engine, which used to delete the file); the later _song_card is then a no-op
+        _song_card(status)
+        carded = True
+        if cancel.is_set():
+            return
     if p.get("reference_url"):
         status("Getting the recording from the link…")
-    ref = _song_reference(p)                           # a link sets p["reference_seconds"]
+    ref = _song_reference(p, followed)                 # a link sets p["reference_seconds"]
     try:
         if ref:
             # 11-20: the recording's own tempo and key, so the song made from it keeps them
@@ -4925,7 +5395,8 @@ def job_song(p: dict, emit, cancel):
             seconds = ref_len                          # the song starts from the recording: no longer than it
         if cancel.is_set():
             return
-        _song_card(status)
+        if not carded:
+            _song_card(status)
         _timing(model="ACE-Step 1.5", steps=8, count=1)
         status("Loading the song model…")
         mp3 = _sing(tags, lyrics, seconds, seed, bpm, key, s["language"], emit, cancel,
@@ -4987,6 +5458,12 @@ def job_artwork(p: dict, emit, cancel):
     if cancel.is_set():
         return
     if not png:
+        try:
+            have_model = _cover_model() is not None
+        except Exception:                              # noqa: BLE001
+            have_model = False
+        if have_model:                                 # 11-22: the model is there; the painting itself failed
+            raise UserFacing("The picture engine couldn't paint the artwork this time. Try again in a moment.")
         raise UserFacing("No everyday picture model is on your computer to paint it.")
     emit({"t": "progress", "v": 1.0})
     emit({"t": "cover", "v": base64.b64encode(png).decode(), "art_id": art_id, "prompt": prompt})
@@ -5009,10 +5486,15 @@ def _album_system(n: int, instrumental: bool, safe: bool, style: str, language: 
             + (" Keep everything clean: nothing sexual or explicit." if safe else ""))
 
 
+def _cover_model():
+    """The everyday picture model ready for a cover, or None when there is none."""
+    a = _auto_models()
+    return _first_ready([x for x in a.get("picture_safe") or [] if x not in _adult_models()])
+
+
 def _album_cover(prompt: str, seed: int, cancel) -> bytes | None:
     """A square cover from the everyday picture model; None when there is none or it fails (the songs still come)."""
-    a = _auto_models()
-    first = _first_ready([x for x in a.get("picture_safe") or [] if x not in _adult_models()])
+    first = _cover_model()
     if first is None or not prompt:
         return None
     try:
@@ -5333,7 +5815,16 @@ def job_config(p: dict, emit, cancel):
 def _prompt_style(r: dict) -> str:
     """Which phrasing a recipe's toggles use: Chroma / SDXL sentences with negatives, or the positive-only sentences
     (the legacy "zimage" style) that Qwen-Image 2.1 uses at guidance 1, where negatives do nothing."""
-    return {"chroma": "chroma", "sdxl": "chroma"}.get(r.get("builder", ""), "zimage")
+    return {"chroma": "chroma", "sdxl": "sdxl"}.get(r.get("builder", ""), "zimage")
+
+
+def _toggle_phrase(it: dict, style: str) -> dict:
+    """One toggle's wording for a style. 11-22: SDXL models get their own short tag wording ("sdxl" in
+    prompt_toggles.json); a toggle that has none falls back to the Chroma sentences it used before."""
+    phr = it.get(style)
+    if style == "sdxl" and not isinstance(phr, dict):
+        phr = it.get("chroma")
+    return phr if isinstance(phr, dict) else {}
 
 
 def _toggle_library() -> list[dict]:
@@ -5369,7 +5860,7 @@ def _recipe_toggles(r: dict) -> list[dict]:
     out = []
     for g in _toggle_library():
         items = [{"id": it["id"], "label": it["label"], "explicit": _toggle_is_adult(it)} for it in g.get("items", [])
-                 if (it.get(style) or {}).get("p") or (it.get(style) or {}).get("n")]
+                 if _toggle_phrase(it, style).get("p") or _toggle_phrase(it, style).get("n")]
         if items:
             out.append({"name": g.get("name", ""), "items": items})
     return out
@@ -5386,12 +5877,12 @@ def _apply_toggles(r: dict, v: dict) -> dict:
     for g in _toggle_library():
         for it in g.get("items", []):
             if it.get("id") in ids and not (safe and _toggle_is_adult(it)):
-                phr = it.get(style) or {}
+                phr = _toggle_phrase(it, style)
                 if phr.get("p"):
                     pos.append(phr["p"])
                 if phr.get("n"):
                     neg.append(phr["n"])
-    sep = ". "
+    sep = ", " if style == "sdxl" else ". "              # tag wording joins with commas, sentences with full stops
     prompt = (v.get("prompt") or "").strip().rstrip(".")
     v = {**v, "prompt": sep.join([x for x in [prompt] + pos if x])}
     if neg and r.get("negative"):
@@ -5602,14 +6093,18 @@ def _make_catalog() -> dict:
                 continue
             dflt = r["defaults"]
             nums = {}
-            if d.get("steps") is not None and r.get("uses_steps", True):
-                nums["steps"] = float(d["steps"])
-            if d.get("cfg") is not None:
-                nums["cfg"] = float(d["cfg"])
-            if d.get("realism") is not None:
-                nums["realism"] = float(d["realism"])
-            if d.get("shift") is not None and r.get("uses_shift", True):
-                nums["shift"] = float(d["shift"])
+            try:
+                if d.get("steps") is not None and r.get("uses_steps", True):
+                    nums["steps"] = float(d["steps"])
+                if d.get("cfg") is not None:
+                    nums["cfg"] = float(d["cfg"])
+                if d.get("realism") is not None:
+                    nums["realism"] = float(d["realism"])
+                if d.get("shift") is not None and r.get("uses_shift", True):
+                    nums["shift"] = float(d["shift"])
+            except (TypeError, ValueError):             # one bad number in recipes.json must not take down every style
+                log.warning("recipes.json: the style %r has a number that isn't a number; left out", item["id"])
+                continue
             menus = {}
             if r.get("uses_sampler", True) and d.get("sampler") in SAMPLER_WORDS:
                 menus["sampler"] = _labelled([d["sampler"]], SAMPLER_WORDS, dflt["sampler"])[0]
@@ -5676,26 +6171,29 @@ def job_comfy_run(p: dict, emit, cancel):
         v["prompt"] = _with_triggers(v.get("prompt"), triggers)
     photo, photo_name, mode = None, None, str(v.get("image_mode") or "start")
     extra_names = []                                  # photos 2 and 3 for a multi-photo edit
-    for b64 in (v.get("images") or [])[:2]:
-        import uuid
-        n = f"cr_{uuid.uuid4().hex}.png"
-        (COMFY_PRIVATE / "input").mkdir(parents=True, exist_ok=True)
-        _image_in(b64).save(COMFY_PRIVATE / "input" / n, format="PNG")
-        extra_names.append(n)
-    if v.get("image"):
-        import uuid
-        photo = _image_in(v["image"])
-        photo_name = f"cr_{uuid.uuid4().hex}.png"
-        (COMFY_PRIVATE / "input").mkdir(parents=True, exist_ok=True)
-        photo.save(COMFY_PRIVATE / "input" / photo_name, format="PNG")
-        if mode == "paint" and not v.get("mask"):
-            (COMFY_PRIVATE / "input" / photo_name).unlink(missing_ok=True)
-            raise UserFacing("Paint over the spot to change first.")
-        if mode in ("edit", "reference") and not (_qwen_edit_ready() or _qwen_edit_ready(True) or _qwen21_ready()):
-            (COMFY_PRIVATE / "input" / photo_name).unlink(missing_ok=True)
-            raise UserFacing("Editing a photo needs a photo editor model on your computer.")
-    if v.get("image_mode") == "paint" and photo is None:
-        raise UserFacing("Paint to change needs the picture; try again from the viewer.")
+    try:                                               # any failure before the drawing starts removes every photo written so far
+        for b64 in (v.get("images") or [])[:2]:
+            import uuid
+            n = f"cr_{uuid.uuid4().hex}.png"
+            extra_names.append(n)
+            (COMFY_PRIVATE / "input").mkdir(parents=True, exist_ok=True)
+            _image_in(b64).save(COMFY_PRIVATE / "input" / n, format="PNG")
+        if v.get("image"):
+            import uuid
+            photo = _image_in(v["image"])
+            photo_name = f"cr_{uuid.uuid4().hex}.png"
+            (COMFY_PRIVATE / "input").mkdir(parents=True, exist_ok=True)
+            photo.save(COMFY_PRIVATE / "input" / photo_name, format="PNG")
+            if mode == "paint" and not v.get("mask"):
+                raise UserFacing("Paint over the spot to change first.")
+            if mode in ("edit", "reference") and not (_qwen_edit_ready() or _qwen_edit_ready(True) or _qwen21_ready()):
+                raise UserFacing("Editing a photo needs a photo editor model on your computer.")
+        if v.get("image_mode") == "paint" and photo is None:
+            raise UserFacing("Paint to change needs the picture; try again from the viewer.")
+    except BaseException:
+        for n in ([photo_name] if photo_name else []) + extra_names:
+            (COMFY_PRIVATE / "input" / n).unlink(missing_ok=True)
+        raise
     try:
         _create_pictures(r, v, w, h, count, seed, loras, photo, photo_name, mode, emit, cancel, status,
                          extra_names, p.get("recipe"))
@@ -5795,7 +6293,8 @@ def _create_pictures(r, v, w, h, count, seed, loras, photo, photo_name, mode, em
         if cancel.is_set() or not png:
             return
         COMFY.last_recipe = None if editing else recipe_id   # an edit ran the editor's models, not the recipe's
-        emit({"t": "image", "v": base64.b64encode(png).decode(), "seed": s_i, "index": i})
+        emit({"t": "image", "v": base64.b64encode(png).decode(), "seed": s_i, "index": i,
+              "recipe": recipe_id})                      # so a picture the phone adopts later can still be changed
     emit({"t": "progress", "v": 1.0})
 
 
@@ -6166,7 +6665,7 @@ LORA_WAN_5B = "This add-on was made for a smaller Wan video model that isn't on 
 
 def _civitai_token() -> str:
     try:
-        return CIVITAI_TOKEN.read_text(encoding="utf-8").strip()
+        return (sec.read_text(CIVITAI_TOKEN) or "").strip()   # sealed, or a legacy plaintext file
     except Exception:                                    # noqa: BLE001
         return ""
 
@@ -6263,18 +6762,53 @@ def _clean_lora_name(name: str) -> str:
     return (base or "lora")[:60]
 
 
+def _lora_path(fn) -> Path | None:
+    """COMFY_LORAS / fn for a file name that came from the phone, or None when it is not a plain add-on file name:
+    a bare '<name>.safetensors' (no folders, '..', drive, colon or absolute path) whose resolved parent is the add-on
+    folder itself. Every place that joins a phone-supplied name to the folder goes through this."""
+    if not isinstance(fn, str) or not fn or fn != fn.strip() or not fn.lower().endswith(".safetensors"):
+        return None
+    if any(c in fn for c in "/\\:\0") or ".." in fn or Path(fn).is_absolute() or Path(fn).name != fn:
+        return None
+    try:
+        f = COMFY_LORAS / fn
+        if f.resolve().parent != COMFY_LORAS.resolve():
+            return None
+    except (OSError, ValueError):
+        return None
+    return f
+
+
 def _lora_lib() -> dict:
     try:
-        return json.loads((COMFY_LORAS / "library.json").read_text(encoding="utf-8"))
+        d = json.loads(sec.read_text(COMFY_LORAS / "library.json") or "null")
+        return d if isinstance(d, dict) else {}          # missing file / wrong shape: an empty library, never None
     except Exception:                                    # noqa: BLE001
         return {}
 
 
+LIB_LOCK = threading.RLock()                            # 31: held for each library.json read-change-write, in every writer
+                                                        # (jobs run on executor threads). Held only for that short step,
+                                                        # never across a download, a ComfyUI stop or an await. Lock order:
+                                                        # LORA_LOCK first, then this one.
+
+
+def _lora_lib_for_update() -> dict:
+    """The library for a read-change-write, to be called inside LIB_LOCK. Unlike _lora_lib it does not turn an
+    unreadable file into {}: a file that exists but can't be unsealed or parsed is refused, so the change is not
+    written over it as an empty library. A missing or empty file is a fresh library."""
+    try:
+        return sec.load_json_object(COMFY_LORAS / "library.json")
+    except sec.ConfigUnreadable as e:
+        log.warning("add-on list can't be read: %s", e)
+        raise UserFacing("The list of your add-ons couldn't be read, so nothing was changed. On the PC, run "
+                         "\"python pair.py --reset library\" in the Fixer folder: it renames the old list (kept, not "
+                         "deleted) and starts an empty one, then add your add-ons again.") from e
+
+
 def _lora_lib_write(lib: dict) -> None:
     _ensure_lora_store()
-    tmp = COMFY_LORAS / "library.json.tmp"
-    tmp.write_text(json.dumps(lib), encoding="utf-8")
-    tmp.replace(COMFY_LORAS / "library.json")            # atomic
+    sec.write_text(COMFY_LORAS / "library.json", json.dumps(lib))   # sealed at rest (DPAPI)
 
 
 # ----- Roles & macros (11-21) ------------------------------------------------------------------------------------
@@ -6291,7 +6825,7 @@ def _macros_defaults() -> dict:
     file/strength (so the Settings role editor shows it filled in), every other built-in role present but unset."""
     roles = {r: {"file": "", "strength": 1.0, "enabled": False} for r in BUILTIN_ROLES}
     qf = _tune_text("qwen21_explicit_lora", QWEN21_LORA_FILE)
-    if qf and (qf in _lora_lib() or (COMFY_LORAS / qf).is_file()):   # 11-21: only pre-fill when it's actually installed
+    if qf and (qf in (_lora_lib() or {}) or (COMFY_LORAS / qf).is_file()):   # 11-21: only pre-fill when it's actually installed
         roles["qwen-explicit-addon"] = {"file": qf,
                                         "strength": max(0.0, min(2.0, _tune("qwen21_explicit_strength", 1.0))),
                                         "enabled": True}
@@ -6302,7 +6836,7 @@ def _macros() -> dict:
     """macros.json as {roles, macros}, read fresh every use. Absent or corrupt -> built-in defaults (never raises,
     never writes). Missing sections are filled so callers index safely."""
     try:
-        data = json.loads(MACROS_FILE.read_text(encoding="utf-8-sig"))
+        data = json.loads(sec.read_text(MACROS_FILE) or "null")
         if not isinstance(data, dict):
             raise ValueError
     except Exception:                                    # noqa: BLE001  (absent / corrupt -> defaults)
@@ -6317,10 +6851,7 @@ def _macros() -> dict:
 
 def _macros_write(data: dict) -> None:
     """Atomic write (tmp + replace), like _lora_lib_write."""
-    MACROS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = MACROS_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(MACROS_FILE)
+    sec.write_text(MACROS_FILE, json.dumps(data, indent=2, ensure_ascii=False))   # sealed at rest (DPAPI)
 
 
 def _role_lora(name: str) -> tuple[str, float] | None:
@@ -6330,7 +6861,8 @@ def _role_lora(name: str) -> tuple[str, float] | None:
     if not isinstance(r, dict) or not r.get("enabled"):
         return None
     fn = str(r.get("file") or "")
-    if not fn or not (fn in _lora_lib() or (COMFY_LORAS / fn).is_file()):
+    f = _lora_path(fn)
+    if f is None or not (fn in (_lora_lib() or {}) or f.is_file()):
         return None
     return (fn, max(0.0, min(2.0, float(r.get("strength", 1.0)))))
 
@@ -6418,11 +6950,12 @@ def _lora_nsfw_backfill(limit: int = 40) -> None:
         if not found or not LORA_LOCK.acquire(timeout=30):
             return
         try:
-            lib = _lora_lib()
-            for fn, flag in found.items():
-                if fn in lib:
-                    lib[fn]["nsfw"] = flag
-            _lora_lib_write(lib)
+            with LIB_LOCK:
+                lib = _lora_lib_for_update()             # fresh read: the lookups above took a while
+                for fn, flag in found.items():
+                    if isinstance(lib.get(fn), dict):
+                        lib[fn]["nsfw"] = flag
+                _lora_lib_write(lib)
         finally:
             LORA_LOCK.release()
     except Exception as e:                               # noqa: BLE001
@@ -6576,20 +7109,21 @@ def _resort_qwen_loras() -> None:
     if not LORA_LOCK.acquire(blocking=False):
         return
     try:
-        lib = _lora_lib()
-        changed = False
-        for fn, e in lib.items():
-            if not isinstance(e, dict) or e.get("family") != "qwen-edit" or "family_checked" in e:
-                continue
-            path = COMFY_LORAS / fn
-            if not path.is_file():
-                continue
-            if _header_is_qwen21(_read_lora_header(path)):
-                e["family"] = "qwen21"
-            e["family_checked"] = True
-            changed = True
-        if changed:
-            _lora_lib_write(lib)
+        with LIB_LOCK:                                   # 31: read, change, write as one step
+            lib = _lora_lib_for_update()
+            changed = False
+            for fn, e in lib.items():
+                if not isinstance(e, dict) or e.get("family") != "qwen-edit" or "family_checked" in e:
+                    continue
+                path = COMFY_LORAS / fn
+                if not path.is_file():
+                    continue
+                if _header_is_qwen21(_read_lora_header(path)):
+                    e["family"] = "qwen21"
+                e["family_checked"] = True
+                changed = True
+            if changed:
+                _lora_lib_write(lib)
     except Exception:                                    # noqa: BLE001
         pass
     finally:
@@ -6654,12 +7188,14 @@ def _stream_lora(url: str, dest: Path, emit, cancel, max_bytes: int = LORA_MAX_B
     try:
         cl = r.headers.get("Content-Length")
         if cl and int(cl) > max_bytes:
+            r.close()                                    # not yet inside the try/finally below
             raise UserFacing("That add-on is too large (over 2 GB).")
     except (TypeError, ValueError):
         pass
     h = hashlib.sha256()
     head = bytearray()
     header = None
+    head_len = 8
     total = None
     try:
         total = int(r.headers.get("Content-Length") or 0) or None
@@ -6690,6 +7226,9 @@ def _stream_lora(url: str, dest: Path, emit, cancel, max_bytes: int = LORA_MAX_B
                                 header = json.loads(bytes(head[8:8 + n]).decode("utf-8"))
                             except Exception as e:       # noqa: BLE001
                                 raise UserFacing("That file isn't a valid safetensors add-on.") from e
+                            if not isinstance(header, dict):   # 'null' or a list: reject now, don't keep buffering
+                                raise UserFacing("That file isn't a valid safetensors add-on.")
+                            head_len = 8 + n
                 now = time.monotonic()
                 if total and now - last > 0.3:
                     last = now
@@ -6698,6 +7237,15 @@ def _stream_lora(url: str, dest: Path, emit, cancel, max_bytes: int = LORA_MAX_B
         r.close()
     if header is None:
         raise UserFacing("That file isn't a valid safetensors add-on.")
+    if total and got != total:                           # the connection closed early: a cut-off file looks fine up front
+        raise UserFacing("The download stopped before it finished. Please try again.")
+    try:                                                 # the header says where the last tensor ends: the file must reach it
+        end = max([int(v["data_offsets"][1]) for k, v in header.items()
+                   if k != "__metadata__" and isinstance(v, dict) and v.get("data_offsets")] or [0])
+    except (TypeError, ValueError, KeyError, IndexError):
+        end = 0
+    if got < head_len + end:
+        raise UserFacing("The download stopped before it finished. Please try again.")
     return header, h.hexdigest(), got
 
 
@@ -6724,7 +7272,8 @@ def _parse_lora_link(link: str) -> dict:
     if host in ("huggingface.co", "www.huggingface.co"):
         m = re.search(r"/([^/]+/[^/]+)/(?:blob|resolve)/[^/]+/(.+\.safetensors)$", path)
         if m:
-            return {"kind": "hf_file", "repo": m.group(1), "file": m.group(2)}
+            rev = re.search(r"/(?:blob|resolve)/([^/]+)/", path).group(1)   # the branch / tag / commit in the link
+            return {"kind": "hf_file", "repo": m.group(1), "file": m.group(2), "rev": rev}
         m = re.match(r"/([^/]+/[^/]+)/?$", path)
         if m:
             return {"kind": "hf_repo", "repo": m.group(1)}
@@ -6874,6 +7423,7 @@ def _plan_from_descriptor(d: dict) -> dict:
                 "tags": [str(t) for t in (mj.get("tags") or [])][:12]}
     if k in ("hf_repo", "hf_file"):
         repo = d["repo"]
+        rev = urllib.parse.quote(urllib.parse.unquote(str(d.get("rev") or "main")), safe="")    # a link to a pinned version downloads that version
         if k == "hf_file":
             files = [d["file"]]
         else:
@@ -6885,7 +7435,7 @@ def _plan_from_descriptor(d: dict) -> dict:
             if len(files) > 1:
                 return {"choices": files, "repo": repo, "source": "hf"}
         rows = [{"name": f.split("/")[-1],
-                 "url": f"https://huggingface.co/{repo}/resolve/main/" + urllib.parse.quote(f),
+                 "url": f"https://huggingface.co/{repo}/resolve/{rev}/" + urllib.parse.quote(f),
                  "size": None, "sha256": "", "pickle": None, "virus": None} for f in files]
         return {"source": "hf", "source_id": f"hf:{repo}", "name": repo.split("/")[-1], "base": "",
                 "triggers": [], "files": rows}
@@ -6910,11 +7460,7 @@ def job_lora_key(p: dict, emit, cancel):
     """Saves (or clears) the Civitai key. Never returns it."""
     key = str(p.get("key") or "").strip()
     if key:
-        CIVITAI_TOKEN.write_text(key, encoding="utf-8")
-        try:
-            CIVITAI_TOKEN.chmod(0o600)
-        except Exception:                                # noqa: BLE001
-            pass
+        sec.write_text(CIVITAI_TOKEN, key)               # sealed at rest (DPAPI)
     else:
         CIVITAI_TOKEN.unlink(missing_ok=True)
     emit({"t": "info", "civitai_key": bool(key)})
@@ -6929,30 +7475,38 @@ def job_lora_list(p: dict, emit, cancel):
 def job_lora_set(p: dict, emit, cancel):
     """Change strength, always_on or family for one file (and, for a pair, both halves)."""
     fn = str(p.get("file") or "")
-    lib = _lora_lib()
-    if fn not in lib and not (COMFY_LORAS / fn).is_file():
+    f = _lora_path(fn)                                   # the phone's name: a bare add-on file name only
+    if f is None:
         raise UserFacing("That add-on isn't on your computer.")
-    e = lib.get(fn) or {"name": re.sub(r"\.safetensors$", "", fn), "family": "unknown", "triggers": [],
-                        "strength": 1.0, "always_on": False, "pair": None, "role": None, "source": "", "source_id": "",
-                        "sha256": "", "size": (COMFY_LORAS / fn).stat().st_size}
-    if "strength" in p:
-        e["strength"] = max(0.0, min(2.0, float(p.get("strength") or 1.0)))
-    if "always_on" in p:
-        e["always_on"] = bool(p.get("always_on"))
-    if "family" in p and p.get("family") in LORA_FAMILIES:
-        e["family"] = p["family"]
-        e["family_checked"] = True                       # chosen by hand: the Qwen re-sort leaves it alone
-    if isinstance(p.get("explicit"), bool):              # 11-19: the owner's own 18+ mark beats any guess
-        e["explicit"] = p["explicit"]
-    lib[fn] = e
-    pair = e.get("pair")
-    if pair:                                             # keep both halves of a Wan pair in step
-        for k, v in lib.items():
-            if v.get("pair") == pair and k != fn:
-                for field in ("strength", "always_on", "family", "explicit"):
-                    if field in p:
-                        v[field] = e[field]
-    _lora_lib_write(lib)
+    with LIB_LOCK:                                       # 31: a fresh read, the change and the write as one step
+        lib = _lora_lib_for_update()
+        if fn not in lib and not f.is_file():
+            raise UserFacing("That add-on isn't on your computer.")
+        e = lib.get(fn) or {"name": re.sub(r"\.safetensors$", "", fn), "family": "unknown", "triggers": [],
+                            "strength": 1.0, "always_on": False, "pair": None, "role": None, "source": "", "source_id": "",
+                            "sha256": "", "size": f.stat().st_size}
+        if "strength" in p:
+            try:
+                st = float(p["strength"]) if p["strength"] is not None else 1.0   # a strength of 0 is real (add-on off)
+            except (TypeError, ValueError):
+                st = 1.0
+            e["strength"] = max(0.0, min(2.0, st))
+        if "always_on" in p:
+            e["always_on"] = bool(p.get("always_on"))
+        if "family" in p and p.get("family") in LORA_FAMILIES:
+            e["family"] = p["family"]
+            e["family_checked"] = True                   # chosen by hand: the Qwen re-sort leaves it alone
+        if isinstance(p.get("explicit"), bool):          # 11-19: the owner's own 18+ mark beats any guess
+            e["explicit"] = p["explicit"]
+        lib[fn] = e
+        pair = e.get("pair")
+        if pair:                                         # keep both halves of a Wan pair in step
+            for k, v in lib.items():
+                if v.get("pair") == pair and k != fn:
+                    for field in ("strength", "always_on", "family", "explicit"):
+                        if field in p:
+                            v[field] = e[field]
+        _lora_lib_write(lib)
     emit({"t": "info", "library": _lora_entries()})
 
 
@@ -6968,10 +7522,12 @@ def job_macros_set(p: dict, emit, cancel):
     roles_in, macros_in = p.get("roles"), p.get("macros")
     if not isinstance(roles_in, dict) or not isinstance(macros_in, list):
         raise UserFacing("That didn't look like a valid roles/macros document.")
-    lib = _lora_lib()
+    lib = _lora_lib() or {}
 
     def known(fn: str) -> bool:
-        return bool(fn) and (fn in lib or (COMFY_LORAS / fn).is_file())
+        return _lora_path(fn) is not None and (fn in lib or _lora_path(fn).is_file())
+
+    stored = {str(x.get("id") or "").strip(): x for x in (_macros().get("macros") or [])}   # the copy on disk now
 
     roles = {}
     for name, r in roles_in.items():
@@ -6992,6 +7548,8 @@ def job_macros_set(p: dict, emit, cancel):
         if not mid or mid in seen_ids:
             raise UserFacing("Each macro needs its own name.")
         seen_ids.add(mid)
+        old = stored.get(mid)
+        had = {str(x.get("file")) for x in ((old or {}).get("loras") or []) if isinstance(x, dict) and x.get("file")}
         loras = []
         for it in (m.get("loras") or []):
             if not isinstance(it, dict):
@@ -6999,11 +7557,13 @@ def job_macros_set(p: dict, emit, cancel):
             if it.get("role"):
                 loras.append({"role": str(it["role"])})
             elif it.get("file"):
-                if not known(str(it["file"])):
-                    continue                              # 11-21: drop an add-on that isn't installed rather than
-                                                          # refusing the whole save.
+                if not known(str(it["file"])) and str(it["file"]) not in had:
+                    continue                              # 11-21: drop a NEWLY added add-on that isn't installed rather
+                                                          # than refusing the whole save; one the macro already had stays
+                                                          # (it may just be removed or not installed yet).
                 loras.append({"file": str(it["file"]), "strength": max(0.0, min(2.0, float(it.get("strength", 1.0))))})
-        macros.append({"id": mid, "name": str(m.get("name") or mid),
+        macros.append({**(old or {}),                     # keep keys the phone does not edit (the Realism macro's tuning)
+                       "id": mid, "name": str(m.get("name") or mid),
                        "prompt_add": str(m.get("prompt_add") or ""), "negative_add": str(m.get("negative_add") or ""),
                        "loras": loras, "settings": m.get("settings") if isinstance(m.get("settings"), dict) else {},
                        "model": (str(m["model"]) if m.get("model") else None), "explicit": bool(m.get("explicit")),
@@ -7036,28 +7596,34 @@ def job_describe_photo(p: dict, emit, cancel):
 def job_lora_remove(p: dict, emit, cancel):
     """Delete a file (or a whole pair) and its library entry."""
     fn = str(p.get("file") or "")
-    lib = _lora_lib()
-    pair = (lib.get(fn) or {}).get("pair")
+    if _lora_path(fn) is None:                           # the phone's name: a bare add-on file name only
+        raise UserFacing("That add-on isn't on your computer.")
+    with LIB_LOCK:                                       # an unreadable library refuses here, BEFORE any file is deleted.
+        lib = _lora_lib_for_update()                     # No LORA_LOCK: removing while another add-on downloads is allowed;
+                                                         # a row left for a file deleted under an add is never listed (_lora_entries)
+    pair = (lib.get(fn) or {}).get("pair")           # only to find the pair; the entries are removed from a fresh read below
     targets = [k for k, v in lib.items() if v.get("pair") == pair] if pair else [fn]
     if fn not in targets:
         targets.append(fn)
     freed, stopped = 0, False
-    for t in targets:
-        f = COMFY_LORAS / t
-        if not f.is_file():
-            lib.pop(t, None)
+    for t in targets:                                # files first, outside the library lock (COMFY.stop can take a while)
+        f = _lora_path(t)
+        if f is None or not f.is_file():
             continue
         size = f.stat().st_size
         try:
             f.unlink()
         except PermissionError:
-            if not stopped:                              # ComfyUI may hold the file open on Windows; release it
+            if not stopped:                          # ComfyUI may hold the file open on Windows; release it
                 COMFY.stop()
                 stopped = True
             f.unlink(missing_ok=True)
         freed += size
-        lib.pop(t, None)
-    _lora_lib_write(lib)
+    with LIB_LOCK:                                   # 31: drop the entries from a fresh read, so a concurrent edit stays
+        lib = _lora_lib_for_update()
+        for t in targets:
+            lib.pop(t, None)
+        _lora_lib_write(lib)
     COMFY.warmed.clear()
     emit({"t": "info", "removed": fn, "freed_gb": round(freed / 1024 ** 3, 2), "library": _lora_entries()})
 
@@ -7227,12 +7793,15 @@ def job_lora_add(p: dict, emit, cancel):
         is_pair = picked == "wan22" and len(files) >= 2
         if not is_pair and len(files) > 1:
             files = files[:1]
+        if is_pair and len(files) > 2:                   # a pair is exactly two files: the high-noise and low-noise half
+            hi = next((x for x in files if _wan_role(x["name"]) == "high"), None)
+            lo = next((x for x in files if _wan_role(x["name"]) == "low"), None)
+            files = [hi, lo] if hi and lo else files[:2]
         pair_id = secrets.token_hex(4) if is_pair else None
         _ensure_lora_store()
-        lib = _lora_lib()
-        added = []
+        added = []                                       # 31: the library is read fresh AFTER the download, not held from here
         warn_out = None
-        for f in files:
+        for f in files:                                  # check every file before downloading any
             if plan["source"] == "civitai" and (f.get("pickle") not in (None, "Success")
                                                 or f.get("virus") not in (None, "Success")):
                 raise UserFacing("That file hasn't passed Civitai's safety scan, so nothing was added.")
@@ -7240,8 +7809,10 @@ def job_lora_add(p: dict, emit, cancel):
                 raise UserFacing("That add-on is too large (over 2 GB).")
             if not str(f["name"]).lower().endswith(".safetensors"):
                 raise UserFacing("Only .safetensors add-ons are allowed.")
+        staged = []                                      # (part file, final name, row, family, sha, size): nothing is
+        for f in files:                                  # installed until every file of the add-on has arrived
             clean = _clean_lora_name(f["name"])
-            part = COMFY_LORAS / (clean + ".part")
+            part = COMFY_LORAS / (clean + ".part" if not staged else f"{clean}.{len(staged)}.part")
             try:
                 emit({"t": "status", "v": "Downloading the add-on…"})
                 header, sha, size = _stream_lora(f["url"], part, emit, cancel)
@@ -7256,21 +7827,46 @@ def job_lora_add(p: dict, emit, cancel):
                     raise UserFacing(fam_warn or "Pick the model this add-on is for, then add it again.")
                 warn_out = warn_out or fam_warn
                 final = COMFY_LORAS / f"{clean}-{sha[:8]}.safetensors"
-                part.replace(final)
+                staged.append((part, final, f, fam, sha, size))
             except BaseException:
                 part.unlink(missing_ok=True)
+                for sp in staged:                        # a later file failed: the earlier halves go too
+                    sp[0].unlink(missing_ok=True)
                 raise
+        placed = []
+        try:
+            for part, final, f, fam, sha, size in staged:
+                existed = final.exists()
+                part.replace(final)
+                if not existed:
+                    placed.append(final)
+        except BaseException:
+            for sp in staged:
+                sp[0].unlink(missing_ok=True)
+            for fp in placed:
+                fp.unlink(missing_ok=True)
+            raise
+        new_rows = {}
+        for part, final, f, fam, sha, size in staged:
             role = _wan_role(f["name"]) if fam == "wan22" and is_pair else None
             seed = plan.get("strength")                  # a weight guessed from the Civitai description, if any
-            lib[final.name] = {"name": plan["name"], "family": fam, "source": plan["source"],
-                               "source_id": plan.get("source_id", ""), "sha256": sha, "size": size,
-                               "triggers": plan.get("triggers") or [],
-                               "strength": float(seed) if seed else 1.0, "pair": pair_id,
-                               "role": role, "always_on": False}
+            new_rows[final.name] = {"name": plan["name"], "family": fam, "source": plan["source"],
+                                    "source_id": plan.get("source_id", ""), "sha256": sha, "size": size,
+                                    "triggers": plan.get("triggers") or [],
+                                    "strength": float(seed) if seed else 1.0, "pair": pair_id,
+                                    "role": role, "always_on": False}
             if plan["source"] == "civitai":
-                lib[final.name]["nsfw"] = bool(plan.get("nsfw"))
+                new_rows[final.name]["nsfw"] = bool(plan.get("nsfw"))
             added.append({"file": final.name, "family": fam})
-        _lora_lib_write(lib)
+        try:
+            with LIB_LOCK:                               # 31: merge into the current library, so an edit or a removal
+                lib = _lora_lib_for_update()             # made while this downloaded is kept
+                lib.update(new_rows)
+                _lora_lib_write(lib)
+        except BaseException:                            # the list can't be saved: don't leave files it doesn't know
+            for fp in placed:
+                fp.unlink(missing_ok=True)
+            raise
         if not QUEUE.busy():                             # never under a picture or video that is being drawn
             COMFY.stop()                                 # so the next job's ComfyUI sees the new file
         emit({"t": "info", "added": added, "warning": warn_out, "library": _lora_entries()})
@@ -8091,22 +8687,26 @@ ASYNC_HANDLERS = {"queue": _op_queue, "stop_all": _op_stop_all, "free_memory": _
 
 def _drop_expired_pairings():
     """A temporary pairing past its expiry is deleted from keys.json, not just refused."""
+    dropped = []
+
+    def drop(data: dict):
+        now = time.time()
+        phones = data.get("phones", {})
+        gone = [k for k, v in phones.items() if (v.get("expires") and float(v["expires"]) < now)
+                or (v.get("pair_by") and float(v["pair_by"]) < now)]      # 11-19: a code nobody used in time
+        if not gone:
+            return False                               # nothing expired on the fresh copy: no write
+        for k in gone:
+            phones.pop(k)
+        dropped.extend(gone)
+
     try:
-        data = json.loads(KEYS.read_text(encoding="utf-8"))
-    except Exception:
+        # 8: under the keys.json lock, from a fresh read (a confirmation that just landed is not undone); a file that
+        # can't be read is left alone (and Keys.get has already logged it). Sealed at rest: never a plaintext copy.
+        if sec.update_json(KEYS, drop, indent=1):
+            log.warning("removed %d expired pairing(s)", len(dropped))
+    except Exception:                                  # noqa: BLE001  (busy / unreadable: try again in 30 s)
         return
-    now = time.time()
-    phones = data.get("phones", {})
-    gone = [k for k, v in phones.items() if (v.get("expires") and float(v["expires"]) < now)
-            or (v.get("pair_by") and float(v["pair_by"]) < now)]      # 11-19: a code nobody used in time
-    if not gone:
-        return
-    for k in gone:
-        phones.pop(k)
-    tmp = KEYS.with_name(f"keys.{os.getpid()}.drop.tmp")
-    tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
-    os.replace(tmp, KEYS)
-    log.warning("removed %d expired pairing(s)", len(gone))
 
 
 async def idle_unloader(app):
@@ -8120,7 +8720,8 @@ async def idle_unloader(app):
         while True:
             await asyncio.sleep(30)
             QUEUE.expire()
-            _drop_expired_pairings()               # 11-19: was never called; unused 60 s pairing codes go too
+            # 11-19: was never called; unused 60 s pairing codes go too. In the executor: it can wait on keys.json.lock
+            await asyncio.get_running_loop().run_in_executor(None, _drop_expired_pairings)
             if QUEUE.has_work():                   # queued/running jobs and held results count as use: never unload under them
                 LAST_USE = time.monotonic()
             # Idle means no pictures AND no chat: a long chat between pictures no longer unloads the picture model
@@ -8186,7 +8787,8 @@ async def handle(request: web.Request) -> web.StreamResponse:
         return _deny()
     del body
     if KEYSTORE.pending(phone):
-        confirm_pairing(phone)                         # 11-19: first use of a fresh code: it is now a real pairing
+        # 11-19: first use of a fresh code: it is now a real pairing. In the executor: it can wait on keys.json.lock
+        await asyncio.get_running_loop().run_in_executor(None, confirm_pairing, phone)
     if op in ("leave", "warm") and isinstance(payload, dict):    # 11-18: the owner's "free my computer after" choice
         choice = _parse_free_after(payload.get("free_after_min"))
         if choice is not None:
@@ -8496,7 +9098,7 @@ async def local_unload(request: web.Request) -> web.Response:
     if not GPU.locked():
         async with GPU:
             await asyncio.get_running_loop().run_in_executor(None, ENGINE.unload)
-            LLAMA.stop()                               # restarts in seconds on the next chat
+            await asyncio.get_running_loop().run_in_executor(None, LLAMA.stop)   # restarts in seconds on the next chat
             # 11-19: the picture models too (it used to leave ComfyUI's ~15 GB in place), the same as the app's Free;
             # ComfyUI itself keeps running, empty, so the next picture has no cold engine start.
             await asyncio.get_running_loop().run_in_executor(None, COMFY.free)
@@ -8518,6 +9120,19 @@ def app() -> web.Application:
     return a
 
 
+def _seal_configs_at_rest() -> None:
+    """11-22: upgrade the persistent config files (pairing keys, macros, LoRA catalog) to DPAPI-sealed at rest, in
+    place. Best-effort and idempotent: a file is sealed only after a verified round-trip, and one that can't be sealed
+    is left EXACTLY as it was and logged — never crashing startup. A legacy plaintext file is still read fine until it
+    migrates, so this can't break pairing. (keys.json carries the AES keys, so it must not sit in plaintext on disk.)"""
+    for path in (KEYS, MACROS_FILE, COMFY_LORAS / "library.json", CIVITAI_TOKEN, ROOT / "hf_token"):
+        try:
+            if sec.migrate(path, json_only=path.suffix == ".json", lock=(path == KEYS)) == "sealed":   # 8: keys.json under its lock
+                log.warning("sealed %s at rest", path.name)
+        except Exception as e:                         # noqa: BLE001
+            log.warning("could not seal %s (left as-is): %s", path.name, e.__class__.__name__)
+
+
 def main():
     global FREE_AFTER_MIN, FREE_AFTER_SAVED
     _JOB.own()                                         # 11-18: first, before any child: every child dies with us
@@ -8525,6 +9140,7 @@ def main():
     FREE_AFTER_MIN = FREE_AFTER_SAVED = _load_free_after()   # 11-18: the owner's last "free my computer after" choice
     import shutil
     shutil.rmtree(COMFY_PRIVATE, ignore_errors=True)   # a crash or kill could have left a job's photo behind
+    _seal_configs_at_rest()                            # 11-22: seal keys.json / macros.json / library.json at rest
     if not KEYS.exists():
         print(f"No phones paired yet. Run:  python pair.py \"My iPhone\"   (keys go in {KEYS})", file=sys.stderr)
     print(f"Fixer Desktop on {HOST}:{PORT}  models: {MODELS} (cap {CAP_GB:.0f} GB)", file=sys.stderr)

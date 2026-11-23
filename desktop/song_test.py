@@ -281,6 +281,24 @@ class FakeYDL:
         open(out, "wb").write(b"m4a")
         return {"duration": 132}
 sys.modules["yt_dlp"] = types.SimpleNamespace(YoutubeDL=FakeYDL)
+# 11-22: link hosts are resolved and redirects walked; the test fakes the DNS answers and the HEAD requests (no network)
+import io
+import socket
+import urllib.error
+import urllib.request
+_real_gai, _real_open = socket.getaddrinfo, urllib.request.OpenerDirector.open
+_dns = {"soundcloud.com": "93.184.216.34", "youtube.com": "93.184.216.34", "redirector.example.com": "93.184.216.34",
+        "127.0.0.1.nip.io": "127.0.0.1", "nas.example.com": "192.168.1.9"}
+socket.getaddrinfo = lambda host, *a, **k: ([(2, 1, 6, "", (_dns[host], 0))] if host in _dns else _real_gai(host, *a, **k))
+heads = []
+
+
+def _fake_open(self, req, *a, **k):
+    heads.append(req.full_url)
+    if "redirector" in req.full_url:
+        raise urllib.error.HTTPError(req.full_url, 302, "Found", {"Location": "http://10.0.0.130:8088/x"}, io.BytesIO())
+    raise urllib.error.URLError("no network in tests")
+urllib.request.OpenerDirector.open = _fake_open
 seen_files.clear()
 out = run({"prompt": "x", "reference_url": "https://soundcloud.com/me/old-song"})
 wf = ran["wf"]
@@ -289,7 +307,10 @@ check(seen_files == [True] and wf["9"]["inputs"]["audio"].endswith(".m4a")
 check(wf["5"]["inputs"]["seconds"] == 132.0, "a link: Auto length is the recording's")
 check(FakeYDL.opts_seen["noplaylist"] and FakeYDL.opts_seen["max_filesize"] == fd.SONG_REF_MAX, "one file, capped")
 check(any(o.get("v") == "Getting the recording from the link…" for o in out), "says it is getting the link")
-for bad in ("ftp://x.com/a", "http://localhost/a", "http://192.168.1.5/a", "http://10.0.0.130:8088/x"):
+for bad in ("ftp://x.com/a", "http://localhost/a", "http://192.168.1.5/a", "http://10.0.0.130:8088/x",
+            "http://2130706433/a", "http://127.1/a", "http://0x7f000001/a", "http://[::1]/a",
+            "http://[::ffff:127.0.0.1]/a", "http://127.0.0.1.nip.io/a", "http://nas.example.com/a",
+            "https://redirector.example.com/a"):                  # numeric forms, DNS names, and a redirect inward
     try:
         run({"prompt": "x", "reference_url": bad})
         check(False, "refused " + bad)
@@ -302,7 +323,145 @@ try:
 except fd.UserFacing as e:
     check("Couldn't get the audio" in str(e) and set((fd.COMFY_PRIVATE / "input").glob("songref_*")) == before_refs,
           "a failing link says so and leaves nothing")
+check(not any("10.0.0.130" in h for h in heads), "nothing was ever fetched from an inside address")
+# 11-22: the cheap link check runs BEFORE the (slow) engine start; a good link still starts it, after the check
+_order = []
+_real_card = fd._song_card
+fd._song_card = lambda status: _order.append("card")
+try:
+    for bad in ("http://127.0.0.1.nip.io/a", "ftp://x.com/a", "https://redirector.example.com/a"):
+        try:
+            run({"prompt": "x", "reference_url": bad})
+            check(False, "refused " + bad)
+        except fd.UserFacing:
+            check(True, "")
+    check(_order == [], "a bad link is refused before the picture engine is started")
+    run({"prompt": "x", "reference_url": "https://soundcloud.com/me/old-song"})
+    check(_order == ["card"], "a good link: the engine starts once, after the check")
+finally:
+    fd._song_card = _real_card
+socket.getaddrinfo, urllib.request.OpenerDirector.open = _real_gai, _real_open
 fd._comfy_run = fake_run
+
+# 11-22 (25/79): the connect-level guard. Only a thread inside a _SongNetGuard is refused a private address.
+srv = socket.socket()
+srv.bind(("127.0.0.1", 0))
+srv.listen(8)
+port4 = srv.getsockname()[1]
+
+
+def tries(addr, family=socket.AF_INET, ex=False):
+    """None when the connect went through, else the OSError."""
+    s = socket.socket(family, socket.SOCK_STREAM)
+    s.settimeout(3)
+    try:
+        if ex:
+            s.connect_ex(addr)
+        else:
+            s.connect(addr)
+        return None
+    except OSError as e:
+        return e
+    finally:
+        s.close()
+
+
+check(tries(("127.0.0.1", port4)) is None, "no guard: a connect to 127.0.0.1 is untouched")
+with fd._SongNetGuard():
+    e = tries(("127.0.0.1", port4))
+    check(isinstance(e, fd._PrivatePeer) and isinstance(e, OSError), f"guard: 127.0.0.1 is refused ({e!r})")
+    sx = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    rc = sx.connect_ex(("127.0.0.1", port4))
+    sx.close()
+    import errno as _errno
+    check(rc == _errno.EACCES, f"guard: connect_ex is refused too, as an error number ({rc})")
+    check(getattr(socket, "_fixer_song_net", None) is fd._SONG_NET, "guard state lives beside the wrappers, on the socket module")
+    check(isinstance(tries(("localhost", port4)), fd._PrivatePeer), "guard: a NAME that resolves to loopback is refused")
+    with fd._SongNetGuard():
+        pass
+    check(isinstance(tries(("127.0.0.1", port4)), fd._PrivatePeer), "guard: still on after a nested one ends")
+check(tries(("127.0.0.1", port4)) is None, "guard off again after the with block")
+try:
+    with fd._SongNetGuard():
+        raise RuntimeError("boom")
+except RuntimeError:
+    pass
+check(tries(("127.0.0.1", port4)) is None, "guard cleared even when the block raised")
+srv6 = None
+try:
+    srv6 = socket.socket(socket.AF_INET6)
+    srv6.bind(("::1", 0))
+    srv6.listen(8)
+except OSError:
+    srv6 = None                                            # no IPv6 loopback on this machine
+if srv6:
+    port6 = srv6.getsockname()[1]
+    check(tries(("::1", port6, 0, 0), socket.AF_INET6) is None, "no guard: a connect to ::1 is untouched")
+    with fd._SongNetGuard():
+        check(isinstance(tries(("::1", port6, 0, 0), socket.AF_INET6), fd._PrivatePeer), "guard: ::1 is refused")
+    srv6.close()
+else:
+    print("note: no IPv6 loopback here; ::1 checked through _checked_peer only")
+for fam, addr in ((socket.AF_INET6, ("::1", 80, 0, 0)), (socket.AF_INET6, ("::ffff:127.0.0.1", 80, 0, 0)),
+                  (socket.AF_INET6, ("fe80::1%12", 80, 0, 12)), (socket.AF_INET6, ("::ffff:10.0.0.130", 80, 0, 0)),
+                  (socket.AF_INET, ("169.254.169.254", 80)), (socket.AF_INET, ("0.0.0.0", 80)),
+                  (socket.AF_INET, ("", 80)), (socket.AF_INET, ("192.168.1.9", 80))):
+    try:
+        fd._checked_peer(fam, addr)
+        check(False, f"_checked_peer refuses {addr}")
+    except fd._PrivatePeer:
+        check(True, "")
+check(fd._checked_peer(socket.AF_INET, ("93.184.216.34", 443)) == ("93.184.216.34", 443), "a public address passes unchanged")
+check(fd._checked_peer(getattr(socket, "AF_UNIX", 1), "/tmp/x") == "/tmp/x", "not an internet socket: untouched")
+# the flag does not leak into another thread
+other = {}
+with fd._SongNetGuard():
+    th = threading.Thread(target=lambda: other.setdefault("r", tries(("127.0.0.1", port4))))
+    th.start()
+    th.join(10)
+check(other.get("r", "unset") is None, "another thread is not guarded while this one is")
+th = threading.Thread(target=lambda: other.update(r2=fd._SongNetGuard().__enter__() and tries(("127.0.0.1", port4))))
+th.start()
+th.join(10)
+check(isinstance(other.get("r2"), fd._PrivatePeer), "a thread that sets its own flag is guarded")
+check(tries(("127.0.0.1", port4)) is None, "...and that did not leak back into this thread")
+# DNS rebinding end to end: the host check sees a public address, the connect sees loopback -> refused, nothing reaches the server
+rebind = socket.socket()
+rebind.bind(("127.0.0.1", 0))
+rebind.listen(8)
+rebind.setblocking(False)
+rb_port = rebind.getsockname()[1]
+_asked = []
+
+
+def _rebinding_gai(host, port=None, *a, **k):
+    if host == "rebind.example.com":
+        _asked.append(1)
+        ip = "93.184.216.34" if len(_asked) == 1 else "127.0.0.1"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port or 0))]
+    return _real_gai(host, port, *a, **k)
+
+
+socket.getaddrinfo = _rebinding_gai
+try:
+    try:
+        fd._song_follow(f"http://rebind.example.com:{rb_port}/x")
+        check(False, "a rebinding host is refused at connect time")
+    except fd.UserFacing as e:
+        check("inside your own network" in str(e) and len(_asked) >= 2, f"rebinding: refused at connect ({e})")
+finally:
+    socket.getaddrinfo = _real_gai
+try:
+    rebind.accept()
+    check(False, "nothing reached the loopback server")
+except BlockingIOError:
+    check(True, "")
+rebind.close()
+srv.close()
+# the walk uses no environment proxy
+import inspect
+check("ProxyHandler({})" in inspect.getsource(fd._song_follow), "the link walk ignores proxy settings")
+check("external_downloader" not in inspect.getsource(fd._song_reference_url), "no external downloader is asked for")
 
 # artwork: painted after the song when asked; or later on its own, from the song or the owner's wish
 fd._comfy_run = fake_run

@@ -96,6 +96,10 @@ enum LibraryKeys {
 
     /// The device key's public half. Making the key needs no prompt; using it later does.
     private static func devicePublicKey() throws -> P256.KeyAgreement.PublicKey {
+        // One at a time: sealing now runs on several threads, and two first-time creations would each make a
+        // different key, leaving whatever was sealed to the loser unreadable for good.
+        creating.lock()
+        defer { creating.unlock() }
         if let raw = try read(pubAccount) { return try P256.KeyAgreement.PublicKey(rawRepresentation: raw) }
         var error: Unmanaged<CFError>?
         guard let access = SecAccessControlCreateWithFlags(nil, kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
@@ -108,7 +112,11 @@ enum LibraryKeys {
         return key.publicKey
     }
 
+    private static let creating = NSRecursiveLock()
+
     private static func softKey() throws -> SymmetricKey {
+        creating.lock()
+        defer { creating.unlock() }
         if let raw = try read(softAccount) { return SymmetricKey(data: raw) }
         let key = SymmetricKey(size: .bits256)
         try write(softAccount, bytes(key), accessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly)

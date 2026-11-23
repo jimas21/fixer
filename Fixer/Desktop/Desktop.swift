@@ -255,8 +255,16 @@ final class Desktop: ObservableObject {
         req.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
         let (bytes, response) = try await session.bytes(for: req)
         guard let http = response as? HTTPURLResponse else { throw PCError.bad }
-        if http.statusCode == 401 { throw PCError.refused }
+        if http.statusCode == 401 {
+            // The computer answers 401 for a clock that is off too, not only for an unknown phone. Its own Date
+            // header tells them apart; a clock problem is not "this phone is unknown", so nothing is forgotten.
+            if let said = http.value(forHTTPHeaderField: "Date"), let theirs = httpDate(said), abs(theirs.timeIntervalSinceNow) > 100 {
+                throw PCError.server("The time on your iPhone and your computer differ by more than 2 minutes. Set both to automatic time, then try again.")
+            }
+            throw PCError.refused
+        }
         if meansUnreachable(http.statusCode) { throw URLError(.cannotConnectToHost) }
+        if http.statusCode == 413 { throw PCError.server("That photo is too large to send to your computer. Try a smaller one.") }
         guard http.statusCode == 200 else { throw PCError.server("HTTP \(http.statusCode)") }
 
         var it = bytes.makeAsyncIterator()
@@ -284,6 +292,15 @@ final class Desktop: ObservableObject {
             seen?.got = true
             out.yield(obj)
         }
+    }
+
+    /// A reply's HTTP "Date" header ("Sun, 22 Nov 2026 10:00:00 GMT") as a date.
+    private nonisolated static func httpDate(_ s: String) -> Date? {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone(identifier: "GMT")
+        f.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        return f.date(from: s)
     }
 
     private nonisolated static func read(_ n: Int, from it: inout URLSession.AsyncBytes.Iterator) async throws -> Data? {
@@ -378,12 +395,14 @@ final class Desktop: ObservableObject {
                queued: @escaping @Sendable (String) -> Void = { _ in },
                status: @escaping @Sendable (String) -> Void,
                progress: @escaping @Sendable (Double) -> Void,
-               preview: @escaping @Sendable (Data) -> Void = { _ in }) async throws -> CGImage {
+               preview: @escaping @Sendable (Data) -> Void = { _ in },
+               produced: @escaping @Sendable (PCImageInfo) -> Void = { _ in }) async throws -> CGImage {
         guard let link else { throw PCError.notPaired }
         let rules = Rules.shared
         lastImageSeed = nil
         lastImageRecipe = nil
         lastImageEnhanced = nil
+        var enhancedHere: String?           // this request's own, so a job running beside it can't swap it
         let choice = rules.chatModelChoice
         // "model" stays for older computers: the chosen recipe's own model, otherwise the saved picture model.
         let legacyModel = choice == "auto" ? rules.pcImageID
@@ -396,14 +415,17 @@ final class Desktop: ObservableObject {
         payload["safe"] = !rules.explicitNow
         if enhance { payload["enhance"] = true }
         if let start {
-            guard let png = Self.png(start) else { throw PCError.bad }
+            guard var png = Self.png(start) else { throw PCError.bad }
+            // A big noisy photo as PNG can pass the computer's upload limit: send it as a high-quality JPEG instead.
+            if png.utf8.count > 20_000_000,
+               let smaller = Self.jpeg(start, longest: CGFloat(max(start.width, start.height)), quality: 0.95) { png = smaller }
             payload["image"] = png
         }
         for try await f in jobStream("image", payload, slot: slot, link: link, queued: queued) {
             switch f["t"] as? String {
             case "progress": progress(f["v"] as? Double ?? 0)
             case "status": status(f["v"] as? String ?? "")
-            case "enhanced": lastImageEnhanced = f["v"] as? String
+            case "enhanced": lastImageEnhanced = f["v"] as? String; enhancedHere = lastImageEnhanced
             case "preview":
                 if let b = f["v"] as? String, let d = Data(base64Encoded: b) { preview(d) }
             case "image":
@@ -411,6 +433,7 @@ final class Desktop: ObservableObject {
                       let cg = UIImage(data: data)?.cgImage else { throw PCError.bad }
                 lastImageSeed = (f["seed"] as? NSNumber)?.intValue
                 lastImageRecipe = f["recipe"] as? String
+                produced(PCImageInfo(seed: lastImageSeed, recipe: lastImageRecipe, enhanced: enhancedHere))
                 return cg
             default: break
             }
@@ -821,6 +844,7 @@ final class Desktop: ObservableObject {
         var explicit = false
         var pinned = false                            // 11-22: shown as a one-tap favorite chip in Make
         private var extra: [String: Any] = [:]       // keys this version doesn't know are passed back unchanged
+        private var extraSettings: [String: Any] = [:]   // settings keys beyond cfg/steps (e.g. shift), passed back too
 
         init() {}
         init(_ d: [String: Any]) {
@@ -831,6 +855,7 @@ final class Desktop: ObservableObject {
             negativeAdd = d["negative_add"] as? String ?? ""
             loras = (d["loras"] as? [[String: Any]] ?? []).compactMap { MacroLora($0) }
             let st = d["settings"] as? [String: Any] ?? [:]
+            extraSettings = st
             cfg = (st["cfg"] as? NSNumber)?.doubleValue
             steps = (st["steps"] as? NSNumber)?.doubleValue
             let m = d["model"] as? String
@@ -845,9 +870,9 @@ final class Desktop: ObservableObject {
             d["prompt_add"] = promptAdd
             d["negative_add"] = negativeAdd
             d["loras"] = loras.map { $0.raw }
-            var st: [String: Any] = [:]
-            if let cfg { st["cfg"] = cfg }
-            if let steps { st["steps"] = steps }
+            var st = extraSettings
+            if let cfg { st["cfg"] = cfg } else { st["cfg"] = nil }
+            if let steps { st["steps"] = steps } else { st["steps"] = nil }
             d["settings"] = st
             d["model"] = model ?? NSNull()
             d["explicit"] = explicit
@@ -863,6 +888,7 @@ final class Desktop: ObservableObject {
             if let st = a["settings"] as? [String: Any] {
                 if let v = st["cfg"] as? NSNumber { cfg = v.doubleValue }
                 if let v = st["steps"] as? NSNumber { steps = v.doubleValue }
+                for (k, v) in st where k != "cfg" && k != "steps" && v is NSNumber { extraSettings[k] = v }   // e.g. shift
             }
             if let v = a["model"] as? String { model = v.isEmpty ? nil : v }
             if let v = a["explicit"] as? Bool { explicit = v }
@@ -949,6 +975,13 @@ final class Desktop: ObservableObject {
         var list = cur.macros
         if let i = list.firstIndex(where: { $0.id == m.id }) { list[i] = m } else { list.append(m) }
         return try await macrosSet(roles: cur.roles, macros: list).macros
+    }
+
+    /// Saves the add-on roles with the macros the computer holds right now, so a macro changed elsewhere since this
+    /// screen opened is not overwritten by an old copy.
+    func saveRoles(_ roles: [Role]) async throws -> (roles: [Role], macros: [Macro], library: [LoraEntry]) {
+        let cur = try await macrosGet()
+        return try await macrosSet(roles: roles, macros: cur.macros)
     }
 
     @discardableResult
@@ -1259,7 +1292,9 @@ final class Desktop: ObservableObject {
                             continuation.yield(f)
                             if single, t == "image" || t == "video" || t == "mask" || t == "audio" || t == "cover", let id = jobID {
                                 await Self.live.markCollected(id)
-                                await self.ackNow(id, link: link)       // finished before the id leaves `live`
+                                // The caller returns on this frame, which cancels this task: send the ack from a task
+                                // of its own so the cancel can't cut it off (markCollected already covers the gap).
+                                Task.detached(priority: .userInitiated) { await self.ackNow(id, link: link) }
                             }
                         }
                         if !single, let id = jobID {
@@ -1482,6 +1517,13 @@ actor LiveJobs {
         if let d = collected[id], Date().timeIntervalSince(d) < 35 * 60 { return true }
         return false
     }
+}
+
+/// What the computer reported with one finished picture: its seed, the recipe it used, the prompt it wrote.
+struct PCImageInfo: Sendable {
+    var seed: Int?
+    var recipe: String?
+    var enhanced: String?
 }
 
 /// One entry of the computer's line, as the computer reports it (11-17).

@@ -299,6 +299,10 @@ struct Plan {
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return Plan(say: raw.trimmingCharacters(in: .whitespacesAndNewlines), actions: [])
         }
+        // A reply with prose and some other JSON in it (a sample config, say) is just an answer: keep all of it.
+        if obj["say"] == nil, obj["actions"] == nil, obj["tool"] == nil {
+            return Plan(say: raw.trimmingCharacters(in: .whitespacesAndNewlines), actions: [])
+        }
         let say = obj["say"] as? String ?? ""
         var actions: [Action] = []
         // The brain sometimes sends one bare action ({"tool": "make", ...}) instead of {"say", "actions": [...]}.

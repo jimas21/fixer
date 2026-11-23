@@ -10,6 +10,9 @@ struct FixerApp: App {
         Privacy.forgetOldInstallKey()
         Privacy.excludeFromBackup()
         LibraryVault.sweepOrphans()               // half-saved Library files nobody can read; before any save starts
+        SealedFiles.removeTempCopies()            // decrypted copies a player needed; none may outlive the app run
+        // Seals what an older build left in the clear (conversations, their pictures and videos). Never deletes.
+        Task.detached(priority: .utility) { History.sealLegacy() }
         AudioFocus.mix()                          // 11-20: never silence the music or podcast already playing
     }
 
@@ -45,6 +48,7 @@ struct FixerApp: App {
                 Privacy.excludeFromBackup()
                 Desktop.shared.leave()                   // 11-18: the computer may give its memory back early
                 LibraryStore.shared.lock()               // the Library opens again only with Face ID or the passcode
+                History.dropCaches()                     // decoded chat pictures held in memory go too (re-read when needed)
             }
         }
     }

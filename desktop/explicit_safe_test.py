@@ -119,6 +119,18 @@ try:
     orig_lib = fd._toggle_library
     fd._toggle_library = lambda: lib_t
     try:
+        # 11-22 (finding 27): SDXL recipes use the "sdxl" tag wording, joined with commas; no "sdxl" entry -> Chroma's
+        lib_s = [{"name": "Q", "items": [{"id": "q_a", "label": "A", "chroma": {"p": "A photograph", "n": "anime"},
+                                          "sdxl": {"p": "photo", "n": "cartoon"}},
+                                         {"id": "q_b", "label": "B", "chroma": {"p": "sharp focus"}}]}]
+        fd._toggle_library = lambda: lib_s
+        vs = fd._apply_toggles({"builder": "sdxl", "negative": True}, {"prompt": "a dog", "negative": "x", "toggles": ["q_a", "q_b"]})
+        check(vs["prompt"] == "a dog, photo, sharp focus", f"sdxl: tag wording, comma joined ({vs['prompt']})")
+        check(vs["negative"] == "x, cartoon", f"sdxl: its own negative ({vs['negative']})")
+        vc = fd._apply_toggles({"builder": "chroma"}, {"prompt": "a dog", "toggles": ["q_a", "q_b"]})
+        check(vc["prompt"] == "a dog. A photograph. sharp focus", f"chroma wording unchanged ({vc['prompt']})")
+        check([i["id"] for i in fd._recipe_toggles({"builder": "sdxl"})[0]["items"]] == ["q_a", "q_b"], "sdxl: both toggles listed")
+        fd._toggle_library = lambda: lib_t
         rc = {"builder": "chroma"}
         v = fd._apply_toggles(rc, {"prompt": "a woman", "toggles": ["w_nude", "w_casual"]})
         check("nude" in v["prompt"] and "jeans" in v["prompt"], "18+ on: both tips applied")

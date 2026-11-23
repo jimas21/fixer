@@ -436,7 +436,7 @@ struct LoraBrowser: View {
         let from = reset ? nil : cursor
         let words = query.trimmingCharacters(in: .whitespacesAndNewlines)
         searching = true
-        if reset { searchNote = nil }
+        if reset { searchNote = nil; cursor = nil }      // the old cursor belongs to the old query and filters
         let (apiSort, period): (String, String?) =
             sort == "trending" ? ("popular", "week") :
             sort == "rated" ? ("rated", nil) :
@@ -457,6 +457,7 @@ struct LoraBrowser: View {
             searchNote = results.isEmpty ? "Nothing here. Try other engines, a category, or words." : nil
         } catch {
             guard run == searchRun else { return }
+            if reset { results = [] }                      // not the old search's list under the new error note
             if !Task.isCancelled { searchNote = error.localizedDescription }
         }
         searching = false

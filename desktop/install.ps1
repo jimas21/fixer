@@ -22,19 +22,30 @@ $Ref = if ($env:FIXER_REF) { $env:FIXER_REF } else { "main" }
 $Raw = "https://raw.githubusercontent.com/jimas21/fixer/$Ref/desktop"
 $LlamaTag = "b12443"
 $ComfyTag = "v0.45.5"
+# SHA-256 of the three archives below, recorded 2026-11-22. They belong to the tags above: change a tag, change its hash.
+$LlamaSha = "a12df512f52da4bfe9aeb2916e17ed1ebe9f3ea3078e319b108f9bb18f03bb2b"
+$CudartSha = "c2bf4cc202bfbaaa7a0b75f5082457c3811326947bb216059b72839d844e9cba"
+$ComfySha = "7f2807f842de6a0da8d31d42214feb0adcb0a7f20e7cff458efd21d9871d8346"
 $Torch = @("torch==2.11.0", "torchvision==0.26.0")
 $TorchIndex = "https://download.pytorch.org/whl/cu128"
-$Files = @("fixer_desktop.py", "comfy_guard.py", "tray.py", "taehv.py", "pair.py", "fixerctl.py", "client_test.py",
+$Files = @("fixer_desktop.py", "fixer_secure.py", "comfy_guard.py", "tray.py", "taehv.py", "pair.py", "fixerctl.py", "client_test.py",
            "trace_test.py", "uninstall.ps1", "requirements.txt", "requirements-lock.txt", "comfyui-lock.txt",
            "prompt_toggles.json", "phone_config.json", "local.example.json")
 
 function Step($t) { Write-Host ""; Write-Host "== $t" -ForegroundColor Cyan }
 function Done($t) { Write-Host "   $t" -ForegroundColor DarkGray }
 
-function Get-File($url, $dest) {
+function Get-File($url, $dest, $sha = "") {
     for ($i = 1; $i -le 3; $i++) {
-        try { Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing -Headers @{ "User-Agent" = "FixerInstaller/1" }; return }
+        try { Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing -Headers @{ "User-Agent" = "FixerInstaller/1" }; break }
         catch { if ($i -eq 3) { throw "Couldn't download $url : $($_.Exception.Message)" }; Start-Sleep -Seconds (3 * $i) }
+    }
+    if ($sha) {                                        # a file that is not the one recorded here is never unpacked or run
+        $got = (Get-FileHash -Path $dest -Algorithm SHA256).Hash
+        if ($got -ne $sha) {
+            Remove-Item $dest -Force -ErrorAction SilentlyContinue
+            throw "The download of $url is not the file this installer expects (SHA-256 $got). Nothing was installed from it."
+        }
     }
 }
 
@@ -86,8 +97,8 @@ if (-not (Test-Path (Join-Path $llama "llama-server.exe"))) {
     $tmp = Join-Path $env:TEMP "fixer-llama"
     New-Item -ItemType Directory -Force -Path $tmp | Out-Null
     $rel = "https://github.com/ggml-org/llama.cpp/releases/download/$LlamaTag"
-    Get-File "$rel/llama-$LlamaTag-bin-win-cuda-13.5-x64.zip" "$tmp\llama.zip"
-    Get-File "$rel/cudart-llama-bin-win-cuda-13.5-x64.zip" "$tmp\cudart.zip"
+    Get-File "$rel/llama-$LlamaTag-bin-win-cuda-13.5-x64.zip" "$tmp\llama.zip" $LlamaSha
+    Get-File "$rel/cudart-llama-bin-win-cuda-13.5-x64.zip" "$tmp\cudart.zip" $CudartSha
     Expand-Into "$tmp\llama.zip" $llama
     Expand-Into "$tmp\cudart.zip" $llama
     Remove-Item $tmp -Recurse -Force
@@ -99,7 +110,7 @@ $comfy = Join-Path $HomeDir "comfyui"
 if (-not (Test-Path (Join-Path $comfy "main.py"))) {
     $tmp = Join-Path $env:TEMP "fixer-comfy"
     New-Item -ItemType Directory -Force -Path $tmp | Out-Null
-    Get-File "https://github.com/comfyanonymous/ComfyUI/archive/refs/tags/$ComfyTag.zip" "$tmp\comfy.zip"
+    Get-File "https://github.com/comfyanonymous/ComfyUI/archive/refs/tags/$ComfyTag.zip" "$tmp\comfy.zip" $ComfySha
     Expand-Into "$tmp\comfy.zip" $tmp
     $inner = Get-ChildItem $tmp -Directory | Where-Object { $_.Name -like "ComfyUI-*" } | Select-Object -First 1
     Move-Item $inner.FullName $comfy
@@ -126,11 +137,18 @@ if ($env:FIXER_NO_STARTUP -ne "1") {
 }
 
 Step "Checking the install"
-& $py -c "import fixer_desktop" 2>$null
+$env:FIXER_HOME = $HomeDir
+$bad = 1
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = "Continue"                       # Windows PowerShell 5.1 turns a library's stderr warning into an error
 Push-Location $HomeDir
-try { & $py -c "import sys; sys.path.insert(0, '.'); import aiohttp, cryptography, PIL, torch, yt_dlp; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())" }
-finally { Pop-Location }
-if ($LASTEXITCODE) { throw "The install didn't check out." }
+try {
+    # from the install folder, so the server file itself is imported too, along with the libraries it and the tray need
+    & $py -c "import sys; sys.path.insert(0, '.'); import aiohttp, cryptography, PIL, torch, yt_dlp, av, diffusers, transformers, pystray, fixer_desktop; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
+    $bad = $LASTEXITCODE
+}
+finally { Pop-Location; $ErrorActionPreference = $prevEap }
+if ($bad) { throw "The install didn't check out." }
 
 if ($env:FIXER_NO_START -ne "1") {
     Step "Starting Fixer Desktop"

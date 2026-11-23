@@ -119,6 +119,9 @@ check(not lo(r"C:\Python312\python.exe", r"python C:\Users\x\fixer\desktop\fixer
 check(not lo(r"C:\FixerDesktop\llama\llama-server.exe", "x", pid=1000), "this process is excluded by pid")
 check(not lo(r"C:\FixerDesktop\venv\Scripts\python.exe", "python C:\\FixerDesktop\\fixer_desktop.py", pid=999),
       "its launcher parent is excluded by pid")
+check(lo(r"C:\FixerDesktop\venv\Scripts\python.exe",
+         'python.exe -c "from multiprocessing.spawn import spawn_main; spawn_main(parent_pid=5, pipe_handle=7)" --multiprocessing-fork'),
+      "the server's spawned helper (venv python, no path in its command line) is a leftover")
 check(not lo(r"C:\Python312\python.exe", "python.exe other.py"), "an unrelated python.exe is excluded")
 check(not lo(r"C:\Games\Game\game.exe", "game.exe -fullscreen"), "a game is excluded")
 check(not lo(r"C:\FixerDesktop2\llama\llama-server.exe", r"C:\FixerDesktop2\llama\llama-server.exe"),
@@ -164,6 +167,7 @@ class World:
         self.leftovers = [dict(pid=p, ppid=1, name="llama-server.exe", exe="", cmd="") for p in leftovers]
         self.clock = 0.0
         self.owned = True
+        self.rows: list | None = []                        # what process_rows gives; None = the listing failed
         self.ev: list[str] = []
 
     def install(self, with_pid=True):
@@ -176,6 +180,7 @@ class World:
             "kill_tree": lambda pid: w._kill(pid),
             "port_pids": lambda port=0: [w.pid],
             "install_owned": lambda pid, root=None, protect=(): w.owned,
+            "process_rows": lambda root=None: w.rows,
             "find_leftovers": lambda root=None, protect=(), rows=None: list(w.leftovers),
             "_sleep": lambda s: setattr(w, "clock", w.clock + s),
             "_mono": lambda: w.clock,
@@ -249,6 +254,13 @@ with w.install(with_pid=False):
     rep = fx.stop_everything(R, 8765, proc=None, job=None, protect=ME)
 check(w.ev == ["ask_quit"] and rep["foreign"] == [4242] and not rep["ok"], f"foreign port owner is left alone ({w.ev})")
 
+# the process list could not be read: whose server it is, is unknown, so nothing is killed and the stop is not ok
+w = World("ok")
+w.owned = None
+with w.install():
+    rep = fx.stop_everything(R, 8765, proc=None, job=None, protect=ME)
+check(w.ev == [] and not rep["ok"] and rep["remaining"] == [4242], f"an unreadable process list is not a stop ({w.ev})")
+
 # nothing running: no ask, no kill
 w = World("ok")
 w.up = False
@@ -266,7 +278,80 @@ with w.install():
     rep = fx.stop_everything(R, 8765, protect=ME)
 check(rep["remaining"] == [5003] and not rep["ok"], "a leftover that survives is reported and the stop is not ok")
 
-# ------------------------------------------------------------------ 11-18: kills never raise; failures are recorded
+# the final listing cannot be read: no leftover can be ruled out, so the stop is not ok (even with the port closed)
+w = World("ok")
+w.rows = None
+with w.install():
+    rep = fx.stop_everything(R, 8765, proc=None, job=None, protect=ME)
+check(rep["unlisted"] and not rep["ok"] and rep["port_closed"], f"an unreadable final listing is not ok ({rep})")
+w = World("old")
+w.owned = False
+w.rows = None
+with w.install(with_pid=False):
+    rep = fx.stop_everything(R, 8765, proc=None, job=None, protect=ME)
+check(rep["unlisted"] and not rep["ok"], "an unreadable final listing is not ok on the foreign-server path either")
+
+# 11-22: cmd_stop's last look for trays. A failed listing (None) is "could not confirm" (exit 1, with the note), not
+# "no trays"; a good empty listing still ends with "everything is stopped"; process_rows is called once when no tray
+# was found. (stop_everything itself is stubbed to a clean report so only cmd_stop's own listing is under test.)
+import contextlib
+import io
+
+CLEAN = dict(polite=True, forced=False, ok=True, port_closed=True, swept=[], remaining=[], unlisted=False)
+
+
+def run_cmd_stop(rows_seq):
+    calls = []
+
+    def fake_rows(root=None):
+        calls.append(1)
+        return rows_seq[min(len(calls), len(rows_seq)) - 1]
+    buf = io.StringIO()
+    with mock.patch.multiple(fx, stop_everything=lambda *a, **k: dict(CLEAN), process_rows=fake_rows,
+                             find_leftovers=lambda *a, **k: [], kill_tree=lambda pid: True, _sleep=lambda s: None):
+        with contextlib.redirect_stdout(buf):
+            rc = fx.cmd_stop(types.SimpleNamespace())
+    return rc, buf.getvalue(), len(calls)
+
+
+rc, out, n = run_cmd_stop([None])
+check(rc == 1 and "could not list the running programs" in out and "everything is stopped" not in out
+      and "NOT everything stopped" in out, f"cmd_stop: an unreadable listing is not 'everything stopped' ({rc}, {out!r})")
+rc, out, n = run_cmd_stop([[]])
+check(rc == 0 and "everything is stopped" in out and n == 1, f"cmd_stop: a good empty listing is stopped, listed once ({rc}, {n})")
+tray_row = dict(pid=9001, ppid=1, name="pythonw.exe", exe=str(fx.ROOT / "venv" / "Scripts" / "pythonw.exe"),
+                cmd=f'"{fx.ROOT / "venv" / "Scripts" / "pythonw.exe"}" "{fx.ROOT / "tray.py"}"')
+if fx.find_trays((), [tray_row]):
+    rc, out, n = run_cmd_stop([[tray_row], None])
+    check(rc == 1 and "ended trays: 9001" in out and "could not list" in out and "everything is stopped" not in out,
+          f"cmd_stop: after ending a tray, a failed re-listing is not 'everything stopped' ({rc}, {out!r})")
+    rc, out, n = run_cmd_stop([[tray_row], []])
+    check(rc == 0 and "everything is stopped" in out and n == 2, f"cmd_stop: after ending a tray, a good re-listing ({rc}, {n})")
+
+
+# process_rows: a failed PowerShell call is None; a successful empty listing is []
+def ps_run(rc, out):
+    return lambda *a, **k: types.SimpleNamespace(returncode=rc, stdout=out)
+
+
+with mock.patch.object(fx.subprocess, "run", ps_run(1, b"")):
+    check(fx.process_rows(R) is None, "process_rows: non-zero exit is None")
+with mock.patch.object(fx.subprocess, "run", ps_run(1, b"[]")):
+    check(fx.process_rows(R) is None, "process_rows: non-zero exit is None even with output")
+with mock.patch.object(fx.subprocess, "run", ps_run(0, b"  \r\n")):
+    check(fx.process_rows(R) is None, "process_rows: blank stdout is None")
+with mock.patch.object(fx.subprocess, "run", ps_run(0, b"not json")):
+    check(fx.process_rows(R) is None, "process_rows: bad JSON is None")
+def ps_timeout(*a, **k):
+    raise fx.subprocess.TimeoutExpired("powershell", 40)
+
+
+with mock.patch.object(fx.subprocess, "run", ps_timeout):
+    check(fx.process_rows(R) is None, "process_rows: a timeout is None")
+with mock.patch.object(fx.subprocess, "run", ps_run(0, b"[]")):
+    check(fx.process_rows(R) == [], "process_rows: a successful empty listing is []")
+with mock.patch.object(fx.subprocess, "run", ps_run(0, b'[{"ProcessId":5,"ParentProcessId":1,"Name":"a.exe"}]')):
+    check([d["pid"] for d in fx.process_rows(R)] == [5], "process_rows: a listing is parsed")
 
 
 def raises(exc):
@@ -292,6 +377,39 @@ with w.install():
     with mock.patch.object(fx, "kill_tree", lambda pid: w.ev.append(f"kill:{pid}") and False):
         rep = fx.stop_everything(R, 8765, proc=None, job=None, protect=ME)
 check(rep["unkilled"] == [4242] and not rep["ok"] and rep["killed"] == [4242], f"an unkillable pid is recorded {rep}")
+
+# deploy: the previous files are put back after ANY failure once files were swapped (temp folders only, nothing live)
+def deploy_case(restart_rcs, state_after):
+    """restart_rcs: the codes cmd_restart gives in turn. state_after: what /local/state says after the first restart.
+    Returns (rc, the deployed file's text, the restart calls)."""
+    base = Path(tempfile.mkdtemp(prefix="fixer_deploy_test_"))
+    root, here = base / "install", base / "repo"
+    (root / "venv" / "Scripts").mkdir(parents=True)
+    (root / "venv" / "Scripts" / "python.exe").write_bytes(b"")
+    here.mkdir()
+    (root / "tool.txt").write_text("old")
+    (here / "tool.txt").write_text("new")
+    rcs, calls = list(restart_rcs), []
+
+    def restart(args):
+        calls.append((root / "tool.txt").read_text())      # the file's content at the time of each restart
+        return rcs.pop(0)
+
+    clock = [0.0]
+    with mock.patch.multiple(fx, ROOT=root, HERE=here, DEPLOY_FILES=("tool.txt",), cmd_restart=restart,
+                             state=lambda port=0: ({"busy": False} if (calls and state_after) or not calls else None),
+                             _autostarts=lambda: True, _sleep=lambda s: clock.__setitem__(0, clock[0] + s),
+                             _mono=lambda: clock[0]):
+        rc = fx.cmd_deploy([])
+    return rc, (root / "tool.txt").read_text(), calls
+
+
+rc, text, calls = deploy_case([0], True)
+check(rc == 0 and text == "new", f"deploy: a server that comes back keeps the new file ({rc}, {text})")
+rc, text, calls = deploy_case([1, 0], True)
+check(rc == 1 and text == "old" and calls == ["new", "old"], f"deploy: a failed restart puts the old file back ({rc}, {text}, {calls})")
+rc, text, calls = deploy_case([0, 0], False)
+check(rc == 1 and text == "old" and calls == ["new", "old"], f"deploy: a silent server puts the old file back ({rc}, {text}, {calls})")
 
 # ask_quit sends X-Fixer-Local: 1; a 404 from an older server still counts as "old"
 seen_req: list = []

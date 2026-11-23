@@ -636,6 +636,7 @@ def case_enhance_text():
     asked = []
     saved = fd._fetch_text
     fd._ENHANCE_TEXT.clear()
+    fd._ENHANCE_RETRY_AT.clear()
 
     def fetch(repo, name):
         asked.append((repo, name))
@@ -654,16 +655,23 @@ def case_enhance_text():
         fd._enhance_system(False)
         check(len(asked) == 2, "a fetched instruction is kept for next time")
 
-        def boom(repo, name):
-            raise OSError("offline")
         fd._ENHANCE_TEXT.clear()
-        fd._fetch_text = boom
+        fd._ENHANCE_RETRY_AT.clear()
+        tries = []
+
+        def boom_counted(repo, name):
+            tries.append(name)
+            raise OSError("offline")
+        fd._fetch_text = boom_counted
         b = fd._enhance_system(False)
         check(b.startswith(fd.ENHANCE_BUILTIN_T2I) and fd.ENHANCE_RULES in b, "no fetch: a short built-in instruction plus the rules")
+        fd._enhance_system(False)
+        check(len(tries) == 1, "a failed fetch is remembered: no second network wait right after")
         check(fd._enhance_system(True).startswith(fd.ENHANCE_BUILTIN_I2I), "the built-in edit instruction only sharpens the request")
     finally:
         fd._fetch_text = saved
         fd._ENHANCE_TEXT.clear()
+        fd._ENHANCE_RETRY_AT.clear()
 
 
 def case_enhance_run():

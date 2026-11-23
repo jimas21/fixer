@@ -79,8 +79,9 @@ enum LibraryVault {
     }
 
     /// Data or meta files whose key never got written (a crash mid-save): nobody can read them, so they go.
-    /// Only call this before any save has started (at launch).
+    /// Only call this before any save has started (at launch). It also clears decrypted temp videos.
     static func sweepOrphans() {
+        removeTempVideos(includingChecks: true)        // decrypted video copies a kill or crash left in tmp
         let l = listing()
         for stem in l.others where !l.keys.contains(stem) {
             for ext in ["pic", "vid", "meta", "protected"] {
@@ -188,10 +189,11 @@ enum LibraryVault {
         FileManager.default.temporaryDirectory.appendingPathComponent("lib-\(id.uuidString).mp4")
     }
 
-    static func removeTempVideos() {
+    /// `includingChecks` also removes the content filter's own "check-" copies; only at launch, when none is in use.
+    static func removeTempVideos(includingChecks: Bool = false) {
         let tmp = FileManager.default.temporaryDirectory
         for url in (try? FileManager.default.contentsOfDirectory(at: tmp, includingPropertiesForKeys: nil)) ?? []
-        where url.lastPathComponent.hasPrefix("lib-") {
+        where url.lastPathComponent.hasPrefix("lib-") || (includingChecks && url.lastPathComponent.hasPrefix("check-")) {
             try? FileManager.default.removeItem(at: url)
         }
     }

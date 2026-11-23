@@ -16,7 +16,8 @@ enum ContentGate {
     static func blocksVideo(_ data: Data, _ filter: FilterSetting) async -> Bool {
         if filter.isOff { return false }
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("check-\(UUID().uuidString).mp4")
-        do { try data.write(to: url) } catch { return false }
+        // UnlessOpen, not complete: the copy is read straight back and a lock mid-check must not make the read fail.
+        do { try data.write(to: url, options: .completeFileProtectionUnlessOpen) } catch { return false }
         defer { try? FileManager.default.removeItem(at: url) }
         let asset = AVURLAsset(url: url)
         guard let duration = try? await asset.load(.duration), duration.seconds > 0 else { return false }

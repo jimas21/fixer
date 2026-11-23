@@ -23,7 +23,8 @@ final class LibraryStore: ObservableObject {
     private var context: LAContext?
     private var deks: [UUID: SymmetricKey] = [:]
     private var writer: Task<Void, Never>?
-    private var epoch = 0                         // bumped by lock(), so an unlock that is still working gives up
+    private var arrivedWhileUnlocking: [LibraryVault.Stored] = []   // saved after the listing started: merged when it ends
+    private var epoch = 0                        // bumped by lock(), so an unlock that is still working gives up
     private var suppressAuto = false              // the owner said no to the prompt: don't ask again until the app has left
     private let thumbs = NSCache<NSUUID, UIImage>()
 
@@ -44,7 +45,18 @@ final class LibraryStore: ObservableObject {
     func addVideo(_ data: Data, meta: LibraryMeta, source: URL?) -> UUID {
         let master = self.master
         enqueue {
-            let frame = await Self.firstFrame(source)
+            // No file to read the first frame from (a chat video: its own copy is sealed): a short-lived private copy,
+            // written and removed off the main thread.
+            var scratch: URL?
+            if source == nil {
+                scratch = await Task.detached(priority: .utility) { () -> URL? in
+                    let url = FileManager.default.temporaryDirectory
+                        .appendingPathComponent("lib-src-\(meta.id.uuidString).mp4")
+                    return (try? data.write(to: url, options: [.atomic, .completeFileProtection])) != nil ? url : nil
+                }.value
+            }
+            let frame = await Self.firstFrame(source ?? scratch)
+            if let scratch { try? FileManager.default.removeItem(at: scratch) }
             return await Task.detached(priority: .utility) {
                 LibraryVault.storeVideo(data, meta: meta, thumbnail: frame, master: master)
             }.value
@@ -64,6 +76,7 @@ final class LibraryStore: ObservableObject {
 
     private func didStore(_ s: LibraryVault.Stored) {
         counts = s.inventory
+        if state == .unlocking { arrivedWhileUnlocking.append(s); return }   // unlock's listing may have missed it
         guard master != nil, state == .unlocked else { return }       // locked: it shows up at the next unlock
         deks[s.meta.id] = s.dek
         insert(LibraryEntry(id: s.meta.id, meta: s.meta, isProtected: false))
@@ -97,6 +110,7 @@ final class LibraryStore: ObservableObject {
         }
         state = .unlocking
         message = nil
+        arrivedWhileUnlocking = []
         let mine = epoch
         let ctx = LAContext()
         var probe: NSError?
@@ -129,9 +143,15 @@ final class LibraryStore: ObservableObject {
             guard mine == epoch else { ctx.invalidate(); return }
             self.master = master
             context = ctx
+            SealedFiles.unlocked(master: master, priv: priv)   // conversations and songs open with the same unlock
             deks = Dictionary(loaded.map { ($0.meta.id, $0.dek) }, uniquingKeysWith: { a, _ in a })
             entries = loaded.map { LibraryEntry(id: $0.meta.id, meta: $0.meta, isProtected: $0.isProtected) }
                 .sorted { $0.meta.created > $1.meta.created }
+            for s in arrivedWhileUnlocking {              // saved while this was opening: add what the listing missed
+                deks[s.meta.id] = s.dek
+                insert(LibraryEntry(id: s.meta.id, meta: s.meta, isProtected: false))
+            }
+            arrivedWhileUnlocking = []
             counts = LibraryVault.inventory()
             state = .unlocked
         } catch {
@@ -146,8 +166,10 @@ final class LibraryStore: ObservableObject {
     func lock() {
         epoch += 1
         master = nil
+        SealedFiles.lockNow()
         deks = [:]
         entries = []
+        arrivedWhileUnlocking = []
         thumbs.removeAllObjects()
         context?.invalidate()
         context = nil
@@ -201,6 +223,7 @@ final class LibraryStore: ObservableObject {
     func delete(_ id: UUID) {
         LibraryVault.delete(id)
         entries.removeAll { $0.id == id }
+        arrivedWhileUnlocking.removeAll { $0.meta.id == id }
         deks[id] = nil
         thumbs.removeObject(forKey: id as NSUUID)
         removeTempVideo(id)

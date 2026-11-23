@@ -91,19 +91,32 @@ enum Agent {
 
     /// What the Library records about a result. When the computer drew it, the recipe and seed it reported come along
     /// (otherwise they are nil: the iPhone's own models don't report either).
-    private static func made(_ action: String, words: String?, pc: Bool, rules: Rules) -> Made {
+    /// `pc` is true only when the computer itself drew the result (not when the iPhone took over after it couldn't be
+    /// reached); `info` is what it reported for that picture.
+    private static func made(_ action: String, words: String?, pc: Bool, info: PCImageInfo? = nil, rules: Rules) -> Made {
         let desktop = Desktop.shared
         var m = Made(action: action, words: words)
         m.choice = rules.chatModelChoice
         if pc, action == "make" || action == "edit" || action == "remove" {
-            m.recipeID = desktop.lastImageRecipe
-            m.seed = desktop.lastImageSeed
-            m.enhanced = desktop.lastImageEnhanced
-            m.model = desktop.lastImageRecipe ?? rules.pcImageID
+            let got = info ?? PCImageInfo(seed: desktop.lastImageSeed, recipe: desktop.lastImageRecipe,
+                                          enhanced: desktop.lastImageEnhanced)
+            m.recipeID = got.recipe
+            m.seed = got.seed
+            m.enhanced = got.enhanced
+            m.model = got.recipe ?? rules.pcImageID
         } else if action == "make" || action == "edit" {
             m.model = rules.generatorID
         }
         return m
+    }
+
+    /// Holds what the computer reported for one action's picture; stays nil when the iPhone drew it instead.
+    private final class Produced: @unchecked Sendable { var info: PCImageInfo? }
+
+    private static func track(_ s: Generator.Settings, _ got: Produced) -> Generator.Settings {
+        var s = s
+        s.produced = { got.info = $0 }
+        return s
     }
 
     /// A switch kept in Settings storage by the screens' own toggles ("Enhance my prompt"); `d` until it is first set.
@@ -141,6 +154,7 @@ enum Agent {
                 guard let photo = photoNow else { throw noPhoto() }
                 guard let m = await mask(for: targets, in: photo) ?? paintedNow else { throw ToolError.noMask }
                 var out: CGImage?
+                let got = Produced()
                 if pc {
                     // On the computer, the photo editor repaints the area from an instruction, which handles big and
                     // textured areas far better than the phone's remover. The mask is grown so shadows and
@@ -150,7 +164,7 @@ enum Agent {
                     let prompt = "Remove \(what) completely. Fill the space with the surrounding background so it looks natural, as if \(what) was never there. Keep everything else exactly the same."
                     let grown = ImageKit.softened(m, grow: max(6, CGFloat(photo.width) / 120), feather: 0)
                     do {
-                        out = try await Generator.shared.redraw(photo, mask: grown, settings(prompt, true, false, false),
+                        out = try await Generator.shared.redraw(photo, mask: grown, track(settings(prompt, true, false, false), got),
                                                                 filter: rules.editFilter, progress: r.progress)
                     } catch let e as PCError where e.isUnreachable {
                         r.status("Your computer isn't reachable. Using this iPhone…")
@@ -164,7 +178,8 @@ enum Agent {
                 }
                 let done = out!
                 chat.commit(done, caption: "Removed \(names(targets) ?? "the selected area").",
-                            made: made("remove", words: names(targets), pc: pc, rules: rules), into: job?.conversation)
+                            made: made("remove", words: names(targets), pc: got.info != nil, info: got.info, rules: rules),
+                            into: job?.conversation)
                 photoNow = done
 
             case .cutout(let targets):
@@ -220,13 +235,15 @@ enum Agent {
                 guard let photo = photoNow else { throw noPhoto() }
                 let m = await mask(for: targets, in: photo) ?? paintedNow
                 let text = prompt.isEmpty ? "high quality photo" : prompt
+                let got = Produced()
                 let out = try await generate(chat, job: job, r: r, pc: pc, label: "Editing…") { remote in
                     try await Generator.shared.redraw(photo, mask: m,
-                                                      settings(text, remote, true, flag("make.enhanceEdits", false)),
+                                                      track(settings(text, remote, true, flag("make.enhanceEdits", false)), got),
                                                       filter: rules.editFilter, progress: r.progress)
                 }
                 chat.commit(out, caption: "Edited \(names(targets) ?? (m == nil ? "the photo" : "the selected area")).",
-                            made: made("edit", words: text, pc: pc, rules: rules), into: job?.conversation)
+                            made: made("edit", words: text, pc: got.info != nil, info: got.info, rules: rules),
+                            into: job?.conversation)
                 photoNow = out
 
             case .search:
@@ -236,12 +253,14 @@ enum Agent {
                 break                                   // handled by `control` before any picture work, never reached here
 
             case .make(let prompt):
+                let got = Produced()
                 let out = try await generate(chat, job: job, r: r, pc: pc, label: "Creating image…") { remote in
-                    try await Generator.shared.make(settings(prompt, remote, true, flag("chat.enhance", true)),
+                    try await Generator.shared.make(track(settings(prompt, remote, true, flag("chat.enhance", true)), got),
                                                     filter: rules.newFilter, progress: r.progress)
                 }
                 // No caption: the words it was made from are kept in the picture's details (Library / viewer).
-                chat.commit(out, caption: "", made: made("make", words: prompt, pc: pc, rules: rules), into: job?.conversation)
+                chat.commit(out, caption: "", made: made("make", words: prompt, pc: got.info != nil, info: got.info, rules: rules),
+                            into: job?.conversation)
                 photoNow = out
 
             case .video(let prompt, let fromPhoto):

@@ -147,6 +147,9 @@ final class CreateStore: ObservableObject {
     /// 11-17: which task is the current one, so a replaced (older) task never clears the newer one's status when it ends.
     fileprivate var videoToken: UUID?
     fileprivate var reviseToken: UUID?
+    /// 11-22: the recipe the Make form shows now (kept by the screen). A picture filed from the job inbox has no recipe of
+    /// its own, so a change on it uses this one.
+    var fallbackRecipeID = ""
     var videoRunning: Bool { videoStatus != nil }
 
     init() {
@@ -242,6 +245,7 @@ final class CreateStore: ObservableObject {
                                 words: words.isEmpty ? nil : words)
                 let id = LibraryStore.shared.add(picture: ui, meta: info.meta(kind: .picture, conversation: nil))
                 results.append(CreateResult(image: ui, seed: (fr["seed"] as? NSNumber)?.intValue ?? 0,
+                                            recipeID: (fr["recipe"] as? String) ?? "",
                                             texts: ["prompt": words], libraryID: id))
             case "video":
                 if await ContentGate.blocksVideo(data, filter) { if myEpoch == epoch { noteBlocked("video") }; continue }
@@ -253,7 +257,7 @@ final class CreateStore: ObservableObject {
 
     private func addVideo(_ data: Data, words: String, explicit: String, parent: UUID?, action: String, epoch myEpoch: Int) async {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("make-\(UUID().uuidString).mp4")
-        do { try data.write(to: url, options: [.atomic, .completeFileProtectionUnlessOpen]) }
+        do { try data.write(to: url, options: [.atomic, .completeFileProtection]) }
         catch { videoNote = "Couldn't keep the video."; return }
         let frame = await Self.firstFrame(url)
         guard myEpoch == epoch else { try? FileManager.default.removeItem(at: url); return }   // Clear everything ran meanwhile
@@ -284,8 +288,18 @@ final class CreateStore: ObservableObject {
     /// Explicit add-on switch to use for a Qwen-Image 2.1 edit (nil = the switch the picture was made with).
     func revise(baseID: UUID, change: String, mode requested: String, mask: CGImage?, strength: Double?,
                 editor: String = "auto", explicit: String? = nil, useLoras: Bool = true) {
-        guard let base = results.first(where: { $0.id == baseID }), let cg = base.image.cgImage,
-              let jpeg = Desktop.jpeg(cg, longest: 1536, quality: 0.92) else { return }
+        guard let base = results.first(where: { $0.id == baseID }) else { return }
+        // 11-22: only ever change the real picture; if its full copy is gone, say so rather than send a thumbnail.
+        guard let full = MakeMedia.shared.fullImage(baseID), let cg = full.cgImage else {
+            reviseNote = "That picture is no longer available to change."
+            return
+        }
+        guard let jpeg = Desktop.jpeg(cg, longest: 1536, quality: 0.92) else { return }
+        // 11-22: a picture the computer finished while Fixer was closed has no recipe of its own; use the form's (or the
+        // newest picture's) so the change can still run.
+        let recipeToUse = !base.recipeID.isEmpty ? base.recipeID
+            : !fallbackRecipeID.isEmpty ? fallbackRecipeID
+            : results.last(where: { !$0.recipeID.isEmpty })?.recipeID ?? ""
         let change = change.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !change.isEmpty else { return }
         let original = base.texts["prompt"] ?? ""
@@ -342,6 +356,7 @@ final class CreateStore: ObservableObject {
         }
         let payload = values
         let spot = mask
+        let origForSpot: CGImage? = mask != nil ? cg : nil      // the untouched pixels outside a painted spot
         let madePrompt = values["prompt"] as? String ?? original
         let myEpoch = epoch
         // 11-17: a new change from here replaces the unfinished one (the computer drops the old one itself).
@@ -355,16 +370,16 @@ final class CreateStore: ObservableObject {
         reviseProgress = 0
         revising = Task {
             do {
-                try await Desktop.shared.create(recipe: base.recipeID, values: payload, slot: "make:change") { event in
+                try await Desktop.shared.create(recipe: recipeToUse, values: payload, slot: "make:change") { event in
                     Task { @MainActor in
                         switch event {
-                        case .status(let st): self.reviseStatus = st
+                        case .status(let st): if myEpoch == self.epoch, self.reviseToken == mine { self.reviseStatus = st }
                         case .progress(let v): if myEpoch == self.epoch { self.reviseProgress = v }
                         case .preview(let ui): if myEpoch == self.epoch { self.revisePreview = ui }
                         case .image(var ui, let seed, let enhanced):
                             var texts = base.texts
                             if mode == "redraw" { texts["prompt"] = madePrompt }
-                            if let spot, let patch = ui.cgImage, let orig = base.image.cgImage {
+                            if let spot, let patch = ui.cgImage, let orig = origForSpot {
                                 // Keep every pixel outside the spot exactly as it was (the copy sent was compressed).
                                 let wide = ImageKit.softened(spot, grow: 56, feather: 4)
                                 if let kept = ImageKit.blend(base: orig, patch: patch, mask: wide) {
@@ -376,8 +391,8 @@ final class CreateStore: ObservableObject {
                                 return
                             }
                             guard myEpoch == self.epoch else { return }          // Clear everything ran meanwhile
-                            var meta = Made(source: .make, action: "change", words: change, model: base.recipeID,
-                                            recipeID: base.recipeID, choice: base.recipeID, seed: seed,
+                            var meta = Made(source: .make, action: "change", words: change, model: recipeToUse,
+                                            recipeID: recipeToUse, choice: recipeToUse, seed: seed,
                                             parent: base.libraryID).meta(kind: .picture, conversation: nil)
                             meta.texts = texts
                             meta.numbers = base.numbers
@@ -387,7 +402,7 @@ final class CreateStore: ObservableObject {
                             meta.imageMode = mode
                             meta.enhanced = enhanced
                             let libraryID = LibraryStore.shared.add(picture: ui, meta: meta)
-                            let made = CreateResult(image: ui, seed: seed, recipeID: base.recipeID, texts: texts,
+                            let made = CreateResult(image: ui, seed: seed, recipeID: recipeToUse, texts: texts,
                                                     numbers: base.numbers, menus: base.menus, shape: base.shape,
                                                     toggles: base.toggles, note: "Changed: \(change)", libraryID: libraryID,
                                                     enhanced: enhanced, loras: mode == "redraw" && useLoras ? base.loras : [])
@@ -465,6 +480,7 @@ struct CreateScreen: View {
     @State var savedMacros: [Desktop.Macro] = []       // 11-21: saved macros, shown in the in-Make "Macros" card
     @State var macroRoles: [Desktop.Role] = []         // needed to turn a saved macro's role add-ons into files
     @State var showMacroManager = false                // 11-22: the full macro manager (use/edit/delete/suggest/new) as a sheet, opened from the Macros row
+    @State var macroModelKept: String?                 // 11-22: a loaded macro's model that 18+ coming on must not swap away
     @State var appliedMacroID: String?                 // 11-22: the macro loaded into the form now (nil = none), so "Update this macro" can overwrite it
     @State var mode = "picture"                // picture or video
     @State var videoPrompt = ""
@@ -600,7 +616,10 @@ struct CreateScreen: View {
                 }
             }
             .onChange(of: makeExplicit) { _, on in explicitSwitchChanged(on) }
-            .onChange(of: recipeID) { _, _ in alignModelToExplicit(turnedOn: false) }   // e.g. Make again, 18+ off
+            .onChange(of: recipeID) { _, id in
+                store.fallbackRecipeID = id                      // a picture with no recipe of its own is changed with this one
+                alignModelToExplicit(turnedOn: false)            // e.g. Make again, 18+ off
+            }
     }
 
     /// The second half of the screen's handlers (loading, sheets, clear everything, haptics), kept apart so no single
@@ -643,6 +662,7 @@ struct CreateScreen: View {
                 stylePrefix = ""; styleSuffix = ""; videoPrefix = ""; videoSuffix = ""
                 applied = nil; target = .new; appliedMacroID = nil
                 recipeStore.clear()
+                if desktop.isPaired { Task { await recipeStore.refresh() } }   // the styles hold nothing private: bring them back
             }
             .fullScreenCover(item: $viewing) { r in
                 MakeMediaViewer(startID: r.id, chat: chat, router: router, onTweak: { res in fill(from: res) })
@@ -688,8 +708,22 @@ struct CreateScreen: View {
         shape = res.shape
         chosen = Set(res.toggles)
         fixedSeed = res.seed
+        restoreLoras(res.loras)
         photo = nil
         morePhotos = []
+    }
+
+    /// Puts a picture's add-ons (and the extra activation words it was made with) back into the form.
+    func restoreLoras(_ list: [LoraSetting]) {
+        loras = list.map { LoraPick(name: $0.name, strength: $0.strength) }
+        var extras: [String: String] = [:]               // saved words minus the add-on's own
+        for l in list {
+            guard let saved = l.triggers else { continue }
+            let own = loraLibrary.first { $0.file == l.name }?.triggers ?? []
+            let more = saved.filter { !own.contains($0) }
+            if !more.isEmpty { extras[l.name] = more.joined(separator: ", ") }
+        }
+        loraExtra = extras
     }
 
     /// The same, from a Library item (a Make picture keeps its whole form; a chat picture keeps its words and seed).
@@ -715,15 +749,7 @@ struct CreateScreen: View {
         menus = meta.menus ?? [:]
         shape = meta.shape ?? "square"
         chosen = Set(meta.toggles ?? [])
-        loras = (meta.loras ?? []).map { LoraPick(name: $0.name, strength: $0.strength) }
-        var extras: [String: String] = [:]               // saved words minus the add-on's own
-        for l in meta.loras ?? [] {
-            guard let saved = l.triggers else { continue }
-            let own = loraLibrary.first { $0.file == l.name }?.triggers ?? []
-            let more = saved.filter { !own.contains($0) }
-            if !more.isEmpty { extras[l.name] = more.joined(separator: ", ") }
-        }
-        loraExtra = extras
+        restoreLoras(meta.loras ?? [])
         fixedSeed = meta.seed
         photo = nil
         morePhotos = []
@@ -1242,7 +1268,11 @@ struct MakeMediaViewer: View {
         a.cancel = { store.cancelRevise() }
         a.animate = { item, words in
             guard case .sessionPicture(let rid) = item.source else { return }
-            store.startVideo(prompt: words, start: MakeMedia.shared.image(rid), explicit: Rules.shared.videoExplicitNow,
+            guard let start = MakeMedia.shared.fullImage(rid) else {
+                store.videoNote = "That picture is no longer available to animate."
+                return
+            }
+            store.startVideo(prompt: words, start: start, explicit: Rules.shared.videoExplicitNow,
                              parent: item.libraryID, action: "animate", seconds: videoSeconds)
         }
         // No "send to chat" (11-17): work made in Make stays in Make; the chat would switch models to pick it up.

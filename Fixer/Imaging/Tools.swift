@@ -49,7 +49,8 @@ private func paste(_ patch: CGImage, into base: CGImage, at rect: CGRect, mask: 
 enum Remover {
     static func remove(_ image: CGImage, mask rawMask: CGImage) async throws -> CGImage {
         try await ModelStore.shared.ensure(.remover)
-        return try await Task.detached(priority: .userInitiated) {
+        // A detached task does not inherit Stop, so cancel it by hand.
+        let work = Task.detached(priority: .userInitiated) { () throws -> CGImage in
             let size = CGSize(width: image.width, height: image.height)
             let hole = ImageKit.softened(rawMask, grow: max(6, CGFloat(image.width) / 200), feather: 0)
             guard let box = ImageKit.maskBounds(hole) else { throw ToolError.noMask }
@@ -59,7 +60,8 @@ enum Remover {
                   let inPB = ImageKit.pixelBuffer(crop, size: side), let maskPB = ImageKit.grayPixelBuffer(cropMask, size: side)
             else { throw ToolError.model("Couldn't prepare the photo.") }
             let model = try compiledModel(.remover)
-            let input = try MLDictionaryFeatureProvider(dictionary: [
+            try Task.checkCancellation()
+            let input =try MLDictionaryFeatureProvider(dictionary: [
                 "image": MLFeatureValue(pixelBuffer: inPB),
                 "mask": MLFeatureValue(pixelBuffer: maskPB),
             ])
@@ -69,7 +71,8 @@ enum Remover {
             let blendMask = ImageKit.softened(hole, grow: 2, feather: 3)
             guard let result = paste(back, into: image, at: window, mask: blendMask) else { throw ToolError.model("Couldn't finish the edit. Try again.") }
             return result
-        }.value
+        }
+        return try await withTaskCancellationHandler { try await work.value } onCancel: { work.cancel() }
     }
 }
 
@@ -80,7 +83,8 @@ enum Upscaler {
 
     static func upscale(_ source: CGImage, progress: @escaping @Sendable (Double) -> Void) async throws -> CGImage {
         try await ModelStore.shared.ensure(.upscaler)
-        return try await Task.detached(priority: .userInitiated) {
+        // A detached task does not inherit Stop, so cancel it by hand (the tile loop checks).
+        let work = Task.detached(priority: .userInitiated) { () throws -> CGImage in
             // Keep the result phone-sized: at most 4096 px on the long side.
             var image = source
             let longSide = max(image.width, image.height)
@@ -128,7 +132,8 @@ enum Upscaler {
             }
             guard let final = out.makeImage() else { throw ToolError.model("Couldn't finish upscaling. Try again.") }
             return final
-        }.value
+        }
+        return try await withTaskCancellationHandler { try await work.value } onCancel: { work.cancel() }
     }
 }
 
@@ -166,6 +171,7 @@ actor Generator {
         var explicit: Bool? = nil                            // 11-17: the chat model's call: nude or sexual (nil = not said)
         var enhance = false                                  // 11-17: ask the computer to enrich the prompt first
         var preview: @Sendable (Data) -> Void = { _ in }     // a half-drawn picture from the computer (JPEG), if it sends any
+        var produced: @Sendable (PCImageInfo) -> Void = { _ in }   // called only when the computer itself drew the picture
     }
 
     /// One 512×512 image. `start` makes it an edit of that picture.
@@ -173,7 +179,7 @@ actor Generator {
         if s.remote {
             return try await Desktop.shared.image(prompt: s.prompt, start: start, slot: s.slot, explicit: s.explicit,
                                                   enhance: s.enhance, queued: s.queued, status: s.status, progress: progress,
-                                                  preview: s.preview)
+                                                  preview: s.preview, produced: s.produced)
         }
         if pipeline == nil {
             s.status("Preparing image model (first use can take a minute)…")

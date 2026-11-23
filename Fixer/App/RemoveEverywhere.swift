@@ -8,7 +8,15 @@ import SwiftUI
 enum AppWipe {
     /// Everything in the app's own folders, its keychain items and its settings.
     static func everything() {
+        SealedFiles.forgetAll()                    // every key held in memory, and the decrypted temporary copies
+        let jar = HTTPCookieStorage.shared
+        for cookie in jar.cookies ?? [] { jar.deleteCookie(cookie) }
         let fm = FileManager.default
+        for library in fm.urls(for: .libraryDirectory, in: .userDomainMask) {
+            for name in ["Cookies", "HTTPStorages"] {
+                try? fm.removeItem(at: library.appendingPathComponent(name, isDirectory: true))
+            }
+        }
         var dirs = [fm.temporaryDirectory]
         for d in [FileManager.SearchPathDirectory.documentDirectory, .applicationSupportDirectory, .cachesDirectory] {
             dirs += fm.urls(for: d, in: .userDomainMask)
@@ -109,8 +117,11 @@ struct RemoveEverywhereView: View {
         History.deleteAll()
         Brain.shared.forget()
         Desktop.shared.unpair()
+        await LibraryStore.shared.flush()          // a picture still being sealed would write its files and keys after the wipe
         AppWipe.everything()
         try? await Task.sleep(nanoseconds: 400_000_000)
+        await LibraryStore.shared.flush()
+        AppWipe.everything()                       // once more, in case a save finished meanwhile
         phoneDone = true
     }
 }

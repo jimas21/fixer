@@ -380,6 +380,10 @@ extension CreateScreen {
     }
 
     func explicitSwitchChanged(_ on: Bool) {
+        if let kept = macroModelKept {                 // 18+ came on because a macro was loaded: its model stays
+            macroModelKept = nil                       // consulted once, on or off, so it never outlives the switch
+            if on, kept == recipeID { return }
+        }
         alignModelToExplicit(turnedOn: on)
         guard !on else { return }                  // turning it on changes nothing else: the recipe you pick sets things
         removeAdultPicks()                         // only at the moment 18+ goes off, never on later edits
@@ -428,9 +432,15 @@ extension CreateScreen {
         target = .new
         var missingModel = false
         var unfitAddons = 0
-        if m.explicit, !makeExplicit { rules.explicitNow = true }
+        let turnedExplicitOn = m.explicit && !makeExplicit
+        if turnedExplicitOn { rules.explicitNow = true }
+        macroModelKept = nil
         if let id = m.model, !id.isEmpty {
-            if shownRecipes.contains(where: { $0.id == id }) { modelChoice.wrappedValue = id }
+            if shownRecipes.contains(where: { $0.id == id }) {
+                modelChoice.wrappedValue = id
+                // 18+ coming on would swap an everyday model for Chroma (wiping the macro's settings): keep this one.
+                if turnedExplicitOn { macroModelKept = id }
+            }
             else { missingModel = true }
         }
         applied = nil                 // a macro is its own recipe, not a style layered over the model

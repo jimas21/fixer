@@ -23,8 +23,8 @@ extension CreateScreen {
             makeHeader
             ScrollView {
                 VStack(spacing: 12) {
-                    ForEach(Array(composeStack.enumerated()), id: \.offset) { _, section in
-                        section
+                    ForEach(composeStack) { section in
+                        section.view
                     }
                 }
                 .padding(.horizontal, 12)
@@ -133,12 +133,15 @@ extension CreateScreen {
     /// each one to AnyView is what keeps this safe: stacking every control inline as one combined view made the
     /// scroll content's static generic type so deeply nested that resolving its metadata overflowed the stack the
     /// instant Make appeared (SIGSEGV in swift_getTypeByMangledName). One AnyView per section stops the types fusing.
-    var composeStack: [AnyView] {
-        var out: [AnyView] = [AnyView(composePicture)]
+    ///
+    /// 11-22: each section has its own steady id, so a section that appears or goes (the roll, the trigger words, the
+    /// Body panel) no longer shifts every later one: they keep their sheets and open/closed state.
+    var composeStack: [MakeSection] {
+        var out: [MakeSection] = [MakeSection("picture", AnyView(composePicture))]
         // 11-19 (the owner): the model / shape / pictures / enhance tiles sit right under the picture, before any
         // other setting, in every mode.
-        if let tiles = composeTiles { out.append(tiles) }
-        if store.results.count > 1 { out.append(AnyView(resultsRoll)) }
+        if let tiles = composeTiles { out.append(MakeSection("tiles", tiles)) }
+        if store.results.count > 1 { out.append(MakeSection("roll", AnyView(resultsRoll))) }
         out.append(contentsOf: composeSections)
         return out
     }
@@ -152,27 +155,27 @@ extension CreateScreen {
     }
 
     /// The controls for what is being made, each its own card, each type-erased (see `composeStack`).
-    var composeSections: [AnyView] {
-        var out: [AnyView] = []
-        if hasRecipeRow { out.append(AnyView(recipeRow)) }
-        out.append(AnyView(promptBox))
+    var composeSections: [MakeSection] {
+        var out: [MakeSection] = []
+        if hasRecipeRow { out.append(MakeSection("recipes", AnyView(recipeRow))) }
+        out.append(MakeSection("prompt", AnyView(promptBox)))
         if effectiveTarget == .change {
-            if hasQuickPicks { out.append(AnyView(quickSectionsCard(tips: []))) }
-            out.append(AnyView(helpPage))
+            if hasQuickPicks { out.append(MakeSection("quick", AnyView(quickSectionsCard(tips: [])))) }
+            out.append(MakeSection("help", AnyView(helpPage)))
         } else if mode == "video" {
-            if !activeTriggerWords.isEmpty { out.append(AnyView(triggerRow)) }
-            out.append(AnyView(videoPhotoPage))
-            out.append(AnyView(drawerSection("Add-ons") { loraSection }))
-            out.append(AnyView(videoSettingsPage))
+            if !activeTriggerWords.isEmpty { out.append(MakeSection("triggers", AnyView(triggerRow))) }
+            out.append(MakeSection("videoPhoto", AnyView(videoPhotoPage)))
+            out.append(MakeSection("addons", AnyView(drawerSection("Add-ons") { loraSection })))
+            out.append(MakeSection("videoSettings", AnyView(videoSettingsPage)))
         } else if let r = recipe {
-            out.append(AnyView(macrosCard))                                      // 11-21: saved macros, right in Make
-            if !activeTriggerWords.isEmpty { out.append(AnyView(triggerRow)) }   // 11-21: LoRA trigger words, tap to leave out
+            out.append(MakeSection("macros", AnyView(macrosCard)))               // 11-21: saved macros, right in Make
+            if !activeTriggerWords.isEmpty { out.append(MakeSection("triggers", AnyView(triggerRow))) }   // 11-21: LoRA trigger words, tap to leave out
             let tips = shownToggles(r)              // 11-19: style tips sit inside the quick-pick card now
-            if hasQuickPicks || !tips.isEmpty { out.append(AnyView(quickSectionsCard(tips: tips))) }
-            if showBodyPanel { out.append(AnyView(drawerSection("Body") { bodyPanel })) }
-            out.append(AnyView(drawerSection("Photo") { photoSection }))
-            out.append(AnyView(drawerSection("Add-ons") { loraSection }))
-            out.append(AnyView(pictureSettingsPage(r)))
+            if hasQuickPicks || !tips.isEmpty { out.append(MakeSection("quick", AnyView(quickSectionsCard(tips: tips)))) }
+            if showBodyPanel { out.append(MakeSection("body", AnyView(drawerSection("Body") { bodyPanel }))) }
+            out.append(MakeSection("photo", AnyView(drawerSection("Photo") { photoSection })))
+            out.append(MakeSection("addons", AnyView(drawerSection("Add-ons") { loraSection })))
+            out.append(MakeSection("settings", AnyView(pictureSettingsPage(r))))
         }
         return out
     }
@@ -191,4 +194,11 @@ extension CreateScreen {
         .padding(.bottom, 8)
         .background(.bar)
     }
+}
+
+/// One section of Make's scroll, with a steady id (see `composeStack`).
+struct MakeSection: Identifiable {
+    let id: String
+    let view: AnyView
+    init(_ id: String, _ view: AnyView) { self.id = id; self.view = view }
 }

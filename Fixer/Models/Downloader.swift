@@ -24,9 +24,44 @@ final class Downloader: NSObject, URLSessionDownloadDelegate {
         self.progress = progress
         self.destination = destination
         defer { session.finishTasksAndInvalidate() }
-        return try await withCheckedThrowingContinuation { cont in
-            self.continuation = cont
-            session.downloadTask(with: url).resume()
+        // Stop must end the download too, not wait for the file to finish.
+        let handle = Handle()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<URL, Error>) in
+                self.continuation = cont
+                let t = session.downloadTask(with: url)
+                guard handle.set(t) else {                     // Stop came before the download started
+                    self.continuation = nil
+                    cont.resume(throwing: CancellationError())
+                    return
+                }
+                t.resume()
+            }
+        } onCancel: {
+            handle.cancel()
+        }
+    }
+
+    /// The running download task, reachable from the cancellation handler (which runs on any thread).
+    private final class Handle: @unchecked Sendable {
+        private let lock = NSLock()
+        private var task: URLSessionTask?
+        private var cancelled = false
+
+        /// Keeps the task; false when it was cancelled already (the task must not start).
+        func set(_ t: URLSessionTask) -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            if cancelled { return false }
+            task = t
+            return true
+        }
+
+        func cancel() {
+            lock.lock()
+            cancelled = true
+            let t = task
+            lock.unlock()
+            t?.cancel()
         }
     }
 
@@ -54,7 +89,8 @@ final class Downloader: NSObject, URLSessionDownloadDelegate {
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         if let error {
-            continuation?.resume(throwing: error)
+            // A cancelled download is Stop, not a failure to retry or report.
+            continuation?.resume(throwing: (error as? URLError)?.code == .cancelled ? CancellationError() : error)
             continuation = nil
         }
     }

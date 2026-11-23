@@ -829,6 +829,13 @@ final class Desktop: ObservableObject {
             if role != nil || strength == 1 { return base }
             return "\(base) ×\(String(format: "%.2g", strength))"
         }
+
+        /// Same add-on as `other` by identity (role or file), ignoring id/strength — for dedup when amending a stack.
+        func sameAddon(_ other: MacroLora) -> Bool {
+            if let r = role, let o = other.role { return r == o }
+            if let f = file, let o = other.file { return f == o }
+            return false
+        }
     }
 
     /// 11-21: a saved preset: text added to the prompt, the add-on stack, settings and an optional model.
@@ -881,10 +888,21 @@ final class Desktop: ObservableObject {
         }
 
         /// Overwrites only the fields a suggestion's `apply` holds.
+        /// Applies one AI review suggestion as an AMENDMENT, not a replacement: text is APPENDED (skipped if already
+        /// present, so re-applying is safe), add-ons are ADDED to the existing stack (deduped by role/file), and only
+        /// the single-value settings (cfg/steps/model/explicit) are set outright. The owner's original macro is kept.
         mutating func merge(_ a: [String: Any]) {
-            if let v = a["prompt_add"] as? String { promptAdd = v }
-            if let v = a["negative_add"] as? String { negativeAdd = v }
-            if let v = a["loras"] as? [[String: Any]] { loras = v.compactMap { MacroLora($0) } }
+            if let v = (a["prompt_add"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !v.isEmpty {
+                promptAdd = Self.appendText(promptAdd, v)
+            }
+            if let v = (a["negative_add"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !v.isEmpty {
+                negativeAdd = Self.appendText(negativeAdd, v)
+            }
+            if let v = a["loras"] as? [[String: Any]] {
+                for add in v.compactMap({ MacroLora($0) }) where !loras.contains(where: { $0.sameAddon(add) }) {
+                    loras.append(add)
+                }
+            }
             if let st = a["settings"] as? [String: Any] {
                 if let v = st["cfg"] as? NSNumber { cfg = v.doubleValue }
                 if let v = st["steps"] as? NSNumber { steps = v.doubleValue }
@@ -892,6 +910,15 @@ final class Desktop: ObservableObject {
             }
             if let v = a["model"] as? String { model = v.isEmpty ? nil : v }
             if let v = a["explicit"] as? Bool { explicit = v }
+        }
+
+        /// Append `add` to `base`, deduped: if the addition is already there (case-insensitive substring), leave it.
+        private static func appendText(_ base: String, _ add: String) -> String {
+            let b = base.trimmingCharacters(in: .whitespacesAndNewlines)
+            if b.isEmpty { return add }
+            if b.lowercased().contains(add.lowercased()) { return b }    // already present: don't double it
+            let joiner = b.hasSuffix(",") || b.hasSuffix(".") ? " " : ", "
+            return b + joiner + add
         }
 
         /// "prompt snippet · add-on names" for the list — names, not just a count, so what it uses is visible.
@@ -932,17 +959,47 @@ final class Desktop: ObservableObject {
 
     /// 11-22: an add-on TYPE the owner doesn't have installed that would lift the suggested macros — a search phrase,
     /// the model family it should match (empty = any) and why. Shown as a "worth getting" row that opens the browser.
+    /// One real add-on the computer found in the catalog while verifying a wishlist concept exists (no inventions).
+    struct CatalogHit: Identifiable {
+        var id = UUID()
+        let name: String
+        let base: String            // the catalog's base-model label (e.g. "SDXL 1.0")
+        let family: String          // resolved family it fits
+        let sourceID: String        // "civitai:<id>@<ver>" — opens the add card directly
+        let downloads: Int?
+        let sizeMB: Double?
+        init?(_ d: [String: Any]) {
+            let n = (d["name"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !n.isEmpty else { return nil }
+            name = n
+            base = d["base"] as? String ?? ""
+            family = d["family"] as? String ?? ""
+            sourceID = d["source_id"] as? String ?? ""
+            downloads = (d["downloads"] as? NSNumber)?.intValue
+            sizeMB = (d["size_mb"] as? NSNumber)?.doubleValue
+        }
+    }
+
+    /// An add-on worth acquiring — VERIFIED against the real catalog by the computer, so it always exists. Carries the
+    /// model it's for, whether a usable model is already installed (else it's an upgrade needing that model), and the
+    /// real candidates found.
     struct Wish: Identifiable {
         var id = UUID()
         let find: String
         let family: String
         let why: String
+        let modelLabel: String       // readable name of the model it's for ("" if any)
+        let haveModel: Bool          // true = you already have a model that can use it; false = also needs that model
+        let results: [CatalogHit]
         init?(_ d: [String: Any]) {
             let f = (d["find"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             guard !f.isEmpty else { return nil }
             find = f
             family = d["family"] as? String ?? ""
             why = (d["why"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            modelLabel = d["model_label"] as? String ?? ""
+            haveModel = d["have_model"] as? Bool ?? false
+            results = (d["results"] as? [[String: Any]] ?? []).compactMap { CatalogHit($0) }
         }
     }
 

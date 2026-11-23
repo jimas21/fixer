@@ -404,12 +404,16 @@ struct LoraBrowser: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(r.name).lineLimit(2)
                 HStack(spacing: 6) {
-                    if engines.count > 1, !r.engineLabel.isEmpty {
+                    // 11-22: always show which model this add-on is for, so compatibility is never a mystery.
+                    if !r.engineLabel.isEmpty {
                         Text(r.engineLabel)
                             .font(.caption2.weight(.semibold))
                             .padding(.horizontal, 6).padding(.vertical, 2)
-                            .background(Capsule().fill(Fx.tile))
-                            .foregroundStyle(Fx.secondaryText)
+                            .background(Capsule().fill(r.fits ? Fx.tile : Color.orange.opacity(0.18)))
+                            .foregroundStyle(r.fits ? Fx.secondaryText : .orange)
+                    }
+                    if !r.fits {
+                        Text("other model").font(.caption2).foregroundStyle(.orange)
                     }
                     Text(resultDetail(r)).font(.footnote).foregroundStyle(.secondary).lineLimit(1)
                 }

@@ -3392,9 +3392,14 @@ def _analyze_macro_system(safe: bool) -> str:
         "sharper, more realistic, more on-target images. Look for redundant or conflicting add-ons, prompt phrases "
         "that repeat or fight, missing detail, a cfg/steps value that is off, or trigger words worth adding. Give a "
         "SHORT list (3 to 6) of discrete suggestions. "
+        "IMPORTANT: each suggestion AMENDS the macro — it does not rewrite it. So in 'apply', 'prompt_add' and "
+        "'negative_add' are a SHORT piece of text to ADD (e.g. trigger words or one phrase), never a rewritten prompt, "
+        "and 'loras' are add-ons to ADD to the existing stack. Only 'settings', 'model' and 'explicit' are set "
+        "outright (they are single values). Keep each addition small and specific. "
         'Reply with ONLY JSON: {"suggestions": [{"title": "<short>", "detail": "<one sentence why>", '
-        '"apply": {<only the macro fields to change>}}]}. Include "apply" only when the change is concrete, e.g. '
-        '{"negative_add": "..."} or {"settings": {"cfg": 3.0}}. Never invent add-ons or models not already present.')
+        '"apply": {<only the fields to add/set>}}]}. Include "apply" only when the change is concrete, e.g. '
+        '{"negative_add": "blurry, extra fingers"} (text to add) or {"settings": {"cfg": 3.0}}. Never invent add-ons '
+        "or models not already present.")
     return base + ("\nThis is a safe session: keep every suggestion non-explicit." if safe else "")
 
 
@@ -3418,12 +3423,16 @@ def _recommend_macros_system(safe: bool) -> str:
         "- Settings: set cfg/steps only when the add-on recommends specific ones, else omit them to keep the model's "
         "defaults. Never pair a speed/distill add-on with high cfg or many steps.\n"
         "Propose 2 to 4 distinct, genuinely useful macros the owner can adopt and tweak. "
-        "Only ever use add-ons from the INSTALLED list below in a macro's 'loras'. BUT if a kind of add-on the owner "
-        "does NOT appear to have installed would clearly lift these recipes (a better film-grain, a skin-detailer, a "
-        "specific style the catalog lacks), name it in a separate 'wishlist' (0 to 3 items) so they can go and get it "
-        "— never put an uninstalled add-on in a macro. Each wishlist item: 'find' is a 2-4 word search phrase, "
-        "'family' is the model family it should match (from the list below, or \"\" if any), 'why' is one short "
-        "sentence. Do not wishlist something that merely duplicates an installed add-on.\n"
+        "STRONGLY PREFER the models and add-ons the owner ALREADY HAS: build the macros from the INSTALLED models and "
+        "the INSTALLED add-on list below, and only ever put installed add-ons in a macro's 'loras'. "
+        "The 'wishlist' (0 to 3 items) is OPTIONAL and only for a real improvement that the installed set genuinely "
+        "can't achieve — not a nicer-sounding duplicate of something installed. Favour wishlist add-ons that fit a "
+        "model family the owner already has. You MAY suggest one that needs a DIFFERENT model than the owner has, but "
+        "only when the improvement is substantial, and then 'why' must say plainly that it's an upgrade requiring that "
+        "model. Each wishlist item: 'find' is a 2-4 word search phrase for a REAL add-on (it will be checked against "
+        "the live catalog and dropped if it doesn't exist, so describe a real, common kind), 'family' is the model "
+        "family it fits (from the list below, or \"\" if unsure), 'why' is one short sentence. Never put an "
+        "uninstalled add-on in a macro.\n"
         'Reply with ONLY JSON: {"macros": [{"name": "...", "prompt_add": "...", "negative_add": "...", '
         '"loras": [{"file": "<exact installed file id>", "strength": 0.8}], "settings": {"cfg": 3.5, "steps": 30}, '
         '"model": "<model id>", "explicit": false}], '
@@ -3490,15 +3499,62 @@ def job_recommend_macros(p: dict, emit, cancel):
             m = None
         if m:
             macros.append(m)
-    emit({"t": "info", "macros": macros, "wishlist": _clean_wishlist(obj.get("wishlist"))})
+    emit({"t": "info", "macros": macros, "wishlist": _clean_wishlist(obj.get("wishlist"), safe)})
 
 
-def _clean_wishlist(raw) -> list[dict]:
-    """Add-on TYPES the owner doesn't have but that would help — each a search phrase, a target family and a reason.
-    Coerced, length-clamped, family validated against real model families (or '' for any). At most 3."""
+def _catalog_lookup(query: str, family: str, safe: bool, limit: int = 2) -> list[dict]:
+    """Search the REAL Civitai catalog for a concept and return a few ACTUAL add-ons (name, base model, resolved
+    family, size, downloads, trigger words, source_id). Used to VERIFY an AI wishlist suggestion exists before it is
+    ever shown, so the chat brain cannot invent add-ons that aren't real. `family` scopes the base models when known;
+    if nothing is found in-family it retries broadly (still real hits). Returns [] on any error, so a down or blocked
+    catalog drops the suggestion rather than faking one."""
+    import urllib.parse
+    q = (query or "").strip()
+    if not q:
+        return []
+    try:
+        bases = LORA_CIVITAI_BASE.get(family, []) if family else []
+        base_params = [("types", "LORA"), ("types", "LoCon"), ("types", "DoRA"),
+                       ("nsfw", "false" if safe else "true"), ("limit", "12"),
+                       ("sort", "Most Downloaded"), ("query", q)]
+        params = base_params + [("baseModels", b) for b in bases]
+        data = _api_json(f"{CIVITAI_API}/models?" + urllib.parse.urlencode(params)) or {}
+        items = data.get("items") or []
+        if not items and bases:                          # nothing in that family: widen to any base (still real)
+            data = _api_json(f"{CIVITAI_API}/models?" + urllib.parse.urlencode(base_params)) or {}
+            items = data.get("items") or []
+        out: list[dict] = []
+        for m in items:
+            if safe and m.get("nsfw"):
+                continue
+            v = (m.get("modelVersions") or [{}])[0]
+            rows = _civitai_file_rows(v.get("files"))
+            if not rows:
+                continue
+            base = v.get("baseModel", "")
+            fam = _resolve_family(base or "", None)[0] or ""
+            out.append({"name": str(m.get("name", ""))[:80], "base": base, "family": fam,
+                        "source_id": f"civitai:{m.get('id')}@{v.get('id')}",
+                        "downloads": (m.get("stats") or {}).get("downloadCount"),
+                        "size_mb": round(sum(r["size"] for r in rows) / 1024 ** 2, 1),
+                        "triggers": [str(t) for t in (v.get("trainedWords") or [])][:4]})
+            if len(out) >= limit:
+                break
+        return out
+    except Exception:                                    # noqa: BLE001
+        return []
+
+
+def _clean_wishlist(raw, safe: bool) -> list[dict]:
+    """AI-proposed add-on CONCEPTS worth acquiring — each VERIFIED against the real catalog so nothing invented is
+    shown. Every kept item carries its target family + model name, whether the owner already has a usable model for
+    it (so the phone can say "you'd also need model X"), and the real add-ons found. At most 3."""
     if not isinstance(raw, list):
         return []
-    fams = {str(r.get("lora_family") or "") for r in CREATE_RECIPES.values() if r.get("lora_family")}
+    known = set(LORA_FAMILIES)
+    adult = _adult_models()
+    have = {str(r.get("lora_family") or "") for rid, r in CREATE_RECIPES.items()
+            if r.get("lora_family") and _recipe_ready(r) and not (safe and rid in adult)}
     out: list[dict] = []
     for it in raw[:6]:
         if not isinstance(it, dict):
@@ -3507,10 +3563,17 @@ def _clean_wishlist(raw) -> list[dict]:
         if not find:
             continue
         fam = str(it.get("family") or "").strip()
-        out.append({"find": find, "family": fam if fam in fams else "", "why": str(it.get("why") or "").strip()[:160]})
-        if len(out) >= 3:
-            break
-    return out
+        fam = fam if fam in known else ""
+        hits = _catalog_lookup(find, fam, safe, limit=2)
+        if not hits:                                     # no real add-on exists for this -> drop it (no hallucinations)
+            continue
+        target = hits[0].get("family") or fam            # trust the real result's family over the AI's guess
+        out.append({"find": find, "family": target, "why": str(it.get("why") or "").strip()[:160],
+                    "model_label": _family_model_name(target) if target else "",
+                    "have_model": target in have, "results": hits})
+    # Prefer add-ons that work with a model the owner already has; upgrades (new model needed) come last. Keep 3.
+    out.sort(key=lambda w: 0 if w["have_model"] else 1)
+    return out[:3]
 
 
 def _enhance_inputs(op: str, payload: dict | None):

@@ -414,37 +414,68 @@ struct MacroRecommend: View {
             if results.count > 1, results.contains(where: { !added.contains($0.id) }) {
                 Section { Button("Add all") { Task { for r in results where !added.contains(r.id) { await add(r) } } } }
             }
-            // 11-22: "the art of the possible" — add-ons the AI thinks are worth getting but you don't have. Each
-            // opens the add-on browser with the search already filled in.
+            // 11-22: "the art of the possible" — add-ons worth acquiring, each VERIFIED to exist in the real catalog
+            // (the computer searched for it), with the model it's for and whether you already have that model. Tapping
+            // opens the browser to the real results so you can see and add them.
             if !wishlist.isEmpty {
                 Section {                                  // (a title string can't be combined with a footer closure)
-                    ForEach(wishlist) { w in
-                        Button { browseWish = w } label: {
-                            VStack(alignment: .leading, spacing: 2) {
-                                HStack {
-                                    Label(w.find, systemImage: "magnifyingglass")
-                                    Spacer()
-                                    if !w.family.isEmpty {
-                                        Text(LoraEntry.familyName(w.family)).font(.caption2).foregroundStyle(.secondary)
-                                    }
-                                }
-                                if !w.why.isEmpty { Text(w.why).font(.footnote).foregroundStyle(.secondary) }
-                            }
-                        }
-                    }
+                    ForEach(wishlist) { w in wishRow(w) }
                 } header: {
                     Text("Add-ons worth getting")
                 } footer: {
-                    Text("These aren't installed. Tapping one searches for it to add to your computer.")
+                    Text("Each was found in the catalog (not invented). “Upgrade” means it needs a model you don't have yet. Tap to see and add.")
                 }
             }
         }
         .navigationTitle("Suggest macros")
         .navigationBarTitleDisplayMode(.inline)
         .sheet(item: $browseWish) { w in
-            LoraBrowser(family: w.family, modelName: w.family.isEmpty ? "" : LoraEntry.familyName(w.family),
+            LoraBrowser(family: w.family, modelName: w.modelLabel,
                         initialQuery: w.find)
         }
+    }
+
+    /// One "worth getting" add-on: what it's for, whether you already have the model (or it's an upgrade), and the
+    /// real candidates the computer found — so you understand the full pipeline before acquiring.
+    @ViewBuilder private func wishRow(_ w: Desktop.Wish) -> some View {
+        Button { browseWish = w } label: {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .firstTextBaseline) {
+                    Label(w.find, systemImage: "magnifyingglass")
+                    Spacer()
+                    if w.haveModel {
+                        Label("you have the model", systemImage: "checkmark.circle.fill")
+                            .font(.caption2).foregroundStyle(.green).labelStyle(.titleAndIcon)
+                    } else if !w.modelLabel.isEmpty {
+                        Label("upgrade", systemImage: "arrow.up.circle")
+                            .font(.caption2).foregroundStyle(.orange)
+                    }
+                }
+                if !w.modelLabel.isEmpty {
+                    Text(w.haveModel ? "For your \(w.modelLabel)" : "Needs \(w.modelLabel) (you don't have it yet)")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                if !w.why.isEmpty { Text(w.why).font(.footnote).foregroundStyle(.secondary) }
+                // the real add-ons found, so it's concrete, not a vague idea
+                ForEach(w.results.prefix(2)) { h in
+                    HStack(spacing: 6) {
+                        Image(systemName: "shippingbox").font(.caption2).foregroundStyle(.secondary)
+                        Text(h.name).font(.caption).lineLimit(1)
+                        Spacer(minLength: 6)
+                        if let d = h.downloads {
+                            Text("\(Self.compact(d))↓").font(.caption2).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// "12.3k" style for a download count.
+    private static func compact(_ n: Int) -> String {
+        if n >= 1_000_000 { return String(format: "%.1fM", Double(n) / 1_000_000) }
+        if n >= 1_000 { return String(format: "%.1fk", Double(n) / 1_000) }
+        return "\(n)"
     }
 
     private func fetch() async {
